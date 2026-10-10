@@ -20,11 +20,13 @@ pub struct GitError {
     pub args: Vec<String>,
     pub code: Option<i32>,
     pub stderr: String,
+    /// Some commands explain failures on stdout (e.g. "nothing to commit").
+    pub stdout: String,
 }
 
 impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = self.stderr.trim();
+        let msg = if self.stderr.trim().is_empty() { self.stdout.trim() } else { self.stderr.trim() };
         if msg.is_empty() {
             write!(f, "git {} failed (exit {:?})", self.args.join(" "), self.code)
         } else {
@@ -127,6 +129,7 @@ impl GitRunner {
                 args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
                 code,
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             }
             .into())
         }
@@ -163,6 +166,7 @@ impl GitRunner {
                 args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
                 code,
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             }
             .into())
         }
@@ -258,6 +262,7 @@ impl GitRunner {
                 args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
                 code: status.code(),
                 stderr,
+                stdout: String::new(),
             }
             .into())
         }

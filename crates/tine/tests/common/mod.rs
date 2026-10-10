@@ -41,6 +41,9 @@ pub fn sample_repo() -> tempfile::TempDir {
     let mut t = 1_760_000_000;
     let write = |name: &str, body: &str| std::fs::write(d.join(name), body).unwrap();
     git(d, &["init", "-q", "-b", "main"], &mut t);
+    // Commits made through the app use the repository's own config.
+    git(d, &["config", "user.name", "山田 太郎"], &mut t);
+    git(d, &["config", "user.email", "taro@example.com"], &mut t);
     write("README.md", "# Sample\n\nA sample project.\n");
     git(d, &["add", "-A"], &mut t);
     git(d, &["commit", "-q", "-m", "Initial commit"], &mut t);

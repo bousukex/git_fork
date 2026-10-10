@@ -16,10 +16,13 @@ use tine_core::{
     model::{ChangedFile, CommitDetails, CommitSummary, Oid, RefsSnapshot, WorkingStatus},
 };
 
+use bstr::BString;
+use tine_core::{model::RepoState, ops};
+
 use crate::{
     diff_model::DiffDoc,
     watcher::{FsChange, RepoWatcher},
-    worker::{Gen, Msg, Worker},
+    worker::{Gen, Msg, OpKind, OpOutcome, Worker},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +113,9 @@ pub struct CommitPane {
     seq: Gen,
 }
 
+/// How discard gets rid of untracked files (the trash, or a test stub).
+type UntrackedRemover = Arc<dyn Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync>;
+
 /// Which list a local-changes file was picked from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -139,8 +145,24 @@ pub struct RepoTab {
     pending_select: Option<Oid>,
     pub commit: CommitPane,
     pub commit_diff: DiffPane,
+    /// The file whose diff is shown (the focus of the selection).
     pub changes_selected: Option<(Side, ChangedFile)>,
+    /// All selected paths, on the same side as `changes_selected`.
+    pub changes_multi: std::collections::BTreeSet<BString>,
+    /// Preferred file to select when the current one disappears (the next
+    /// file after staging/unstaging, like Fork).
+    changes_next: Option<(Side, BString)>,
     pub changes_diff: DiffPane,
+    /// Files waiting for the user to confirm a discard.
+    pub pending_discard: Option<Vec<ChangedFile>>,
+    pub amend: bool,
+    /// Messages of successful commits, collected by the app for history.
+    pub committed_messages: Vec<String>,
+    head_message_seq: Gen,
+    /// The new-commit draft set aside while amending.
+    amend_draft: Option<(String, String)>,
+    untracked_remover: UntrackedRemover,
+    merge_msg_loaded: bool,
     pub diff_opts: DiffOptions,
 
     pub errors: Vec<String>,
@@ -155,6 +177,8 @@ pub struct RepoTab {
     /// and applied once they finish (the operation refreshes anyway).
     ops_in_flight: usize,
     held_fs: FsChange,
+    /// Some finished operation may have moved refs.
+    ops_moved_refs: bool,
 }
 
 #[derive(Default)]
@@ -214,6 +238,17 @@ impl RepoTab {
             _watcher: None,
             ops_in_flight: 0,
             held_fs: FsChange::default(),
+            ops_moved_refs: false,
+            changes_multi: Default::default(),
+            changes_next: None,
+            pending_discard: None,
+            amend: false,
+            committed_messages: Vec::new(),
+            head_message_seq: 0,
+            amend_draft: None,
+            // Untracked files go to the desktop trash rather than being deleted.
+            untracked_remover: Arc::new(|p| Ok(trash::delete(p)?)),
+            merge_msg_loaded: false,
         };
         tab._watcher = Some(RepoWatcher::start(
             tab.paths.workdir.clone(),
@@ -301,12 +336,15 @@ impl RepoTab {
                 Ok(st) => {
                     self.status = st;
                     self.status_loaded = true;
+                    self.prefill_merge_message();
                     self.revalidate_changes_selection();
                     if self.changes_selected.is_none() {
                         let first = self.status.conflicted.iter().chain(&self.status.unstaged).next().map(|f| (Side::Unstaged, f))
                             .or_else(|| self.status.staged.first().map(|f| (Side::Staged, f)));
                         if let Some((side, f)) = first {
-                            self.select_change(side, f.clone());
+                            let f = f.clone();
+                            self.changes_multi = [f.path.clone()].into();
+                            self.select_change(side, f);
                         }
                     }
                 }
@@ -347,6 +385,16 @@ impl RepoTab {
                 Err(e) => self.error(format!("{e:#}")),
             },
             Msg::Fs(change) => self.on_fs_change(change),
+            Msg::OpDone(kind, result) => self.on_op_done(kind, result),
+            Msg::HeadMessage(seq, r) if seq == self.head_message_seq => match r {
+                Ok(m) if self.amend => {
+                    let (subject, body) = ops::split_message(&m);
+                    self.commit_subject = subject;
+                    self.commit_body = body;
+                }
+                Ok(_) => {}
+                Err(e) => self.error(format!("Failed to read the last commit message: {e:#}")),
+            },
             // Stale generation.
             _ => {}
         }
@@ -438,21 +486,306 @@ impl RepoTab {
     /// After a status refresh, keep the selected file if it still has
     /// changes on the same side, and reload its diff.
     fn revalidate_changes_selection(&mut self) {
-        let Some((side, file)) = &self.changes_selected else { return };
-        let list = match side {
-            Side::Unstaged => &self.status.unstaged,
-            Side::Staged => &self.status.staged,
-        };
-        let still = list.iter().chain(&self.status.conflicted).find(|f| f.path == file.path).cloned();
+        let Some((side, file)) = self.changes_selected.clone() else { return };
+        let list = self.list(side);
+        let still = list.iter().find(|f| f.path == file.path).cloned();
+        let present: std::collections::BTreeSet<BString> = list.iter().map(|f| f.path.clone()).collect();
+        self.changes_multi.retain(|p| present.contains(p));
         match still {
             Some(f) => {
-                self.changes_selected = Some((*side, f));
+                self.changes_selected = Some((side, f));
                 self.load_changes_diff();
             }
             None => {
                 self.changes_selected = None;
+                self.changes_multi.clear();
                 self.changes_diff = DiffPane::default();
+                // Continue with the next file (after stage/unstage/discard).
+                if let Some((nside, npath)) = self.changes_next.take()
+                    && let Some(f) = self.list(nside).iter().find(|f| f.path == npath).cloned()
+                {
+                    self.changes_multi.insert(f.path.clone());
+                    self.select_change(nside, f);
+                }
             }
+        }
+    }
+
+    /// The files shown in one of the local changes lists (conflicts are
+    /// listed with the unstaged files).
+    pub fn list(&self, side: Side) -> Vec<ChangedFile> {
+        match side {
+            Side::Unstaged => self.status.conflicted.iter().chain(&self.status.unstaged).cloned().collect(),
+            Side::Staged => self.status.staged.clone(),
+        }
+    }
+
+    /// Updates the selection for a click on `file` in the `side` list
+    /// (Ctrl toggles, Shift selects a range from the focused file).
+    pub fn click_change(&mut self, side: Side, file: &ChangedFile, ctrl: bool, shift: bool) {
+        let same_side = self.changes_selected.as_ref().is_some_and(|(s, _)| *s == side);
+        if !same_side {
+            self.changes_multi.clear();
+        }
+        if shift && same_side {
+            let list = self.list(side);
+            let anchor = self.changes_selected.as_ref().map(|(_, f)| f.path.clone());
+            let a = anchor.and_then(|p| list.iter().position(|f| f.path == p));
+            let b = list.iter().position(|f| f.path == file.path);
+            if let (Some(a), Some(b)) = (a, b) {
+                self.changes_multi = list[a.min(b)..=a.max(b)].iter().map(|f| f.path.clone()).collect();
+                return;
+            }
+        }
+        if ctrl && same_side {
+            if !self.changes_multi.remove(&file.path) {
+                self.changes_multi.insert(file.path.clone());
+                self.select_change(side, file.clone());
+            } else if self.changes_selected.as_ref().is_some_and(|(_, f)| f.path == file.path) {
+                // Unselected the focused file: focus another selected one.
+                let next = self.list(side).into_iter().find(|f| self.changes_multi.contains(&f.path));
+                match next {
+                    Some(f) => self.select_change(side, f),
+                    None => {
+                        self.changes_selected = None;
+                        self.changes_diff = DiffPane::default();
+                    }
+                }
+            }
+            return;
+        }
+        self.changes_multi = [file.path.clone()].into();
+        self.select_change(side, file.clone());
+    }
+
+    /// Files an action on `clicked` applies to: the whole selection if the
+    /// clicked file is part of it, otherwise just that file.
+    pub fn action_targets(&self, side: Side, clicked: &ChangedFile) -> Vec<ChangedFile> {
+        let same_side = self.changes_selected.as_ref().is_some_and(|(s, _)| *s == side);
+        if same_side && self.changes_multi.contains(&clicked.path) {
+            self.list(side).into_iter().filter(|f| self.changes_multi.contains(&f.path)).collect()
+        } else {
+            vec![clicked.clone()]
+        }
+    }
+
+    pub fn selected_on(&self, side: Side) -> Vec<ChangedFile> {
+        match &self.changes_selected {
+            Some((s, f)) if *s == side => self.action_targets(side, f),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        self.ops_in_flight > 0
+    }
+
+    /// Remembers which file to select after `targets` leave the `side` list.
+    fn plan_next_selection(&mut self, side: Side, targets: &[ChangedFile]) {
+        let list = self.list(side);
+        let gone: std::collections::BTreeSet<&BString> = targets.iter().map(|f| &f.path).collect();
+        let last = list.iter().rposition(|f| gone.contains(&f.path));
+        self.changes_next = last.and_then(|i| {
+            list[i + 1..].iter().chain(list[..i].iter().rev()).find(|f| !gone.contains(&f.path))
+        })
+        .map(|f| (side, f.path.clone()));
+    }
+
+    fn run_op(&mut self, kind: OpKind, f: impl FnOnce(&GitRunner) -> anyhow::Result<OpOutcome> + Send + 'static) {
+        self.ops_in_flight += 1;
+        let git = self.git.clone();
+        self.worker.op(kind, move || f(&git));
+    }
+
+    pub fn stage(&mut self, files: Vec<ChangedFile>) {
+        // `git add` on a conflicted file marks it resolved even with conflict
+        // markers left in it. Until there is an explicit "mark resolved"
+        // action (M3), conflicted files are never staged implicitly.
+        let (conflicted, files): (Vec<ChangedFile>, Vec<ChangedFile>) =
+            files.into_iter().partition(|f| f.kind == tine_core::model::ChangeKind::Conflicted);
+        if !conflicted.is_empty() {
+            self.activity.push(format!(
+                "Skipped {} conflicted file(s); resolve conflicts before staging them",
+                conflicted.len()
+            ));
+        }
+        if files.is_empty() || self.busy() {
+            return;
+        }
+        self.plan_next_selection(Side::Unstaged, &files);
+        let n = files.len();
+        self.run_op(OpKind::Stage, move |git| {
+            ops::stage(git, &files)?;
+            Ok(OpOutcome { summary: format!("Staged {n} file(s)"), refs_changed: false })
+        });
+    }
+
+    pub fn unstage(&mut self, files: Vec<ChangedFile>) {
+        if files.is_empty() || self.busy() {
+            return;
+        }
+        self.plan_next_selection(Side::Staged, &files);
+        let n = files.len();
+        self.run_op(OpKind::Unstage, move |git| {
+            ops::unstage(git, &files)?;
+            Ok(OpOutcome { summary: format!("Unstaged {n} file(s)"), refs_changed: false })
+        });
+    }
+
+    /// Asks for confirmation before discarding (see `confirm_discard`).
+    pub fn request_discard(&mut self, files: Vec<ChangedFile>) {
+        let files: Vec<ChangedFile> =
+            files.into_iter().filter(|f| f.kind != tine_core::model::ChangeKind::Conflicted).collect();
+        if !files.is_empty() && !self.busy() {
+            self.pending_discard = Some(files);
+        }
+    }
+
+    pub fn confirm_discard(&mut self) {
+        let Some(files) = self.pending_discard.take() else { return };
+        self.plan_next_selection(Side::Unstaged, &files);
+        let remover = self.untracked_remover.clone();
+        self.run_op(OpKind::Discard, move |git| {
+            let report = ops::discard(git, &files, |p| remover(p))?;
+            let done = format!(
+                "restored {} file(s), moved {} untracked file(s) to Trash",
+                report.restored.len(),
+                report.removed.len()
+            );
+            if report.is_complete() {
+                return Ok(OpOutcome { summary: format!("Discard: {done}"), refs_changed: false });
+            }
+            // Partly done: say exactly what happened and what didn't.
+            let failed: Vec<String> =
+                report.failed.iter().map(|(p, e)| format!("{} ({e})", p.display())).collect();
+            anyhow::bail!("{done}, but could not remove {}: {}", failed.len(), failed.join(", "))
+        });
+    }
+
+    /// Replaces how untracked files are removed on discard (tests use this
+    /// to avoid touching the real trash).
+    pub fn set_untracked_remover(&mut self, f: impl Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync + 'static) {
+        self.untracked_remover = Arc::new(f);
+    }
+
+    pub fn can_commit(&self) -> bool {
+        !self.busy()
+            && !self.commit_subject.trim().is_empty()
+            && self.status.conflicted.is_empty()
+            && (self.amend || !self.status.staged.is_empty())
+    }
+
+    pub fn commit(&mut self) {
+        if !self.can_commit() {
+            return;
+        }
+        let message = ops::join_message(&self.commit_subject, &self.commit_body);
+        let amend = self.amend;
+        let kind = OpKind::Commit { message: message.clone(), amend };
+        self.run_op(kind, move |git| {
+            let opts = ops::CommitOptions { amend, allow_empty: false };
+            // Amending only the message must work with nothing staged.
+            let opts = if amend { ops::CommitOptions { allow_empty: true, ..opts } } else { opts };
+            let id = ops::commit(git, &message, &opts)?;
+            let subject = message.lines().next().unwrap_or_default();
+            Ok(OpOutcome { summary: format!("Committed {} {subject}", id.short()), refs_changed: true })
+        });
+    }
+
+    /// Toggles amend. Turning it on sets the draft aside and loads HEAD's
+    /// message for editing; turning it off brings the draft back.
+    pub fn set_amend(&mut self, amend: bool) {
+        if amend == self.amend {
+            return;
+        }
+        self.amend = amend;
+        if amend {
+            let draft = (std::mem::take(&mut self.commit_subject), std::mem::take(&mut self.commit_body));
+            self.amend_draft = Some(draft);
+            self.head_message_seq = self.gens.bump();
+            self.worker.head_message(self.head_message_seq, self.git.clone());
+        } else {
+            // Ignore a HEAD message still on its way.
+            self.head_message_seq = self.gens.bump();
+            if let Some((subject, body)) = self.amend_draft.take() {
+                self.commit_subject = subject;
+                self.commit_body = body;
+            }
+        }
+    }
+
+    /// Key identifying this repository across tabs (see `worker::repo_key`).
+    pub fn repo_key(&self) -> &std::path::Path {
+        self.worker.repo_key()
+    }
+
+    /// Result of an operation started by a tab that has since been closed.
+    pub fn on_external_op_done(&mut self, kind: OpKind, result: anyhow::Result<OpOutcome>) {
+        match result {
+            Ok(out) => self.activity.push(format!("{} (from a closed tab)", out.summary)),
+            Err(e) => self.error(format!("{} (started in a closed tab) failed: {e:#}", kind.label())),
+        }
+        self.refresh_if_changed();
+    }
+
+    fn on_op_done(&mut self, kind: OpKind, result: anyhow::Result<OpOutcome>) {
+        self.ops_in_flight = self.ops_in_flight.saturating_sub(1);
+        // A commit may have been created even if a later step failed.
+        if matches!(kind, OpKind::Commit { .. }) {
+            self.ops_moved_refs = true;
+        }
+        match result {
+            Ok(out) => {
+                self.ops_moved_refs |= out.refs_changed;
+                self.activity.push(out.summary);
+                if let OpKind::Commit { message, amend } = kind {
+                    self.commit_subject.clear();
+                    self.commit_body.clear();
+                    self.amend = false;
+                    // After an amend, bring back what was being written before.
+                    if amend && let Some((subject, body)) = self.amend_draft.take() {
+                        self.commit_subject = subject;
+                        self.commit_body = body;
+                    }
+                    self.committed_messages.push(message);
+                }
+            }
+            Err(e) => {
+                self.changes_next = None;
+                self.error(format!("{} failed: {e:#}", kind.label()));
+            }
+        }
+        if self.ops_in_flight == 0 {
+            let held = std::mem::take(&mut self.held_fs);
+            if std::mem::take(&mut self.ops_moved_refs) || held.refs {
+                self.refresh_if_changed();
+            } else {
+                self.refresh_status();
+            }
+        }
+    }
+
+
+    /// During a merge (or cherry-pick/revert with conflicts) git prepares
+    /// the message in MERGE_MSG; offer it like Fork does.
+    fn prefill_merge_message(&mut self) {
+        let in_progress = matches!(
+            self.status.state,
+            RepoState::Merging | RepoState::CherryPicking | RepoState::Reverting
+        );
+        if !in_progress {
+            self.merge_msg_loaded = false;
+            return;
+        }
+        if self.merge_msg_loaded || !self.commit_subject.is_empty() || !self.commit_body.is_empty() {
+            return;
+        }
+        self.merge_msg_loaded = true;
+        if let Ok(text) = std::fs::read_to_string(self.paths.git_dir.join("MERGE_MSG")) {
+            let cleaned: String = text.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n");
+            let (subject, body) = ops::split_message(&cleaned);
+            self.commit_subject = subject;
+            self.commit_body = body;
         }
     }
 

@@ -21,6 +21,7 @@ memmap2 = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rfd = "0.17"
 notify = "8"
+trash = { version = "5", default-features = false }
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }

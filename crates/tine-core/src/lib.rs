@@ -5,6 +5,7 @@ pub mod graph;
 pub mod log;
 pub mod maintenance;
 pub mod model;
+pub mod ops;
 pub mod reader;
 pub mod refs;
 pub mod runner;

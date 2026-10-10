@@ -81,7 +81,15 @@ fn local_changes_view() {
         },
         |h| {
             settle(h);
-            h.key_press(egui::Key::ArrowDown);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            // Runs once per theme on the same repository: stage only once.
+            if let Some(readme) = tab.list(tine::repo::Side::Unstaged).into_iter().find(|f| f.path == "README.md") {
+                tab.stage(vec![readme]);
+            }
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            tab.commit_subject = "READMEに使い方を追記".into();
+            tab.commit_body = "cargo での実行方法を説明する。".into();
             settle(h);
         },
     );

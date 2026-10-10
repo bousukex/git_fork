@@ -56,3 +56,23 @@ fn switching_and_closing_tabs() {
     assert_eq!(h.state().tab_count(), 1);
     assert_eq!(h.state().active_title(), Some(title(&b).as_str()));
 }
+
+#[test]
+fn stage_all_and_commit_buttons() {
+    let repo = sample_repo();
+    let mut h = app(vec![repo.path().into()]);
+    h.state_mut().show_local_changes();
+    settle(&mut h);
+    h.get_by_label("Stage All").click();
+    settle(&mut h);
+    let tab = h.state_mut().active_tab_mut().unwrap();
+    assert_eq!(tab.status.staged.len(), 2);
+    assert!(tab.status.unstaged.is_empty());
+    tab.commit_subject = "UIからのコミット".into();
+    h.run_steps(2);
+    h.get_by_label("Commit 2 Files").click();
+    settle(&mut h);
+    let tab = h.state_mut().active_tab_mut().unwrap();
+    assert_eq!(tab.history.commits[0].subject, "UIからのコミット");
+    assert_eq!(tab.status.change_count(), 0);
+}

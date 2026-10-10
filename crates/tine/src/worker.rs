@@ -5,7 +5,11 @@
 //! request of that kind, so a slow stale answer can never overwrite fresher
 //! state.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use tine_core::{
@@ -16,6 +20,83 @@ use tine_core::{
 };
 
 pub type Gen = u64;
+
+/// Result of a write operation.
+#[derive(Debug, Default)]
+pub struct OpOutcome {
+    /// One line for the activity log.
+    pub summary: String,
+    /// Branches/HEAD may have moved (history needs a check).
+    pub refs_changed: bool,
+}
+
+type OpFn = Box<dyn FnOnce() -> anyhow::Result<OpOutcome> + Send>;
+
+/// A write operation waiting in a repository's queue.
+struct QueuedOp {
+    kind: OpKind,
+    run: OpFn,
+    /// The submitting tab; gone if the tab was closed meanwhile.
+    reply: Sender<Msg>,
+    ctx: egui::Context,
+}
+
+/// Result of an operation whose tab was closed before it finished.
+pub struct OrphanedResult {
+    /// Repository key (canonical git dir), see [`repo_key`].
+    pub repo: PathBuf,
+    pub kind: OpKind,
+    pub result: anyhow::Result<OpOutcome>,
+}
+
+/// One queue (and thread) per repository for the whole process, so writes
+/// stay serialized even if a tab is closed and the repository reopened
+/// while an operation is still running.
+fn queues() -> &'static Mutex<HashMap<PathBuf, Sender<QueuedOp>>> {
+    static QUEUES: OnceLock<Mutex<HashMap<PathBuf, Sender<QueuedOp>>>> = OnceLock::new();
+    QUEUES.get_or_init(Default::default)
+}
+
+fn orphans() -> &'static Mutex<Vec<OrphanedResult>> {
+    static ORPHANS: OnceLock<Mutex<Vec<OrphanedResult>>> = OnceLock::new();
+    ORPHANS.get_or_init(Default::default)
+}
+
+/// Results of operations whose tab no longer exists (for the app to show).
+pub fn take_orphaned_results() -> Vec<OrphanedResult> {
+    std::mem::take(&mut *orphans().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Identifies a repository across tabs.
+pub fn repo_key(git_dir: &Path) -> PathBuf {
+    git_dir.canonicalize().unwrap_or_else(|_| git_dir.to_path_buf())
+}
+
+fn queue_for(repo: &Path) -> anyhow::Result<Sender<QueuedOp>> {
+    let mut map = queues().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = map.get(repo) {
+        return Ok(tx.clone());
+    }
+    let (tx, rx) = unbounded::<QueuedOp>();
+    let key = repo.to_path_buf();
+    std::thread::Builder::new().name("tine-ops".into()).spawn(move || {
+        for op in rx {
+            let result = (op.run)();
+            if let Err(crossbeam_channel::SendError(Msg::OpDone(kind, result))) =
+                op.reply.send(Msg::OpDone(op.kind, result))
+            {
+                orphans().lock().unwrap_or_else(|e| e.into_inner()).push(OrphanedResult {
+                    repo: key.clone(),
+                    kind,
+                    result,
+                });
+            }
+            op.ctx.request_repaint();
+        }
+    })?;
+    map.insert(repo.to_path_buf(), tx.clone());
+    Ok(tx)
+}
 
 pub enum Msg {
     Refs(Gen, anyhow::Result<RefsSnapshot>),
@@ -28,6 +109,30 @@ pub enum Msg {
     Job(anyhow::Result<String>),
     /// Files changed on disk (from the watcher).
     Fs(crate::watcher::FsChange),
+    /// A queued write operation finished.
+    OpDone(OpKind, anyhow::Result<OpOutcome>),
+    HeadMessage(Gen, anyhow::Result<String>),
+}
+
+/// What a queued write operation was, so the UI can react to its result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpKind {
+    Stage,
+    Unstage,
+    Discard,
+    Commit { message: String, amend: bool },
+}
+
+impl OpKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            OpKind::Stage => "Stage",
+            OpKind::Unstage => "Unstage",
+            OpKind::Discard => "Discard",
+            OpKind::Commit { amend: false, .. } => "Commit",
+            OpKind::Commit { amend: true, .. } => "Amend",
+        }
+    }
 }
 
 pub struct Worker {
@@ -36,12 +141,36 @@ pub struct Worker {
     rx: Receiver<Msg>,
     ctx: egui::Context,
     log_cancel: Option<CancelToken>,
+    /// Key of the repository's shared write queue.
+    repo: PathBuf,
 }
 
 impl Worker {
     pub fn new(reader: Arc<dyn RepoReader>, ctx: egui::Context) -> Self {
         let (tx, rx) = unbounded();
-        Self { reader, tx, rx, ctx, log_cancel: None }
+        let repo = repo_key(&reader.paths().git_dir);
+        Self { reader, tx, rx, ctx, log_cancel: None, repo }
+    }
+
+    pub fn repo_key(&self) -> &Path {
+        &self.repo
+    }
+
+    /// Queues a write operation behind any others for this repository; its
+    /// result arrives as [`Msg::OpDone`] (or, if this tab is gone by then,
+    /// through [`take_orphaned_results`]).
+    pub fn op(&self, kind: OpKind, f: impl FnOnce() -> anyhow::Result<OpOutcome> + Send + 'static) {
+        let op = QueuedOp { kind: kind.clone(), run: Box::new(f), reply: self.tx.clone(), ctx: self.ctx.clone() };
+        let sent = queue_for(&self.repo).and_then(|q| q.send(op).map_err(|_| anyhow::anyhow!("queue closed")));
+        if let Err(e) = sent {
+            let _ = self.tx.send(Msg::OpDone(kind, Err(anyhow::anyhow!("failed to queue the operation: {e:#}"))));
+        }
+    }
+
+    pub fn head_message(&self, seq: Gen, git: tine_core::GitRunner) {
+        self.spawn("head-message", move |_, tx| {
+            let _ = tx.send(Msg::HeadMessage(seq, tine_core::ops::head_message(&git)));
+        });
     }
 
     pub fn reader(&self) -> &Arc<dyn RepoReader> {

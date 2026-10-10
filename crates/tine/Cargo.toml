@@ -17,6 +17,7 @@ memmap2.workspace = true
 chrono.workspace = true
 rfd.workspace = true
 notify.workspace = true
+trash.workspace = true
 log.workspace = true
 env_logger.workspace = true
 serde.workspace = true

@@ -21,7 +21,11 @@ struct Persisted {
     recent: Vec<PathBuf>,
     open: Vec<PathBuf>,
     active: usize,
+    /// Recent commit messages, oldest first.
+    messages: Vec<String>,
 }
+
+const MAX_MESSAGES: usize = 30;
 
 pub struct TineApp {
     tabs: Vec<RepoTab>,
@@ -32,6 +36,8 @@ pub struct TineApp {
     debug: DebugOverlay,
     focused: bool,
     ctx: egui::Context,
+    /// App-level messages (e.g. results of operations from closed tabs).
+    notices: Vec<String>,
 }
 
 /// F12 overlay with frame timing and memory, for checking performance.
@@ -96,6 +102,7 @@ impl TineApp {
             debug: DebugOverlay::default(),
             focused: true,
             ctx: cc.egui_ctx.clone(),
+            notices: Vec::new(),
         };
         let restoring = paths.is_empty();
         let to_open = if restoring { app.state.open.clone() } else { paths };
@@ -182,6 +189,10 @@ impl TineApp {
 
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
+    }
+
+    pub fn active_tab_mut(&mut self) -> Option<&mut RepoTab> {
+        self.tabs.get_mut(self.active)
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -359,7 +370,24 @@ impl eframe::App for TineApp {
         for t in &mut self.tabs {
             t.poll();
             requests.extend(t.open_request.take());
+            for m in t.committed_messages.drain(..) {
+                self.state.messages.retain(|x| x != &m);
+                self.state.messages.push(m);
+            }
         }
+        // Operations whose tab was closed: hand the result to a tab showing
+        // the same repository, or report it at app level.
+        for o in crate::worker::take_orphaned_results() {
+            match self.tabs.iter_mut().find(|t| t.repo_key() == o.repo) {
+                Some(t) => t.on_external_op_done(o.kind, o.result),
+                None => self.notices.push(match o.result {
+                    Ok(out) => format!("{} ({})", out.summary, o.repo.display()),
+                    Err(e) => format!("{} failed in {}: {e:#}", o.kind.label(), o.repo.display()),
+                }),
+            }
+        }
+        let excess = self.state.messages.len().saturating_sub(MAX_MESSAGES);
+        self.state.messages.drain(..excess);
         for r in requests {
             self.open(&r, &ctx);
         }
@@ -384,6 +412,22 @@ impl eframe::App for TineApp {
             .exact_size(38.0)
             .frame(egui::Frame::NONE.fill(p.toolbar_bg).inner_margin(egui::Margin::symmetric(8, 4)))
             .show(ui, |ui| self.toolbar(ui));
+        if !self.notices.is_empty() {
+            let mut dismiss = false;
+            egui::Panel::top("notices")
+                .frame(egui::Frame::NONE.fill(p.diff_hunk_bg).inner_margin(egui::Margin::symmetric(10, 6)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(self.notices.last().expect("non-empty"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            dismiss = ui.small_button("✕").clicked();
+                        });
+                    });
+                });
+            if dismiss {
+                self.notices.clear();
+            }
+        }
         if !self.tabs.is_empty() {
             egui::Panel::top("tabs")
                 .frame(egui::Frame::NONE.fill(p.toolbar_bg).inner_margin(egui::Margin::symmetric(8, 3)))
@@ -417,7 +461,7 @@ impl eframe::App for TineApp {
                         .frame(egui::Frame::NONE.fill(p.bg))
                         .show(ui, |ui| ui::history::show(ui, tab));
                 }
-                View::LocalChanges => ui::changes::show(ui, tab),
+                View::LocalChanges => ui::changes::show(ui, tab, &self.state.messages),
             }
         });
     }
