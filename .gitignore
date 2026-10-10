@@ -1,0 +1,3 @@
+/target
+*.png.new
+/.claude/settings.local.json

@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["crates/tine-core", "crates/tine", "crates/tine-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tine-core = { path = "crates/tine-core" }
+anyhow = "1"
+bstr = "1"
+crossbeam-channel = "0.5"
+eframe = { version = "0.36", features = ["persistence"] }
+egui = "0.36"
+egui_extras = "0.36"
+memmap2 = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rfd = "0.17"
+notify = "8"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
