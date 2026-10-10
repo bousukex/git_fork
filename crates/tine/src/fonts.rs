@@ -179,3 +179,27 @@ mod tests {
         assert!(parse_fc_match("/nonexistent.ttf\x1f0\x1fX\x1f").is_none());
     }
 }
+
+#[cfg(test)]
+mod glyph_tests {
+    use egui::{FontFamily, FontId};
+
+    /// Symbols used in the UI. A symbol missing from every loaded font
+    /// renders as an empty box, so check them against the real fonts.
+    pub const UI_SYMBOLS: &str = "✓×⊘▶?…→▼↑↓☰−■!";
+
+    #[test]
+    fn ui_symbols_have_glyphs() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(super::definitions());
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        let missing: String = ctx.fonts_mut(|f| {
+            UI_SYMBOLS
+                .chars()
+                .filter(|&c| !f.has_glyph(&FontId::new(13.0, FontFamily::Proportional), c))
+                .collect()
+        });
+        assert!(missing.is_empty(), "UI symbols without a glyph: {missing:?}");
+    }
+}

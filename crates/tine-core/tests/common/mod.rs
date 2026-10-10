@@ -17,11 +17,13 @@ pub struct TestRepo {
     clock: Cell<i64>,
 }
 
-const ENV: [(&str, &str); 4] = [
+const ENV: [(&str, &str); 6] = [
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_AUTHOR_NAME", "Test User"),
     ("GIT_AUTHOR_EMAIL", "test@example.com"),
+    ("GIT_COMMITTER_NAME", "Test User"),
+    ("GIT_COMMITTER_EMAIL", "test@example.com"),
 ];
 
 impl TestRepo {

@@ -2,7 +2,10 @@
 
 use bstr::ByteSlice;
 use egui::{Align2, FontId, Key, Modifiers, Pos2, Rect, RichText};
-use tine_core::model::{ChangeKind, ChangedFile, RepoState};
+use tine_core::{
+    model::{ChangeKind, ChangedFile, ConflictKind, RepoState},
+    sequencer::Resolution,
+};
 
 use super::{diff_view::DiffEvent, paint_text, split_path, status_badge};
 use crate::{
@@ -21,6 +24,8 @@ enum ListEvent {
     Stage(Vec<ChangedFile>),
     Unstage(Vec<ChangedFile>),
     Discard(Vec<ChangedFile>),
+    Resolve(Vec<bstr::BString>, Resolution),
+    MergeTool(bstr::BString),
 }
 
 fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab: &RepoTab, events: &mut Vec<ListEvent>) {
@@ -33,6 +38,10 @@ fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab
                 let on_side = tab.changes_selected.as_ref().is_some_and(|(s, _)| *s == side);
                 let selected = on_side && tab.changes_multi.contains(&f.path);
                 let (rect, resp) = super::list_row(ui, ROW_H, selected, true);
+                let side_name = if side == Side::Staged { "staged" } else { "unstaged" };
+                resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{side_name} file {}", f.path.to_str_lossy()))
+                });
                 if resp.double_clicked() {
                     events.push(ListEvent::Toggle(f.clone()));
                 } else if resp.clicked() {
@@ -40,6 +49,10 @@ fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab
                     events.push(ListEvent::Click { file: f.clone(), ctrl: m.command, shift: m.shift });
                 }
                 resp.context_menu(|ui| {
+                    if f.kind == ChangeKind::Conflicted {
+                        conflict_menu(ui, tab, f, side, events);
+                        return;
+                    }
                     let targets = tab.action_targets(side, f);
                     let n = targets.len();
                     let suffix = if n > 1 { format!(" {n} Files") } else { String::new() };
@@ -87,6 +100,40 @@ fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab
             }
         });
     });
+}
+
+/// Resolutions offered for conflicted files, depending on what each side
+/// did to the file.
+fn conflict_menu(ui: &mut egui::Ui, tab: &RepoTab, f: &ChangedFile, side: Side, events: &mut Vec<ListEvent>) {
+    let busy = tab.busy();
+    let targets: Vec<ChangedFile> =
+        tab.action_targets(side, f).into_iter().filter(|t| t.kind == ChangeKind::Conflicted).collect();
+    let kinds: Vec<ConflictKind> = targets.iter().filter_map(|t| tab.status.conflict_kinds.get(&t.path).copied()).collect();
+    let all = |p: fn(ConflictKind) -> bool| !kinds.is_empty() && kinds.iter().all(|k| p(*k));
+    let paths: Vec<bstr::BString> = targets.iter().map(|t| t.path.clone()).collect();
+    let suffix = if paths.len() > 1 { format!(" ({} files)", paths.len()) } else { String::new() };
+    let mut entry = |ui: &mut egui::Ui, label: String, enabled: bool, how: Resolution| {
+        if ui.add_enabled(enabled && !busy, egui::Button::new(label)).clicked() {
+            events.push(ListEvent::Resolve(paths.clone(), how));
+            ui.close();
+        }
+    };
+    entry(ui, format!("Use HEAD Version (ours){suffix}"), all(ConflictKind::has_ours), Resolution::Ours);
+    entry(ui, format!("Use Incoming Version (theirs){suffix}"), all(ConflictKind::has_theirs), Resolution::Theirs);
+    if all(ConflictKind::can_delete) {
+        entry(ui, format!("Resolve by Deleting{suffix}"), true, Resolution::Delete);
+    }
+    ui.separator();
+    entry(ui, format!("Mark as Resolved{suffix}"), true, Resolution::MarkResolved);
+    if paths.len() == 1 && ui.add_enabled(!busy, egui::Button::new("Open in Merge Tool")).clicked() {
+        events.push(ListEvent::MergeTool(f.path.clone()));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Copy Path").clicked() {
+        ui.ctx().copy_text(f.path.to_str_lossy().into_owned());
+        ui.close();
+    }
 }
 
 /// List caption with Stage/Unstage buttons for the selection and for all.
@@ -166,10 +213,32 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
             .desired_rows(4)
             .desired_width(f32::INFINITY),
     );
+    let state = tab.status.state;
+    if matches!(state, RepoState::Rebasing | RepoState::CherryPicking | RepoState::Reverting) {
+        // These continue with the original commit message.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Continuing keeps the commit's original message").small().color(p.text_weak));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let what = match state {
+                    RepoState::Rebasing => "Continue Rebase",
+                    RepoState::CherryPicking => "Continue Cherry-pick",
+                    _ => "Continue Revert",
+                };
+                let can = !tab.busy() && tab.status.conflicted.is_empty();
+                let resp = ui
+                    .add_enabled(can, egui::Button::new(RichText::new(what).strong()))
+                    .on_disabled_hover_text("Resolve the conflicts first");
+                if resp.clicked() || (ctrl_enter && can) {
+                    tab.continue_op();
+                }
+            });
+        });
+        return;
+    }
     ui.horizontal(|ui| {
         let mut amend = tab.amend;
         if ui
-            .add_enabled(!tab.busy(), egui::Checkbox::new(&mut amend, "Amend"))
+            .add_enabled(!tab.busy() && state == RepoState::Clean, egui::Checkbox::new(&mut amend, "Amend"))
             .on_hover_text("Replace the last commit (message and staged changes)")
             .changed()
         {
@@ -177,7 +246,9 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let n = tab.status.staged.len();
-            let label = if tab.amend {
+            let label = if state == RepoState::Merging {
+                "Commit Merge".to_owned()
+            } else if tab.amend {
                 "Amend Last Commit".to_owned()
             } else {
                 format!("Commit {n} File{}", if n == 1 { "" } else { "s" })
@@ -206,9 +277,6 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
             }
         });
     });
-    if tab.status.state != RepoState::Clean {
-        ui.label(RichText::new(format!("{:?} in progress", tab.status.state)).color(p.status_conflict));
-    }
 }
 
 fn line_discard_dialog(ctx: &egui::Context, tab: &mut RepoTab) {
@@ -345,6 +413,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
             ListEvent::Stage(files) => tab.stage(files),
             ListEvent::Unstage(files) => tab.unstage(files),
             ListEvent::Discard(files) => tab.request_discard(files),
+            ListEvent::Resolve(paths, how) => tab.resolve(paths, how),
+            ListEvent::MergeTool(path) => tab.open_mergetool(path),
         }
     }
 }

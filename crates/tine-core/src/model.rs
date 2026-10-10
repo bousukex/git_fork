@@ -229,12 +229,73 @@ pub enum RepoState {
     Bisecting,
 }
 
+/// How the two sides disagree about a conflicted path (porcelain XY).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConflictKind {
+    /// UU: both modified.
+    BothModified,
+    /// AA: both added.
+    BothAdded,
+    /// DD: both deleted.
+    BothDeleted,
+    /// AU: added by us.
+    AddedByUs,
+    /// UA: added by them.
+    AddedByThem,
+    /// DU: deleted by us, modified by them.
+    DeletedByUs,
+    /// UD: modified by us, deleted by them.
+    DeletedByThem,
+}
+
+impl ConflictKind {
+    pub fn from_xy(xy: &[u8]) -> Option<ConflictKind> {
+        Some(match xy {
+            b"UU" => ConflictKind::BothModified,
+            b"AA" => ConflictKind::BothAdded,
+            b"DD" => ConflictKind::BothDeleted,
+            b"AU" => ConflictKind::AddedByUs,
+            b"UA" => ConflictKind::AddedByThem,
+            b"DU" => ConflictKind::DeletedByUs,
+            b"UD" => ConflictKind::DeletedByThem,
+            _ => return None,
+        })
+    }
+
+    /// Our side has a version of the file.
+    pub fn has_ours(self) -> bool {
+        !matches!(self, ConflictKind::BothDeleted | ConflictKind::DeletedByUs | ConflictKind::AddedByThem)
+    }
+
+    /// Their side has a version of the file.
+    pub fn has_theirs(self) -> bool {
+        !matches!(self, ConflictKind::BothDeleted | ConflictKind::DeletedByThem | ConflictKind::AddedByUs)
+    }
+
+    /// One side deleted the file, so deleting is a valid resolution.
+    pub fn can_delete(self) -> bool {
+        !self.has_ours() || !self.has_theirs()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WorkingStatus {
     pub staged: Vec<ChangedFile>,
     pub unstaged: Vec<ChangedFile>,
     pub conflicted: Vec<ChangedFile>,
+    /// Conflict kind per conflicted path.
+    pub conflict_kinds: std::collections::HashMap<BString, ConflictKind>,
     pub state: RepoState,
+}
+
+impl WorkingStatus {
+    /// Changes to tracked files (staged, unstaged or conflicted); untracked
+    /// files don't count.
+    pub fn has_tracked_changes(&self) -> bool {
+        !self.staged.is_empty()
+            || !self.conflicted.is_empty()
+            || self.unstaged.iter().any(|f| f.kind != ChangeKind::Untracked)
+    }
 }
 
 impl WorkingStatus {

@@ -1,5 +1,10 @@
 //! State of one open repository (one tab) and its reaction to worker results.
 
+mod actions;
+pub mod dialog;
+
+pub use actions::{Needs, StashConflict};
+
 use std::{
     collections::HashMap,
     path::Path,
@@ -25,6 +30,7 @@ use tine_core::{
 
 use crate::{
     diff_model::DiffDoc,
+    ops_registry::{self, OpContext, OpId},
     watcher::{FsChange, RepoWatcher},
     worker::{Gen, Msg, OpKind, OpOutcome, Worker},
 };
@@ -220,8 +226,35 @@ pub struct RepoTab {
     _watcher: Option<RepoWatcher>,
     /// While our own git operations run, file events are held back here
     /// and applied once they finish (the operation refreshes anyway).
-    ops_in_flight: usize,
     held_fs: FsChange,
+    /// Registry generation (operations finished on this repository) at
+    /// the time of the latest refs / status request, and the generation the
+    /// last successful refs / status result reflects. Writes wait until
+    /// both are fresh, so nothing acts on pre-operation state — also after
+    /// operations from other tabs or worktrees.
+    refs_req_regen: u64,
+    status_req_regen: u64,
+    refs_synced: u64,
+    status_synced: u64,
+    seen_regen: u64,
+    /// Conflicts of unknown origin (e.g. a stash applied on the command
+    /// line): the paths, so resolving can be finished from the banner.
+    pub generic_conflict: Option<std::collections::BTreeSet<BString>>,
+    /// The commit draft set aside while a merge/rebase/… is in progress.
+    op_draft: Option<(String, String)>,
+    /// Failed operation whose record the error banner links to.
+    pub last_failed_op: Option<OpId>,
+    pub output_open: bool,
+    /// Modal dialog waiting for the user.
+    pub dialog: Option<dialog::Dialog>,
+    /// A stash application that stopped with conflicts.
+    pub stash_conflict: Option<StashConflict>,
+    /// Changes stashed before an operation that stopped half-way.
+    pub pending_autostash: Option<Oid>,
+    /// (current, total) while a rebase is in progress.
+    pub rebase_progress: Option<(usize, usize)>,
+    /// Operation to expand (and scroll to) in the Output panel.
+    pub output_focus: Option<OpId>,
     /// Some finished operation may have moved refs.
     ops_moved_refs: bool,
 }
@@ -281,8 +314,21 @@ impl RepoTab {
             commit_body: String::new(),
             open_request: None,
             _watcher: None,
-            ops_in_flight: 0,
             held_fs: FsChange::default(),
+            refs_req_regen: 0,
+            status_req_regen: 0,
+            refs_synced: 0,
+            status_synced: 0,
+            seen_regen: 0,
+            generic_conflict: None,
+            op_draft: None,
+            last_failed_op: None,
+            output_open: false,
+            dialog: None,
+            stash_conflict: None,
+            pending_autostash: None,
+            rebase_progress: None,
+            output_focus: None,
             ops_moved_refs: false,
             changes_multi: Default::default(),
             changes_next: None,
@@ -323,27 +369,43 @@ impl RepoTab {
         });
     }
 
+    fn request_refs(&mut self, then_log: bool) {
+        self.gens.refs = self.gens.bump();
+        self.gens.refs_then_log = then_log.then_some(self.gens.refs);
+        self.refs_req_regen = ops_registry::generation(self.repo_key());
+        self.worker.refs(self.gens.refs);
+    }
+
     /// Reloads refs, status and history.
     pub fn refresh(&mut self) {
-        self.gens.refs = self.gens.bump();
-        self.gens.refs_then_log = None;
-        self.worker.refs(self.gens.refs);
+        self.request_refs(false);
         self.refresh_status();
         self.reload_history();
     }
 
     pub fn refresh_status(&mut self) {
         self.gens.status = self.gens.bump();
+        self.status_req_regen = ops_registry::generation(self.repo_key());
         self.worker.status(self.gens.status);
     }
 
     /// Cheap check for changes made outside Tine: reloads refs and status,
     /// and the history only if a branch, tag or HEAD actually moved.
     pub fn refresh_if_changed(&mut self) {
-        self.gens.refs = self.gens.bump();
-        self.gens.refs_then_log = Some(self.gens.refs);
-        self.worker.refs(self.gens.refs);
+        self.request_refs(true);
         self.refresh_status();
+    }
+
+    /// An operation on this repository is queued or running (in any tab or
+    /// worktree).
+    pub fn op_active(&self) -> bool {
+        ops_registry::active_for(self.repo_key())
+    }
+
+    /// Refs and status were successfully read after the latest finished
+    /// operation on this repository.
+    pub fn state_fresh(&self) -> bool {
+        self.refs_synced.min(self.status_synced) >= ops_registry::generation(self.repo_key())
     }
 
     fn reload_history(&mut self) {
@@ -359,13 +421,22 @@ impl RepoTab {
         for msg in msgs {
             self.handle(msg);
         }
+        // An operation finished elsewhere (another tab or worktree of this
+        // repository): reload once nothing else is queued.
+        let generation = ops_registry::generation(self.repo_key());
+        if generation > self.seen_regen && !self.op_active() {
+            self.seen_regen = generation;
+            self.refresh_if_changed();
+        }
         changed
     }
 
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Refs(seq, r) if seq == self.gens.refs => match r {
+            Msg::Refs(seq, r) if seq == self.gens.refs => {
+                match r {
                 Ok(refs) => {
+                    self.refs_synced = self.refs_req_regen;
                     let moved = refs_key(&refs) != refs_key(&self.refs);
                     self.refs_by_commit.clear();
                     for (i, r) in refs.refs.iter().enumerate() {
@@ -377,12 +448,25 @@ impl RepoTab {
                     }
                 }
                 Err(e) => self.error(format!("Failed to read branches: {e:#}")),
-            },
-            Msg::Status(seq, r) if seq == self.gens.status => match r {
+            }
+            }
+            Msg::Status(seq, r) if seq == self.gens.status => {
+                match r {
                 Ok(st) => {
+                    self.status_synced = self.status_req_regen;
                     self.status = st;
                     self.status_loaded = true;
-                    self.prefill_merge_message();
+                    self.rebase_progress = tine_core::status::rebase_progress(&self.paths.git_dir);
+                    self.sync_commit_box_with_state();
+                    if self.status.state == RepoState::Clean
+                        && self.stash_conflict.is_none()
+                        && !self.status.conflicted.is_empty()
+                    {
+                        let paths = self.conflicted_paths();
+                        self.generic_conflict.get_or_insert_with(Default::default).extend(paths);
+                    } else if self.status.state != RepoState::Clean {
+                        self.generic_conflict = None;
+                    }
                     self.revalidate_changes_selection();
                     if self.changes_selected.is_none() {
                         let first = self.status.conflicted.iter().chain(&self.status.unstaged).next().map(|f| (Side::Unstaged, f))
@@ -395,7 +479,8 @@ impl RepoTab {
                     }
                 }
                 Err(e) => self.error(format!("Failed to read status: {e:#}")),
-            },
+            }
+            }
             Msg::LogBatch(seq, batch) if seq == self.gens.log => {
                 self.history.push_batch(batch);
                 self.after_history_grew();
@@ -435,7 +520,7 @@ impl RepoTab {
                 Err(e) => self.error(format!("{e:#}")),
             },
             Msg::Fs(change) => self.on_fs_change(change),
-            Msg::OpDone(kind, result) => self.on_op_done(kind, result),
+            Msg::OpDone(id, kind, result) => self.on_op_done(id, kind, result),
             Msg::HeadMessage(seq, r) if seq == self.head_message_seq => match r {
                 Ok(m) if self.amend => {
                     let (subject, body) = ops::split_message(&m);
@@ -460,7 +545,7 @@ impl RepoTab {
     }
 
     fn on_fs_change(&mut self, change: FsChange) {
-        if self.ops_in_flight > 0 {
+        if ops_registry::active_for(self.repo_key()) {
             self.held_fs.merge(change);
         } else if change.refs {
             self.refresh_if_changed();
@@ -628,8 +713,10 @@ impl RepoTab {
         }
     }
 
+    /// An operation on this repository is queued or running (from any tab
+    /// or worktree), or the refresh after one has not completed yet.
     pub fn busy(&self) -> bool {
-        self.ops_in_flight > 0
+        self.op_active() || !self.state_fresh()
     }
 
     /// Remembers which file to select after `targets` leave the `side` list.
@@ -643,10 +730,19 @@ impl RepoTab {
         .map(|f| (side, f.path.clone()));
     }
 
-    fn run_op(&mut self, kind: OpKind, f: impl FnOnce(&GitRunner) -> anyhow::Result<OpOutcome> + Send + 'static) {
-        self.ops_in_flight += 1;
+    fn run_op(&mut self, kind: OpKind, f: impl FnOnce(&GitRunner) -> anyhow::Result<OpOutcome> + Send + 'static) -> Option<OpId> {
+        self.run_op_ctx(kind, move |_, git| f(git))
+    }
+
+    /// Like `run_op`, with access to the operation context (progress,
+    /// cancellation). The runner records every command it runs.
+    fn run_op_ctx(
+        &mut self,
+        kind: OpKind,
+        f: impl FnOnce(&OpContext, &GitRunner) -> anyhow::Result<OpOutcome> + Send + 'static,
+    ) -> Option<OpId> {
         let git = self.git.clone();
-        self.worker.op(kind, move || f(&git));
+        self.worker.op(kind, move |ctx| f(ctx, &ctx.git(&git)))
     }
 
     pub fn stage(&mut self, files: Vec<ChangedFile>) {
@@ -668,7 +764,7 @@ impl RepoTab {
         let n = files.len();
         self.run_op(OpKind::Stage, move |git| {
             ops::stage(git, &files)?;
-            Ok(OpOutcome { summary: format!("Staged {n} file(s)"), refs_changed: false })
+            Ok(OpOutcome::new(format!("Staged {n} file(s)")))
         });
     }
 
@@ -680,7 +776,7 @@ impl RepoTab {
         let n = files.len();
         self.run_op(OpKind::Unstage, move |git| {
             ops::unstage(git, &files)?;
-            Ok(OpOutcome { summary: format!("Unstaged {n} file(s)"), refs_changed: false })
+            Ok(OpOutcome::new(format!("Unstaged {n} file(s)")))
         });
     }
 
@@ -705,7 +801,7 @@ impl RepoTab {
                 report.removed.len()
             );
             if report.is_complete() {
-                return Ok(OpOutcome { summary: format!("Discard: {done}"), refs_changed: false });
+                return Ok(OpOutcome::new(format!("Discard: {done}")));
             }
             // Partly done: say exactly what happened and what didn't.
             let failed: Vec<String> =
@@ -720,11 +816,16 @@ impl RepoTab {
         self.untracked_remover = Arc::new(f);
     }
 
+    /// Committing is allowed with staged changes, when amending, or when
+    /// finishing a merge (whose resolution may leave nothing staged). During
+    /// a rebase, cherry-pick or revert, Continue is used instead.
     pub fn can_commit(&self) -> bool {
-        !self.busy()
-            && !self.commit_subject.trim().is_empty()
-            && self.status.conflicted.is_empty()
-            && (self.amend || !self.status.staged.is_empty())
+        let state_ok = match self.status.state {
+            RepoState::Clean => self.amend || !self.status.staged.is_empty(),
+            RepoState::Merging => !self.amend,
+            _ => false,
+        };
+        !self.busy() && !self.commit_subject.trim().is_empty() && self.status.conflicted.is_empty() && state_ok
     }
 
     pub fn commit(&mut self) {
@@ -733,21 +834,22 @@ impl RepoTab {
         }
         let message = ops::join_message(&self.commit_subject, &self.commit_body);
         let amend = self.amend;
+        let merging = self.status.state == RepoState::Merging;
         let kind = OpKind::Commit { message: message.clone(), amend };
         self.run_op(kind, move |git| {
-            let opts = ops::CommitOptions { amend, allow_empty: false };
+            let opts = ops::CommitOptions { amend, allow_empty: merging };
             // Amending only the message must work with nothing staged.
             let opts = if amend { ops::CommitOptions { allow_empty: true, ..opts } } else { opts };
             let id = ops::commit(git, &message, &opts)?;
             let subject = message.lines().next().unwrap_or_default();
-            Ok(OpOutcome { summary: format!("Committed {} {subject}", id.short()), refs_changed: true })
+            Ok(OpOutcome::new(format!("Committed {} {subject}", id.short())).moving_refs())
         });
     }
 
     /// Toggles amend. Turning it on sets the draft aside and loads HEAD's
     /// message for editing; turning it off brings the draft back.
     pub fn set_amend(&mut self, amend: bool) {
-        if amend == self.amend {
+        if amend == self.amend || (amend && self.status.state != RepoState::Clean) {
             return;
         }
         self.amend = amend;
@@ -770,6 +872,10 @@ impl RepoTab {
     pub fn line_actions(&self) -> Option<LineActions> {
         let (side, file) = self.changes_selected.as_ref()?;
         let Some(Ok(doc)) = &self.changes_diff.doc else { return None };
+        // Conflicts are resolved per file (context menu), not by hunk.
+        if file.kind == ChangeKind::Conflicted {
+            return None;
+        }
         let disabled = if doc.binary {
             Some("Binary files are staged as a whole")
         } else if file.is_submodule {
@@ -848,7 +954,7 @@ impl RepoTab {
                 PatchMode::Unstage => "Unstaged",
                 PatchMode::Discard => "Discarded",
             };
-            Ok(OpOutcome { summary: format!("{verb} {n} line(s) in {}", file.path), refs_changed: false })
+            Ok(OpOutcome::new(format!("{verb} {n} line(s) in {}", file.path)))
         });
     }
 
@@ -857,17 +963,28 @@ impl RepoTab {
         self.worker.repo_key()
     }
 
-    /// Result of an operation started by a tab that has since been closed.
+    /// Result of an operation started by a tab (for this work tree) that
+    /// has since been closed: its follow-ups — where stashed changes are, a
+    /// stash conflict — are taken over here.
     pub fn on_external_op_done(&mut self, kind: OpKind, result: anyhow::Result<OpOutcome>) {
         match result {
-            Ok(out) => self.activity.push(format!("{} (from a closed tab)", out.summary)),
+            Ok(mut out) => {
+                if !out.summary.is_empty() {
+                    self.activity.push(format!("{} (from a closed tab)", out.summary));
+                }
+                for f in std::mem::take(&mut out.follow_ups) {
+                    // A question for a closed tab is moot; state is not.
+                    if !matches!(f, crate::worker::FollowUp::Empty(_)) {
+                        self.handle_follow_up(f);
+                    }
+                }
+            }
             Err(e) => self.error(format!("{} (started in a closed tab) failed: {e:#}", kind.label())),
         }
         self.refresh_if_changed();
     }
 
-    fn on_op_done(&mut self, kind: OpKind, result: anyhow::Result<OpOutcome>) {
-        self.ops_in_flight = self.ops_in_flight.saturating_sub(1);
+    fn on_op_done(&mut self, id: OpId, kind: OpKind, result: anyhow::Result<OpOutcome>) {
         // Whatever the operation did, the shown diff is outdated until the
         // refresh below brings a new one.
         if self.changes_diff.doc.is_some() {
@@ -877,10 +994,18 @@ impl RepoTab {
         if matches!(kind, OpKind::Commit { .. }) {
             self.ops_moved_refs = true;
         }
+        // Failed or cancelled operations may have moved refs part-way (e.g.
+        // a branch created, then the switch failed): always re-check.
+        if result.is_err() {
+            self.ops_moved_refs = true;
+        }
         match result {
-            Ok(out) => {
+            Ok(mut out) => {
                 self.ops_moved_refs |= out.refs_changed;
-                self.activity.push(out.summary);
+                self.activity.push(std::mem::take(&mut out.summary));
+                for f in std::mem::take(&mut out.follow_ups) {
+                    self.handle_follow_up(f);
+                }
                 if let OpKind::Commit { message, amend } = kind {
                     self.commit_subject.clear();
                     self.commit_body.clear();
@@ -893,42 +1018,75 @@ impl RepoTab {
                     self.committed_messages.push(message);
                 }
             }
+            Err(e) if e.downcast_ref::<crate::worker::NeedsDecision>().is_some() => {
+                self.changes_next = None;
+                if let Ok(d) = e.downcast::<crate::worker::NeedsDecision>() {
+                    self.handle_decision(d);
+                }
+            }
             Err(e) => {
                 self.changes_next = None;
-                self.error(format!("{} failed: {e:#}", kind.label()));
+                self.last_failed_op = Some(id);
+                if e.downcast_ref::<tine_core::Cancelled>().is_some() {
+                    // The registry checked for lock files left behind.
+                    let notes = ops_registry::snapshot(id).map(|s| s.notes).unwrap_or_default();
+                    if notes.is_empty() {
+                        self.error(format!("{} was cancelled", kind.label()));
+                    } else {
+                        self.error(format!("{} was cancelled; {}", kind.label(), notes.join("; ")));
+                    }
+                } else {
+                    self.error(format!("{} failed: {e:#}", kind.label()));
+                }
             }
         }
-        if self.ops_in_flight == 0 {
-            let held = std::mem::take(&mut self.held_fs);
-            if std::mem::take(&mut self.ops_moved_refs) || held.refs {
-                self.refresh_if_changed();
-            } else {
-                self.refresh_status();
-            }
+        if !self.op_active() {
+            // Refs and status are both re-read after every operation (busy()
+            // waits for both); history reloads only if refs moved.
+            self.held_fs = FsChange::default();
+            self.ops_moved_refs = false;
+            self.seen_regen = ops_registry::generation(self.repo_key());
+            self.refresh_if_changed();
         }
     }
 
-
-    /// During a merge (or cherry-pick/revert with conflicts) git prepares
-    /// the message in MERGE_MSG; offer it like Fork does.
-    fn prefill_merge_message(&mut self) {
-        let in_progress = matches!(
-            self.status.state,
-            RepoState::Merging | RepoState::CherryPicking | RepoState::Reverting
-        );
-        if !in_progress {
+    /// Keeps the commit box consistent with operations in progress. When
+    /// one starts, Amend is turned off and the draft set aside; during a
+    /// merge/cherry-pick/revert git's prepared message (MERGE_MSG) is shown,
+    /// like Fork does. When it ends, the draft comes back.
+    fn sync_commit_box_with_state(&mut self) {
+        let in_progress = !matches!(self.status.state, RepoState::Clean | RepoState::Bisecting);
+        if in_progress && !self.merge_msg_loaded {
+            self.merge_msg_loaded = true;
+            let draft = if self.amend {
+                // The fields hold HEAD's message; the user's draft was set
+                // aside when amend was turned on.
+                self.amend = false;
+                self.commit_subject.clear();
+                self.commit_body.clear();
+                self.amend_draft.take()
+            } else {
+                Some((std::mem::take(&mut self.commit_subject), std::mem::take(&mut self.commit_body)))
+            };
+            self.op_draft = draft.filter(|(s, b)| !s.trim().is_empty() || !b.trim().is_empty());
+            if matches!(self.status.state, RepoState::Merging | RepoState::CherryPicking | RepoState::Reverting)
+                && let Ok(text) = std::fs::read_to_string(self.paths.git_dir.join("MERGE_MSG"))
+            {
+                let cleaned: String = text.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n");
+                let (subject, body) = ops::split_message(&cleaned);
+                self.commit_subject = subject;
+                self.commit_body = body;
+            }
+        } else if !in_progress && self.merge_msg_loaded {
+            // Finished (the commit cleared the box) or aborted (the box still
+            // holds the operation's message): bring the draft back.
             self.merge_msg_loaded = false;
-            return;
-        }
-        if self.merge_msg_loaded || !self.commit_subject.is_empty() || !self.commit_body.is_empty() {
-            return;
-        }
-        self.merge_msg_loaded = true;
-        if let Ok(text) = std::fs::read_to_string(self.paths.git_dir.join("MERGE_MSG")) {
-            let cleaned: String = text.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n");
-            let (subject, body) = ops::split_message(&cleaned);
-            self.commit_subject = subject;
-            self.commit_body = body;
+            self.commit_subject.clear();
+            self.commit_body.clear();
+            if let Some((subject, body)) = self.op_draft.take() {
+                self.commit_subject = subject;
+                self.commit_body = body;
+            }
         }
     }
 
@@ -947,6 +1105,36 @@ impl RepoTab {
 
     pub fn head_commit(&self) -> Option<Oid> {
         self.refs.head_target()
+    }
+}
+
+impl Drop for RepoTab {
+    /// Results that arrived but were not processed yet, and recovery state
+    /// (stashed changes waiting, a stash conflict) are handed to the app so
+    /// a tab reopened on this work tree can take them over.
+    fn drop(&mut self) {
+        use crate::{ops_registry::OrphanedResult, worker::FollowUp};
+        let repo = self.repo_key().to_path_buf();
+        let origin = self.paths.workdir.clone();
+        for msg in self.worker.poll().collect::<Vec<_>>() {
+            if let Msg::OpDone(id, kind, result) = msg {
+                ops_registry::push_orphan(OrphanedResult { repo: repo.clone(), origin: origin.clone(), id, kind, result });
+            }
+        }
+        let mut carried = OpOutcome::default();
+        if let Some(oid) = self.pending_autostash {
+            carried = carried.with(FollowUp::AutoStash(tine_core::autostash::AutoStash::Kept(oid)));
+        }
+        if let Some(sc) = self.stash_conflict.take() {
+            carried = carried.with(FollowUp::StashConflict {
+                oid: sc.oid,
+                was_clean_before: sc.was_clean_before,
+                created_untracked: sc.created_untracked,
+            });
+        }
+        if !carried.follow_ups.is_empty() {
+            ops_registry::push_orphan(OrphanedResult { repo, origin, id: 0, kind: OpKind::Recovered, result: Ok(carried) });
+        }
     }
 }
 

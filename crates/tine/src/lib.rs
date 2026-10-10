@@ -1,6 +1,7 @@
 pub mod app;
 pub mod diff_model;
 pub mod fonts;
+pub mod ops_registry;
 pub mod probe;
 pub mod repo;
 pub mod theme;

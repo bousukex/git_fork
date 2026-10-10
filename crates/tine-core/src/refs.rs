@@ -42,6 +42,33 @@ fn submodules(git: &GitRunner) -> Result<Vec<bstr::BString>> {
     Ok(paths)
 }
 
+/// Branches checked out in linked worktrees other than `workdir` (they
+/// can't be checked out or deleted here).
+pub fn branches_in_other_worktrees(git: &GitRunner, workdir: &std::path::Path) -> Result<Vec<String>> {
+    let out = git.output(["worktree", "list", "--porcelain", "-z"])?;
+    let this = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let mut result = Vec::new();
+    let (mut path, mut branch): (Option<std::path::PathBuf>, Option<String>) = (None, None);
+    // Records are NUL-terminated lines; an empty record ends a worktree.
+    for rec in out.split(|&b| b == 0) {
+        if rec.is_empty() {
+            if let (Some(p), Some(b)) = (path.take(), branch.take())
+                && p.canonicalize().unwrap_or(p) != this
+            {
+                result.push(b);
+            }
+            path = None;
+            branch = None;
+        } else if let Some(p) = rec.strip_prefix(b"worktree ") {
+            use std::os::unix::ffi::OsStrExt as _;
+            path = Some(std::ffi::OsStr::from_bytes(p).into());
+        } else if let Some(b) = rec.strip_prefix(b"branch refs/heads/") {
+            branch = Some(b.to_str_lossy().into_owned());
+        }
+    }
+    Ok(result)
+}
+
 fn parse_ref(line: &[u8]) -> Option<GitRef> {
     let mut f = line.split(|&b| b == 0);
     let full_name = f.next()?.to_str_lossy().into_owned();

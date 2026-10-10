@@ -267,3 +267,35 @@ fn ignored_paths_and_submodules() {
     let sub = st.unstaged.iter().find(|f| f.path == "libs/sub").expect("dirty submodule listed");
     assert!(sub.is_submodule);
 }
+
+#[test]
+fn linked_worktrees_share_a_common_dir() {
+    let repo = TestRepo::new();
+    repo.commit_file("a", "1", "one");
+    let wt = tempfile::tempdir().unwrap();
+    let wt_path = wt.path().join("wt");
+    repo.git(["worktree", "add", "-q", "-b", "side", wt_path.to_str().unwrap()]);
+    let main = repo.reader();
+    let other = tine_core::CliReader::with_runner(repo.runner().with_workdir(&wt_path)).unwrap();
+    assert_ne!(main.paths().git_dir, other.paths().git_dir);
+    assert_eq!(
+        main.paths().common_dir.canonicalize().unwrap(),
+        other.paths().common_dir.canonicalize().unwrap()
+    );
+    let elsewhere = tine_core::refs::branches_in_other_worktrees(&repo.runner(), repo.path()).unwrap();
+    assert_eq!(elsewhere, ["side"]);
+    let from_wt = tine_core::refs::branches_in_other_worktrees(&repo.runner().with_workdir(&wt_path), &wt_path).unwrap();
+    assert_eq!(from_wt, ["main"]);
+}
+
+#[test]
+fn reports_leftover_lock_files() {
+    let repo = TestRepo::new();
+    repo.commit_file("a", "1", "one");
+    let r = repo.reader();
+    assert!(tine_core::maintenance::leftover_locks(r.paths()).is_empty());
+    std::fs::write(repo.path().join(".git/index.lock"), "").unwrap();
+    std::fs::write(repo.path().join(".git/refs/heads/main.lock"), "").unwrap();
+    let locks = tine_core::maintenance::leftover_locks(r.paths());
+    assert_eq!(locks.len(), 2, "{locks:?}");
+}

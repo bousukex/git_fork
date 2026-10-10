@@ -132,6 +132,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
     let head = tab.head_commit();
     let detached = matches!(tab.refs.head, Some(Head::Detached(_)));
     let mut clicked: Option<Oid> = None;
+    let mut action: Option<super::menus::RefAction> = None;
 
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -152,6 +153,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                 let c = &tab.history.commits[i];
                 let selected = tab.selected_commit == Some(c.id);
                 let (rect, resp) = super::list_row(ui, ROW_HEIGHT, selected, true);
+                resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("commit {} {}", c.id.short(), c.subject))
+                });
                 if i == rows.start {
                     first_graph_rect = Some(Rect::from_min_size(columns(rect).desc.min, vec2(graph_w, ROW_HEIGHT)));
                 }
@@ -159,14 +163,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                     clicked = Some(c.id);
                 }
                 resp.context_menu(|ui| {
-                    if ui.button("Copy Commit Hash").clicked() {
-                        ui.ctx().copy_text(c.id.to_hex());
-                        ui.close();
-                    }
-                    if ui.button("Copy Commit Message").clicked() {
-                        ui.ctx().copy_text(c.subject.clone());
-                        ui.close();
-                    }
+                    clicked = Some(c.id);
+                    super::menus::commit_menu(ui, tab, c, &mut action);
                 });
                 if !ui.is_rect_visible(rect) {
                     continue;
@@ -192,7 +190,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                             break;
                         }
                         let (text, fill) = if r.is_head {
-                            (format!("✔ {}", r.short_name), p.badge_head)
+                            (format!("✓ {}", r.short_name), p.badge_head)
                         } else {
                             (r.short_name.clone(), badge_color(r.kind, p))
                         };
@@ -230,5 +228,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
 
     if let Some(id) = clicked {
         tab.select_commit(id);
+    }
+    if let Some(a) = action {
+        super::menus::apply(tab, a);
     }
 }

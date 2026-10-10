@@ -38,6 +38,9 @@ pub struct TineApp {
     ctx: egui::Context,
     /// App-level messages (e.g. results of operations from closed tabs).
     notices: Vec<String>,
+    /// Results from closed tabs whose work tree is not open (yet); handed
+    /// to a tab when that work tree is opened again.
+    held_orphans: Vec<crate::ops_registry::OrphanedResult>,
 }
 
 /// F12 overlay with frame timing and memory, for checking performance.
@@ -103,6 +106,7 @@ impl TineApp {
             focused: true,
             ctx: cc.egui_ctx.clone(),
             notices: Vec::new(),
+            held_orphans: Vec::new(),
         };
         let restoring = paths.is_empty();
         let to_open = if restoring { app.state.open.clone() } else { paths };
@@ -129,6 +133,23 @@ impl TineApp {
         }
     }
 
+    fn deliver_orphan(&mut self, o: crate::ops_registry::OrphanedResult) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.paths.workdir == o.origin) {
+            t.on_external_op_done(o.kind, o.result);
+            return;
+        }
+        let text = match &o.result {
+            Ok(out) if out.summary.is_empty() => None,
+            Ok(out) => Some(format!("{} ({})", out.summary, o.origin.display())),
+            Err(e) => Some(format!("{} failed in {}: {e:#}", o.kind.label(), o.origin.display())),
+        };
+        self.notices.extend(text);
+        let needs_tab = o.result.as_ref().is_ok_and(|out| !out.follow_ups.is_empty());
+        if needs_tab {
+            self.held_orphans.push(o);
+        }
+    }
+
     fn open(&mut self, path: &Path, ctx: &egui::Context) {
         if let Some(i) = self.tabs.iter().position(|t| t.paths.workdir == path) {
             self.active = i;
@@ -146,11 +167,19 @@ impl TineApp {
                     return;
                 }
                 self.state.recent.retain(|p| p != &workdir);
-                self.state.recent.insert(0, workdir);
+                self.state.recent.insert(0, workdir.clone());
                 self.state.recent.truncate(MAX_RECENT);
                 self.tabs.push(tab);
                 self.active = self.tabs.len() - 1;
                 self.open_error = None;
+                // Recovery state left by a closed tab for this work tree.
+                let (mine, others): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut self.held_orphans).into_iter().partition(|o| o.origin == workdir);
+                self.held_orphans = others;
+                let tab = self.tabs.last_mut().expect("just pushed");
+                for o in mine {
+                    tab.on_external_op_done(o.kind, o.result);
+                }
             }
             Err(e) => self.open_error = Some(format!("{}: {e:#}", path.display())),
         }
@@ -223,9 +252,26 @@ impl TineApp {
                 self.pick_folder();
             }
             ui.separator();
-            for (label, tip) in [("Fetch", "M3"), ("Pull", "M3"), ("Push", "M3"), ("Stash", "M3"), ("Branch", "M3")] {
-                ui.add_enabled(false, egui::Button::new(label))
-                    .on_disabled_hover_text(format!("Not implemented yet ({tip})"));
+            for label in ["Fetch", "Pull", "Push"] {
+                ui.add_enabled(false, egui::Button::new(label)).on_disabled_hover_text("Coming in M3b");
+            }
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                let block = t.block_reason(crate::repo::Needs::CleanState);
+                let resp = ui
+                    .add_enabled(block.is_none(), egui::Button::new("Stash"))
+                    .on_hover_text("Stash local changes")
+                    .on_disabled_hover_text(block.unwrap_or_default());
+                if resp.clicked() {
+                    t.open_stash_dialog();
+                }
+                let block = t.block_reason(crate::repo::Needs::Idle);
+                let resp = ui
+                    .add_enabled(block.is_none(), egui::Button::new("Branch"))
+                    .on_hover_text("Create a branch at HEAD")
+                    .on_disabled_hover_text(block.unwrap_or_default());
+                if resp.clicked() {
+                    t.open_create_branch("HEAD", "HEAD");
+                }
             }
             ui.separator();
             let has_tab = !self.tabs.is_empty();
@@ -233,6 +279,13 @@ impl TineApp {
                 && let Some(t) = self.tabs.get_mut(self.active)
             {
                 t.refresh();
+            }
+
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                let label = if t.output_open { "Hide Output" } else { "Output" };
+                if ui.button(label).on_hover_text("Git commands run by Tine and their output").clicked() {
+                    t.output_open = !t.output_open;
+                }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -247,7 +300,15 @@ impl TineApp {
                         ui.ctx().set_theme(pref);
                     }
                 });
-                if let Some(t) = self.tabs.get(self.active) {
+                if let Some(t) = self.tabs.get(self.active)
+                    && let Some((id, text)) = ui::output::running_summary(t)
+                {
+                    if ui.small_button("Cancel").clicked() {
+                        crate::ops_registry::cancel(id);
+                    }
+                    ui.label(RichText::new(text).small().color(p.text_weak));
+                    ui.spinner();
+                } else if let Some(t) = self.tabs.get(self.active) {
                     let h = &t.history;
                     let text = if h.loading {
                         format!("Loading history… {}", h.commits.len())
@@ -335,6 +396,7 @@ fn error_banner(ui: &mut egui::Ui, tab: &mut RepoTab) {
     }
     let p = Palette::of(ui.ctx());
     let mut dismiss = false;
+    let mut details = false;
     egui::Frame::NONE
         .fill(p.diff_del_bg)
         .inner_margin(egui::Margin::symmetric(10, 6))
@@ -343,12 +405,20 @@ fn error_banner(ui: &mut egui::Ui, tab: &mut RepoTab) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(tab.errors.last().expect("non-empty")).color(p.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    dismiss = ui.small_button("✕").clicked();
+                    dismiss = ui.small_button("×").clicked();
+                    if tab.last_failed_op.is_some() {
+                        details = ui.small_button("Details").on_hover_text("Show the git output").clicked();
+                    }
                 });
             });
         });
+    if details {
+        tab.output_open = true;
+        tab.output_focus = tab.last_failed_op;
+    }
     if dismiss {
         tab.errors.clear();
+        tab.last_failed_op = None;
     }
 }
 
@@ -375,16 +445,12 @@ impl eframe::App for TineApp {
                 self.state.messages.push(m);
             }
         }
-        // Operations whose tab was closed: hand the result to a tab showing
-        // the same repository, or report it at app level.
+        // Operations whose tab was closed: the work tree that started them
+        // takes them over (its stash conflict, stashed changes…); other
+        // worktrees of the repository just refresh. Without a tab for that
+        // work tree, keep them until one is opened.
         for o in crate::worker::take_orphaned_results() {
-            match self.tabs.iter_mut().find(|t| t.repo_key() == o.repo) {
-                Some(t) => t.on_external_op_done(o.kind, o.result),
-                None => self.notices.push(match o.result {
-                    Ok(out) => format!("{} ({})", out.summary, o.repo.display()),
-                    Err(e) => format!("{} failed in {}: {e:#}", o.kind.label(), o.repo.display()),
-                }),
-            }
+            self.deliver_orphan(o);
         }
         let excess = self.state.messages.len().saturating_sub(MAX_MESSAGES);
         self.state.messages.drain(..excess);
@@ -420,7 +486,7 @@ impl eframe::App for TineApp {
                     ui.horizontal(|ui| {
                         ui.label(self.notices.last().expect("non-empty"));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            dismiss = ui.small_button("✕").clicked();
+                            dismiss = ui.small_button("×").clicked();
                         });
                     });
                 });
@@ -448,6 +514,14 @@ impl eframe::App for TineApp {
 
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(p.bg)).show(ui, |ui| {
             error_banner(ui, tab);
+            ui::banner::show(ui, tab);
+            if tab.output_open {
+                egui::Panel::bottom("output")
+                    .resizable(true)
+                    .default_size(220.0)
+                    .frame(egui::Frame::NONE.fill(p.sidebar_bg).inner_margin(egui::Margin::symmetric(8, 4)))
+                    .show(ui, |ui| ui::output::show(ui, tab));
+            }
             match tab.view {
                 View::History => {
                     let h = ui.available_height();
@@ -464,6 +538,7 @@ impl eframe::App for TineApp {
                 View::LocalChanges => ui::changes::show(ui, tab, &self.state.messages),
             }
         });
+        ui::dialogs::show(&ctx, tab);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

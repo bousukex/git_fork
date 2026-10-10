@@ -76,6 +76,10 @@ pub fn show(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions, actions: Opti
             let p = Palette::of(ui.ctx());
             ui.label(RichText::new(e).color(p.status_deleted));
         }
+        Some(Ok(doc)) if doc.header.iter().any(|h| h == tine_core::diff::CONFLICT_DELETED_HEADER) => placeholder(
+            ui,
+            "Deleted on one side of the conflict. Right-click the file to keep a version or resolve by deleting.",
+        ),
         Some(Ok(doc)) if doc.binary => placeholder(ui, "Binary file"),
         Some(Ok(doc)) if doc.is_empty() => {
             let msg = if file.is_submodule {
@@ -89,9 +93,31 @@ pub fn show(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions, actions: Opti
             };
             placeholder(ui, &msg);
         }
-        Some(Ok(doc)) => rows(ui, doc, pane, actions, &mut events),
+        Some(Ok(doc)) => {
+            if doc.header.iter().any(|h| h == tine_core::diff::CONFLICT_HEADER) {
+                conflict_legend(ui);
+            }
+            rows(ui, doc, pane, actions, &mut events)
+        }
     }
     events
+}
+
+fn conflict_legend(ui: &mut egui::Ui) {
+    let p = Palette::of(ui.ctx());
+    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("■").color(p.diff_del_strong));
+            ui.label(RichText::new("HEAD (ours)").small());
+            ui.label(RichText::new("■").color(p.diff_add_strong));
+            ui.label(RichText::new("Incoming (theirs)").small());
+            ui.label(
+                RichText::new("— edit the file, or right-click it in the list to pick a side")
+                    .small()
+                    .color(p.text_weak),
+            );
+        });
+    });
 }
 
 /// Selection after a press on `row` (only changed rows are selectable).

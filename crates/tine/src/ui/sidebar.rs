@@ -18,6 +18,7 @@ enum Action {
     View(View),
     Reveal(Oid),
     ShowStash(Oid),
+    Ref(super::menus::RefAction),
     /// Path relative to the work tree, as raw bytes (may not be UTF-8).
     OpenSubmodule(bstr::BString),
 }
@@ -39,8 +40,16 @@ impl<'a> Tree<'a> {
 }
 
 fn item(ui: &mut egui::Ui, depth: usize, text: &str, right: &str, selected: bool, bold: bool) -> egui::Response {
+    labeled_item(ui, depth, text, right, selected, bold, text)
+}
+
+/// A sidebar row; `a11y` names it for screen readers and UI tests
+/// (e.g. "branch main", "tag v1.0").
+#[allow(clippy::too_many_arguments)]
+fn labeled_item(ui: &mut egui::Ui, depth: usize, text: &str, right: &str, selected: bool, bold: bool, a11y: &str) -> egui::Response {
     let p = Palette::of(ui.ctx());
     let (rect, resp) = super::list_row(ui, ITEM_H, selected, true);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, a11y));
     let left = rect.left() + 10.0 + depth as f32 * INDENT;
     let family = if bold { FontFamily::Name(crate::fonts::BOLD.into()) } else { FontFamily::Proportional };
     let right_w = if right.is_empty() { 0.0 } else { 70.0 };
@@ -73,21 +82,39 @@ fn tracking_text(t: Tracking) -> String {
     }
 }
 
-fn show_tree(ui: &mut egui::Ui, tree: &Tree<'_>, depth: usize, salt: &str, selected: Option<Oid>, actions: &mut Vec<Action>) {
+fn show_tree(
+    ui: &mut egui::Ui,
+    tab: &RepoTab,
+    tree: &Tree<'_>,
+    depth: usize,
+    salt: &str,
+    selected: Option<Oid>,
+    actions: &mut Vec<Action>,
+) {
     for (name, sub) in &tree.folders {
         let id = ui.id().with((salt, name, depth));
         egui::CollapsingHeader::new(RichText::new(name).size(13.0))
             .id_salt(id)
             .default_open(true)
             // The collapsing body already indents its children.
-            .show(ui, |ui| show_tree(ui, sub, 0, salt, selected, actions));
+            .show(ui, |ui| show_tree(ui, tab, sub, 0, salt, selected, actions));
     }
     for (name, r) in &tree.leaves {
-        let resp = item(ui, depth, name, &tracking_text(r.track), selected == Some(r.target), r.is_head);
-        if resp.clicked() {
+        let kind = if r.kind == RefKind::RemoteBranch { "remote branch" } else { "branch" };
+        let a11y = format!("{kind} {}", r.short_name);
+        let resp = labeled_item(ui, depth, name, &tracking_text(r.track), selected == Some(r.target), r.is_head, &a11y);
+        if resp.double_clicked() {
+            // Like Fork: double-click checks out.
+            actions.push(Action::Ref(match r.kind {
+                RefKind::RemoteBranch => super::menus::RefAction::CheckoutRemote((*r).clone()),
+                _ => super::menus::RefAction::Checkout(r.short_name.clone()),
+            }));
+        } else if resp.clicked() {
             actions.push(Action::Reveal(r.target));
         }
-        resp.on_hover_text(&r.full_name);
+        let mut chosen = None;
+        resp.on_hover_text(&r.full_name).context_menu(|ui| super::menus::branch_menu(ui, tab, r, &mut chosen));
+        actions.extend(chosen.map(Action::Ref));
     }
 }
 
@@ -135,7 +162,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             local.insert(&r.short_name, r);
             n += 1;
         }
-        section(ui, "Branches", n, |ui| show_tree(ui, &local, 0, "local", selected, &mut actions));
+        section(ui, "Branches", n, |ui| show_tree(ui, tab, &local, 0, "local", selected, &mut actions));
 
         let mut remotes: BTreeMap<&str, Tree<'_>> = BTreeMap::new();
         let mut n = 0;
@@ -149,7 +176,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                 egui::CollapsingHeader::new(RichText::new(*remote).size(13.0))
                     .id_salt(("remote", *remote))
                     .default_open(true)
-                    .show(ui, |ui| show_tree(ui, tree, 0, remote, selected, &mut actions));
+                    .show(ui, |ui| show_tree(ui, tab, tree, 0, remote, selected, &mut actions));
             }
         });
 
@@ -158,10 +185,14 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
         tags.sort_by(|a, b| natord(&b.short_name, &a.short_name));
         section(ui, "Tags", tags.len(), |ui| {
             for r in tags {
-                let resp = item(ui, 0, &r.short_name, "", selected == Some(r.target), false);
+                let resp =
+                    labeled_item(ui, 0, &r.short_name, "", selected == Some(r.target), false, &format!("tag {}", r.short_name));
                 if resp.clicked() {
                     actions.push(Action::Reveal(r.target));
                 }
+                let mut chosen = None;
+                resp.context_menu(|ui| super::menus::tag_menu(ui, tab, r, &mut chosen));
+                actions.extend(chosen.map(Action::Ref));
             }
         });
 
@@ -184,10 +215,21 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
         let stashes: Vec<_> = tab.refs.stashes.iter().filter(|s| matches(&s.message)).collect();
         section(ui, "Stashes", stashes.len(), |ui| {
             for s in stashes {
-                let resp = item(ui, 0, &s.message, &format!("{{{}}}", s.index), selected == Some(s.id), false);
+                let resp = labeled_item(
+                    ui,
+                    0,
+                    &s.message,
+                    &format!("{{{}}}", s.index),
+                    selected == Some(s.id),
+                    false,
+                    &format!("stash {}", s.index),
+                );
                 if resp.clicked() {
                     actions.push(Action::ShowStash(s.id));
                 }
+                let mut chosen = None;
+                resp.context_menu(|ui| super::menus::stash_menu(ui, tab, s, &mut chosen));
+                actions.extend(chosen.map(Action::Ref));
             }
         });
     });
@@ -197,6 +239,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             Action::View(v) => tab.view = v,
             Action::Reveal(id) => tab.reveal_commit(id),
             Action::ShowStash(id) => tab.select_commit(id),
+            Action::Ref(a) => super::menus::apply(tab, a),
             Action::OpenSubmodule(path) => {
                 use std::os::unix::ffi::OsStrExt as _;
                 tab.open_request = Some(tab.paths.workdir.join(std::ffi::OsStr::from_bytes(&path)));

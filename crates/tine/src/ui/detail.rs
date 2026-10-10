@@ -79,6 +79,7 @@ fn files(ui: &mut egui::Ui, tab: &RepoTab, actions: &mut Vec<Action>) {
                 for i in range {
                     let f = &tab.commit.files[i];
                     let (rect, resp) = super::list_row(ui, FILE_ROW_H, tab.commit.selected_file == Some(i), true);
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("changed file {}", f.path)));
                     if resp.clicked() {
                         actions.push(Action::SelectFile(i));
                     }

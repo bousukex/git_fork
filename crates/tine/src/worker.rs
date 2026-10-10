@@ -6,9 +6,8 @@
 //! state.
 
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::Arc,
 };
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -28,75 +27,75 @@ pub struct OpOutcome {
     pub summary: String,
     /// Branches/HEAD may have moved (history needs a check).
     pub refs_changed: bool,
+    /// Things the UI must follow up on, in order.
+    pub follow_ups: Vec<FollowUp>,
 }
 
-type OpFn = Box<dyn FnOnce() -> anyhow::Result<OpOutcome> + Send>;
-
-/// A write operation waiting in a repository's queue.
-struct QueuedOp {
-    kind: OpKind,
-    run: OpFn,
-    /// The submitting tab; gone if the tab was closed meanwhile.
-    reply: Sender<Msg>,
-    ctx: egui::Context,
-}
-
-/// Result of an operation whose tab was closed before it finished.
-pub struct OrphanedResult {
-    /// Repository key (canonical git dir), see [`repo_key`].
-    pub repo: PathBuf,
-    pub kind: OpKind,
-    pub result: anyhow::Result<OpOutcome>,
-}
-
-/// One queue (and thread) per repository for the whole process, so writes
-/// stay serialized even if a tab is closed and the repository reopened
-/// while an operation is still running.
-fn queues() -> &'static Mutex<HashMap<PathBuf, Sender<QueuedOp>>> {
-    static QUEUES: OnceLock<Mutex<HashMap<PathBuf, Sender<QueuedOp>>>> = OnceLock::new();
-    QUEUES.get_or_init(Default::default)
-}
-
-fn orphans() -> &'static Mutex<Vec<OrphanedResult>> {
-    static ORPHANS: OnceLock<Mutex<Vec<OrphanedResult>>> = OnceLock::new();
-    ORPHANS.get_or_init(Default::default)
-}
-
-/// Results of operations whose tab no longer exists (for the app to show).
-pub fn take_orphaned_results() -> Vec<OrphanedResult> {
-    std::mem::take(&mut *orphans().lock().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// Identifies a repository across tabs.
-pub fn repo_key(git_dir: &Path) -> PathBuf {
-    git_dir.canonicalize().unwrap_or_else(|_| git_dir.to_path_buf())
-}
-
-fn queue_for(repo: &Path) -> anyhow::Result<Sender<QueuedOp>> {
-    let mut map = queues().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tx) = map.get(repo) {
-        return Ok(tx.clone());
+impl OpOutcome {
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self { summary: summary.into(), ..Default::default() }
     }
-    let (tx, rx) = unbounded::<QueuedOp>();
-    let key = repo.to_path_buf();
-    std::thread::Builder::new().name("tine-ops".into()).spawn(move || {
-        for op in rx {
-            let result = (op.run)();
-            if let Err(crossbeam_channel::SendError(Msg::OpDone(kind, result))) =
-                op.reply.send(Msg::OpDone(op.kind, result))
-            {
-                orphans().lock().unwrap_or_else(|e| e.into_inner()).push(OrphanedResult {
-                    repo: key.clone(),
-                    kind,
-                    result,
-                });
-            }
-            op.ctx.request_repaint();
-        }
-    })?;
-    map.insert(repo.to_path_buf(), tx.clone());
-    Ok(tx)
+
+    pub fn moving_refs(mut self) -> Self {
+        self.refs_changed = true;
+        self
+    }
+
+    pub fn with(mut self, f: FollowUp) -> Self {
+        self.follow_ups.push(f);
+        self
+    }
 }
+
+/// Things a successful operation leaves for the UI to handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowUp {
+    /// Stopped with conflicts (the in-progress banner takes over).
+    Conflicts,
+    /// The current step of this operation would be an empty commit.
+    Empty(tine_core::model::RepoState),
+    /// Where auto-stashed local changes ended up.
+    AutoStash(tine_core::autostash::AutoStash),
+    /// Applying a stash conflicted; the stash was kept.
+    StashConflict { oid: tine_core::model::Oid, was_clean_before: bool, created_untracked: Vec<bstr::BString> },
+    /// A stash conflict was finished or undone.
+    ClearStashConflict,
+    /// The auto-stashed changes were applied.
+    ClearPendingAutostash(tine_core::model::Oid),
+    /// Resolved conflicts of unknown origin were finished.
+    ClearGenericConflict,
+}
+
+/// An operation needs the user's decision before it can go on; the UI
+/// shows a dialog instead of an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NeedsDecision {
+    /// The branch has unmerged commits; deleting needs `-D`.
+    ForceDeleteBranch(String),
+    /// Local changes block switching; offer to stash them first.
+    StashAndSwitch(crate::repo::dialog::CheckoutTarget),
+    /// Tracked files changed after the user started an integration; ask
+    /// whether to stash them first.
+    LocalChanges(crate::repo::dialog::Integration),
+    /// What a hard reset would destroy changed since it was confirmed.
+    ResetLossesChanged { target: tine_core::model::Oid, lost: Vec<String> },
+}
+
+impl std::fmt::Display for NeedsDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NeedsDecision::ForceDeleteBranch(b) => write!(f, "'{b}' has unmerged commits"),
+            NeedsDecision::StashAndSwitch(t) => write!(f, "local changes prevent switching to '{}'", t.label()),
+            NeedsDecision::LocalChanges(a) => write!(f, "local changes prevent {}", a.describe()),
+            NeedsDecision::ResetLossesChanged { .. } => write!(f, "the changes a hard reset would discard have changed"),
+        }
+    }
+}
+
+impl std::error::Error for NeedsDecision {}
+
+pub use crate::ops_registry::{OrphanedResult, repo_key, take_orphaned_results};
+use crate::ops_registry::{self, OpContext, OpId};
 
 pub enum Msg {
     Refs(Gen, anyhow::Result<RefsSnapshot>),
@@ -110,7 +109,7 @@ pub enum Msg {
     /// Files changed on disk (from the watcher).
     Fs(crate::watcher::FsChange),
     /// A queued write operation finished.
-    OpDone(OpKind, anyhow::Result<OpOutcome>),
+    OpDone(OpId, OpKind, anyhow::Result<OpOutcome>),
     HeadMessage(Gen, anyhow::Result<String>),
 }
 
@@ -123,19 +122,70 @@ pub enum OpKind {
     Commit { message: String, amend: bool },
     /// Hunk/line level stage, unstage or discard.
     Patch(tine_core::patch::PatchMode),
+    Checkout(String),
+    CreateBranch(String),
+    RenameBranch(String),
+    DeleteBranch(String),
+    Tag(String),
+    DeleteTag(String),
+    Merge(String),
+    Rebase(String),
+    CherryPick(String),
+    Revert(String),
+    Reset(String),
+    Stash,
+    StashApply,
+    StashPop,
+    StashDrop,
+    Continue,
+    Abort,
+    Skip,
+    Resolve,
+    MergeTool,
+    FinishStashConflict,
+    UndoStashApply,
+    /// Unstaging files whose conflicts were resolved.
+    UnstageResolved,
+    /// State handed over from a closed tab (not a git operation).
+    Recovered,
 }
 
 impl OpKind {
     pub fn label(&self) -> &'static str {
+        use tine_core::patch::PatchMode;
         match self {
             OpKind::Stage => "Stage",
             OpKind::Unstage => "Unstage",
             OpKind::Discard => "Discard",
             OpKind::Commit { amend: false, .. } => "Commit",
             OpKind::Commit { amend: true, .. } => "Amend",
-            OpKind::Patch(tine_core::patch::PatchMode::Stage) => "Stage lines",
-            OpKind::Patch(tine_core::patch::PatchMode::Unstage) => "Unstage lines",
-            OpKind::Patch(tine_core::patch::PatchMode::Discard) => "Discard lines",
+            OpKind::Patch(PatchMode::Stage) => "Stage lines",
+            OpKind::Patch(PatchMode::Unstage) => "Unstage lines",
+            OpKind::Patch(PatchMode::Discard) => "Discard lines",
+            OpKind::Checkout(_) => "Checkout",
+            OpKind::CreateBranch(_) => "Create branch",
+            OpKind::RenameBranch(_) => "Rename branch",
+            OpKind::DeleteBranch(_) => "Delete branch",
+            OpKind::Tag(_) => "Create tag",
+            OpKind::DeleteTag(_) => "Delete tag",
+            OpKind::Merge(_) => "Merge",
+            OpKind::Rebase(_) => "Rebase",
+            OpKind::CherryPick(_) => "Cherry-pick",
+            OpKind::Revert(_) => "Revert",
+            OpKind::Reset(_) => "Reset",
+            OpKind::Stash => "Stash",
+            OpKind::StashApply => "Apply stash",
+            OpKind::StashPop => "Pop stash",
+            OpKind::StashDrop => "Drop stash",
+            OpKind::Continue => "Continue",
+            OpKind::Abort => "Abort",
+            OpKind::Skip => "Skip",
+            OpKind::Resolve => "Resolve",
+            OpKind::MergeTool => "Merge tool",
+            OpKind::FinishStashConflict => "Finish stash",
+            OpKind::UndoStashApply => "Undo stash apply",
+            OpKind::UnstageResolved => "Unstage resolved files",
+            OpKind::Recovered => "Recovered state",
         }
     }
 }
@@ -153,7 +203,8 @@ pub struct Worker {
 impl Worker {
     pub fn new(reader: Arc<dyn RepoReader>, ctx: egui::Context) -> Self {
         let (tx, rx) = unbounded();
-        let repo = repo_key(&reader.paths().git_dir);
+        // Linked worktrees share refs, so they share one write queue.
+        let repo = repo_key(&reader.paths().common_dir);
         Self { reader, tx, rx, ctx, log_cancel: None, repo }
     }
 
@@ -164,11 +215,14 @@ impl Worker {
     /// Queues a write operation behind any others for this repository; its
     /// result arrives as [`Msg::OpDone`] (or, if this tab is gone by then,
     /// through [`take_orphaned_results`]).
-    pub fn op(&self, kind: OpKind, f: impl FnOnce() -> anyhow::Result<OpOutcome> + Send + 'static) {
-        let op = QueuedOp { kind: kind.clone(), run: Box::new(f), reply: self.tx.clone(), ctx: self.ctx.clone() };
-        let sent = queue_for(&self.repo).and_then(|q| q.send(op).map_err(|_| anyhow::anyhow!("queue closed")));
-        if let Err(e) = sent {
-            let _ = self.tx.send(Msg::OpDone(kind, Err(anyhow::anyhow!("failed to queue the operation: {e:#}"))));
+    pub fn op(&self, kind: OpKind, f: impl FnOnce(&OpContext) -> anyhow::Result<OpOutcome> + Send + 'static) -> Option<OpId> {
+        let paths = self.reader.paths().clone();
+        match ops_registry::submit(&self.repo, &paths, kind.clone(), self.tx.clone(), self.ctx.clone(), Box::new(f)) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                let _ = self.tx.send(Msg::OpDone(0, kind, Err(anyhow::anyhow!("failed to queue the operation: {e:#}"))));
+                None
+            }
         }
     }
 

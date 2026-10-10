@@ -6,7 +6,7 @@ use anyhow::Result;
 use bstr::{BString, ByteSlice};
 
 use crate::{
-    model::{ChangeKind, ChangedFile, RepoState, WorkingStatus},
+    model::{ChangeKind, ChangedFile, ConflictKind, RepoState, WorkingStatus},
     runner::GitRunner,
 };
 
@@ -58,6 +58,9 @@ pub fn parse(out: &[u8]) -> WorkingStatus {
             Some(b'u') => {
                 let fields: Vec<&[u8]> = rec.splitn(11, |&b| b == b' ').collect();
                 if let Some(path) = fields.get(10) {
+                    if let Some(k) = ConflictKind::from_xy(fields[1]) {
+                        st.conflict_kinds.insert(BString::from(*path), k);
+                    }
                     st.conflicted.push(ChangedFile {
                         path: BString::from(*path),
                         orig_path: None,
@@ -84,6 +87,37 @@ pub fn parse(out: &[u8]) -> WorkingStatus {
         list.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()).then(a.path.cmp(&b.path)));
     }
     st
+}
+
+/// Whether tracked files have changes (staged, unstaged or conflicted),
+/// read fresh from git rather than from a possibly stale status.
+pub fn has_tracked_changes(git: &GitRunner) -> Result<bool> {
+    let out = git.output(["status", "--porcelain=v2", "-z", "--untracked-files=no"])?;
+    Ok(out.split(|&b| b == 0).any(|r| matches!(r.first(), Some(b'1' | b'2' | b'u'))))
+}
+
+/// Any change at all, including untracked files.
+pub fn has_any_changes(git: &GitRunner) -> Result<bool> {
+    Ok(!git.output(["status", "--porcelain=v2", "-z", "--untracked-files=normal"])?.is_empty())
+}
+
+/// Working tree status without the in-progress state (no git dir needed).
+pub fn read(git: &GitRunner) -> Result<WorkingStatus> {
+    Ok(parse(&git.output(["status", "--porcelain=v2", "-z", "--untracked-files=all"])?))
+}
+
+/// Whether the index has unmerged (conflicted) entries.
+pub fn has_conflicts(git: &GitRunner) -> Result<bool> {
+    Ok(!git.output(["ls-files", "--unmerged", "-z"])?.is_empty())
+}
+
+/// Progress of a rebase as (current step, total), from the sequencer files.
+pub fn rebase_progress(git_dir: &Path) -> Option<(usize, usize)> {
+    let dir = ["rebase-merge", "rebase-apply"].iter().map(|d| git_dir.join(d)).find(|d| d.is_dir())?;
+    let read = |names: &[&str]| -> Option<usize> {
+        names.iter().find_map(|n| std::fs::read_to_string(dir.join(n)).ok()?.trim().parse().ok())
+    };
+    Some((read(&["msgnum", "next"])?, read(&["end", "last"])?))
 }
 
 /// Which of `paths` (relative to the work tree) git ignores.

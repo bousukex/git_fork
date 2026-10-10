@@ -84,8 +84,77 @@ pub fn parse_raw(out: &[u8]) -> Vec<ChangedFile> {
     files
 }
 
+/// Header marking a [`FileDiff`] built by [`conflict_view`].
+pub const CONFLICT_HEADER: &str = "conflict";
+/// Header for a conflicted file that no longer exists in the work tree.
+pub const CONFLICT_DELETED_HEADER: &str = "conflict: deleted";
+
+/// Shows a conflicted work tree file as a diff-like document: the HEAD side
+/// of each conflict as deleted lines, the incoming side as added lines, and
+/// conflict markers (and a diff3 base section) as plain notes.
+pub fn conflict_view(content: Option<&[u8]>) -> FileDiff {
+    let Some(content) = content else {
+        return FileDiff { header: vec![CONFLICT_DELETED_HEADER.into()], ..Default::default() };
+    };
+    if content[..content.len().min(8000)].contains(&0) {
+        return FileDiff { header: vec![CONFLICT_HEADER.into()], binary: true, ..Default::default() };
+    }
+    #[derive(PartialEq)]
+    enum Part {
+        Outside,
+        Ours,
+        Base,
+        Theirs,
+    }
+    let mut part = Part::Outside;
+    let mut lines = Vec::new();
+    let body = content.strip_suffix(b"\n").unwrap_or(content);
+    for (i, line) in body.split(|&b| b == b'\n').enumerate() {
+        let n = Some(i as u32 + 1);
+        let marker = |p: &[u8]| line.starts_with(p) && (line.len() == 7 || line[7] == b' ');
+        let kind = if marker(b"<<<<<<<") {
+            part = Part::Ours;
+            LineKind::NoNewline
+        } else if marker(b"|||||||") && part == Part::Ours {
+            part = Part::Base;
+            LineKind::NoNewline
+        } else if line == b"=======" && matches!(part, Part::Ours | Part::Base) {
+            part = Part::Theirs;
+            LineKind::NoNewline
+        } else if marker(b">>>>>>>") && part == Part::Theirs {
+            part = Part::Outside;
+            LineKind::NoNewline
+        } else {
+            match part {
+                Part::Outside => LineKind::Context,
+                Part::Ours => LineKind::Deleted,
+                Part::Base => LineKind::NoNewline,
+                Part::Theirs => LineKind::Added,
+            }
+        };
+        lines.push(DiffLine { kind, old_no: None, new_no: n, content: BString::from(line) });
+    }
+    let count = lines.len() as u32;
+    FileDiff {
+        header: vec![CONFLICT_HEADER.into()],
+        binary: false,
+        hunks: vec![Hunk {
+            old_start: 1,
+            old_lines: count,
+            new_start: 1,
+            new_lines: count,
+            section: "conflicted file".into(),
+            lines,
+        }],
+    }
+}
+
 /// Diff of a single file.
 pub fn file_diff(git: &GitRunner, source: DiffSource, file: &ChangedFile, opts: DiffOptions) -> Result<FileDiff> {
+    if source == DiffSource::Unstaged && file.kind == ChangeKind::Conflicted {
+        let path = git.workdir().join(os(&file.path));
+        return Ok(conflict_view(std::fs::read(path).ok().as_deref()));
+    }
     let mut args: Vec<OsString> = Vec::new();
     let mut ok_codes: &[i32] = &[];
     let context = format!("-U{}", opts.context_lines);
@@ -273,5 +342,26 @@ mod tests {
         assert_eq!(files[2].orig_path.as_ref().unwrap(), "old.txt");
         assert_eq!(files[2].path, "renamed.txt");
         assert!(files[3].is_submodule);
+    }
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+
+    #[test]
+    fn conflict_view_marks_sides() {
+        let file = b"top\n<<<<<<< HEAD\nours\n||||||| base\nbase\n=======\ntheirs\n>>>>>>> topic\nbottom\n";
+        let d = conflict_view(Some(file));
+        let kinds: Vec<_> = d.hunks[0].lines.iter().map(|l| l.kind).collect();
+        use LineKind::*;
+        assert_eq!(kinds, [Context, NoNewline, Deleted, NoNewline, NoNewline, NoNewline, Added, NoNewline, Context]);
+        assert_eq!(d.header, vec![BString::from(CONFLICT_HEADER)]);
+        assert_eq!(d.hunks[0].lines[8].new_no, Some(9));
+        assert!(conflict_view(Some(b"\0bin")).binary);
+        assert_eq!(conflict_view(None).header, vec![BString::from(CONFLICT_DELETED_HEADER)]);
+        // A line that merely starts with the marker text is content.
+        let d = conflict_view(Some(b"<<<<<<<<< not a marker\n"));
+        assert_eq!(d.hunks[0].lines[0].kind, Context);
     }
 }

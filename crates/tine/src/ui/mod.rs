@@ -1,8 +1,12 @@
+pub mod banner;
 pub mod changes;
 pub mod detail;
+pub mod dialogs;
 pub mod diff_view;
 pub mod graph_paint;
 pub mod history;
+pub mod menus;
+pub mod output;
 pub mod sidebar;
 
 use std::sync::Arc;

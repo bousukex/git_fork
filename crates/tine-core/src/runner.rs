@@ -7,9 +7,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
@@ -37,6 +38,18 @@ impl fmt::Display for GitError {
 
 impl std::error::Error for GitError {}
 
+/// The command was stopped because its [`CancelToken`] fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
 /// Set when the caller is no longer interested in a long-running command.
 #[derive(Debug, Clone, Default)]
 pub struct CancelToken(Arc<AtomicBool>);
@@ -51,17 +64,82 @@ impl CancelToken {
     }
 }
 
+/// One finished git invocation, as shown in the Output panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRecord {
+    pub args: Vec<String>,
+    pub stdout: String,
+    pub stderr: String,
+    pub code: Option<i32>,
+    pub duration: Duration,
+    pub cancelled: bool,
+}
+
+/// Collects [`CommandRecord`]s of every command run through a runner that
+/// carries it; survives failures part-way through multi-command operations.
+#[derive(Debug, Clone, Default)]
+pub struct Recorder(Arc<Mutex<Vec<CommandRecord>>>);
+
+/// Output kept per stream in a record (some commands print a lot).
+const RECORD_LIMIT: usize = 64 * 1024;
+
+fn clip(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(&bytes[..bytes.len().min(RECORD_LIMIT)]).into_owned();
+    if bytes.len() > RECORD_LIMIT { s + "\n…(truncated)" } else { s }
+}
+
+impl Recorder {
+    pub fn snapshot(&self) -> Vec<CommandRecord> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn push(&self, rec: CommandRecord) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(rec);
+    }
+}
+
 /// Runs git commands against one repository.
 #[derive(Debug, Clone)]
 pub struct GitRunner {
     workdir: PathBuf,
     git: OsString,
     extra_env: Vec<(OsString, OsString)>,
+    recorder: Option<Recorder>,
+    /// Stops commands run through this runner (and refuses new ones).
+    cancel: Option<CancelToken>,
+}
+
+/// How long a cancelled git gets to exit after SIGTERM (it removes its lock
+/// files on SIGTERM) before it is killed.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Stops a process group started with `process_group(0)` (group id == pid):
+/// SIGTERM now, SIGKILL if it is still around after [`TERM_GRACE`].
+fn stop_group(pid: u32) {
+    let pgid = -(pid as libc::pid_t);
+    // SAFETY: plain syscalls on a process group we created.
+    unsafe {
+        libc::kill(pgid, libc::SIGTERM);
+    }
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + TERM_GRACE;
+        while Instant::now() < deadline {
+            // SAFETY: signal 0 only checks for existence.
+            if unsafe { libc::kill(pgid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // SAFETY: as above.
+        unsafe {
+            libc::kill(pgid, libc::SIGKILL);
+        }
+    });
 }
 
 impl GitRunner {
     pub fn new(workdir: impl Into<PathBuf>) -> Self {
-        Self { workdir: workdir.into(), git: "git".into(), extra_env: Vec::new() }
+        Self { workdir: workdir.into(), git: "git".into(), extra_env: Vec::new(), recorder: None, cancel: None }
     }
 
     /// Adds an environment variable to every invocation (tests use this to
@@ -69,6 +147,32 @@ impl GitRunner {
     pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.extra_env.push((key.into(), value.into()));
         self
+    }
+
+    /// Records every command run through the returned runner.
+    pub fn with_recorder(mut self, recorder: Recorder) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// Makes every command run through the returned runner stop when
+    /// `cancel` fires, and refuse to start once it has.
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// The same runner without cancellation, for recovery steps that must
+    /// complete even after the user cancelled (e.g. restoring a stash).
+    pub fn uncancellable(&self) -> Self {
+        Self { cancel: None, ..self.clone() }
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return Err(Cancelled.into());
+        }
+        Ok(())
     }
 
     /// Same configuration, different directory.
@@ -107,6 +211,29 @@ impl GitRunner {
         cmd
     }
 
+    fn record(&self, args: &[OsString], stdout: &[u8], stderr: &[u8], code: Option<i32>, started: Instant, cancelled: bool) {
+        if let Some(r) = &self.recorder {
+            r.push(CommandRecord {
+                args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+                stdout: clip(stdout),
+                stderr: clip(stderr),
+                code,
+                duration: started.elapsed(),
+                cancelled,
+            });
+        }
+    }
+
+    fn error(args: &[OsString], code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> anyhow::Error {
+        GitError {
+            args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+            code,
+            stderr: String::from_utf8_lossy(stderr).into_owned(),
+            stdout: String::from_utf8_lossy(stdout).into_owned(),
+        }
+        .into()
+    }
+
     /// Runs to completion and returns stdout. `ok_codes` lists exit codes
     /// besides 0 that are not failures (e.g. 1 for `diff --no-index`).
     pub fn output_with<I, S>(&self, args: I, ok_codes: &[i32]) -> Result<Vec<u8>>
@@ -115,24 +242,7 @@ impl GitRunner {
         S: AsRef<OsStr>,
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let out = self
-            .command(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("failed to run git in {}", self.workdir.display()))?;
-        let code = out.status.code();
-        if out.status.success() || code.is_some_and(|c| ok_codes.contains(&c)) {
-            Ok(out.stdout)
-        } else {
-            Err(GitError {
-                args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
-                code,
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            }
-            .into())
-        }
+        self.capture(&args, None, ok_codes)
     }
 
     /// Like [`Self::output_with`], feeding `input` to git's stdin.
@@ -141,34 +251,53 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        use std::io::Write as _;
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let mut child = self
-            .command(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to run git in {}", self.workdir.display()))?;
+        self.capture(&args, Some(input), ok_codes)
+    }
+
+    /// Runs a command to completion, capturing its output; cancellable when
+    /// the runner carries a token.
+    fn capture(&self, args: &[OsString], input: Option<&[u8]>, ok_codes: &[i32]) -> Result<Vec<u8>> {
+        use std::io::Write as _;
+        self.check_cancelled()?;
+        let started = Instant::now();
+        let mut cmd = self.command(args);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        let (mut child, done, stopped) = match &self.cancel {
+            Some(token) => self.spawn_cancellable_cmd(cmd, token)?,
+            None => (
+                cmd.spawn().with_context(|| format!("failed to run git in {}", self.workdir.display()))?,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        };
         // Write from another thread so a large output can't deadlock us.
-        let mut stdin = child.stdin.take().expect("piped");
-        let input = input.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
+        let writer = input.map(|bytes| {
+            let mut stdin = child.stdin.take().expect("piped");
+            let bytes = bytes.to_vec();
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&bytes);
+            })
         });
-        let out = child.wait_with_output()?;
-        let _ = writer.join();
+        let out = child.wait_with_output();
+        done.store(true, Ordering::Relaxed);
+        if let Some(w) = writer {
+            let _ = w.join();
+        }
+        let out = out?;
         let code = out.status.code();
+        let was_stopped = stopped.load(Ordering::Relaxed);
+        self.record(args, &out.stdout, &out.stderr, code, started, was_stopped);
+        if was_stopped {
+            return Err(Cancelled.into());
+        }
         if out.status.success() || code.is_some_and(|c| ok_codes.contains(&c)) {
             Ok(out.stdout)
         } else {
-            Err(GitError {
-                args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
-                code,
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            }
-            .into())
+            Err(Self::error(args, code, &out.stdout, &out.stderr))
         }
     }
 
@@ -180,10 +309,43 @@ impl GitRunner {
         self.output_with(args, &[])
     }
 
+    /// Spawns git in its own process group with a watchdog that stops the
+    /// group when `cancel` fires. Returns the child, a flag to set once it
+    /// has been waited for, and a flag set if the watchdog stopped it.
+    fn spawn_cancellable(&self, args: &[OsString], cancel: &CancelToken) -> Result<(Child, Arc<AtomicBool>, Arc<AtomicBool>)> {
+        let mut cmd = self.command(args);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        self.spawn_cancellable_cmd(cmd, cancel)
+    }
+
+    fn spawn_cancellable_cmd(&self, mut cmd: Command, cancel: &CancelToken) -> Result<(Child, Arc<AtomicBool>, Arc<AtomicBool>)> {
+        use std::os::unix::process::CommandExt as _;
+        let child = cmd
+            // Own process group, so helpers git spawns are stopped with it.
+            .process_group(0)
+            .spawn()
+            .with_context(|| format!("failed to run git in {}", self.workdir.display()))?;
+        let pid = child.id();
+        let done = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (d, s, c) = (done.clone(), stopped.clone(), cancel.clone());
+        std::thread::spawn(move || {
+            while !d.load(Ordering::Relaxed) {
+                if c.is_cancelled() {
+                    s.store(true, Ordering::Relaxed);
+                    stop_group(pid);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Ok((child, done, stopped))
+    }
+
     /// Streams stdout split at `delim`, calling `on_record` for each record
-    /// (without the delimiter). Stops early and kills git when `on_record`
-    /// returns `false` or `cancel` fires, even while git is silent (a
-    /// watchdog thread kills git's whole process group).
+    /// (without the delimiter). Stops early when `on_record` returns `false`
+    /// or `cancel` fires, even while git is silent. Stopping is not an error
+    /// here (used for reading history).
     pub fn stream_records<I, S>(
         &self,
         args: I,
@@ -195,34 +357,12 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        use std::os::unix::process::CommandExt as _;
-
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let mut child = self
-            .command(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Own process group, so helpers git spawns die with it.
-            .process_group(0)
-            .spawn()
-            .with_context(|| format!("failed to run git in {}", self.workdir.display()))?;
+        let started = Instant::now();
+        let (mut child, done, _) = self.spawn_cancellable(&args, cancel)?;
+        let mut recorded_stdout = Vec::new();
         let pid = child.id();
-        let stderr_thread = drain_stderr(&mut child);
-
-        let done = Arc::new(AtomicBool::new(false));
-        let watchdog = {
-            let (done, cancel) = (done.clone(), cancel.clone());
-            std::thread::spawn(move || {
-                while !done.load(Ordering::Relaxed) {
-                    if cancel.is_cancelled() {
-                        kill_group(pid);
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            })
-        };
-
+        let stderr_thread = drain(child.stderr.take().expect("piped"));
         let mut reader = BufReader::with_capacity(1 << 16, child.stdout.take().expect("piped"));
         let mut buf = Vec::with_capacity(512);
         let mut stopped = false;
@@ -237,6 +377,9 @@ impl GitRunner {
                 Ok(_) => {}
                 Err(e) => break Err(e),
             }
+            if self.recorder.is_some() && recorded_stdout.len() <= RECORD_LIMIT {
+                recorded_stdout.extend_from_slice(&buf);
+            }
             if buf.last() == Some(&delim) {
                 buf.pop();
             }
@@ -247,42 +390,92 @@ impl GitRunner {
         };
         stopped |= cancel.is_cancelled();
         if stopped || read_result.is_err() {
-            kill_group(pid);
+            stop_group(pid);
         }
-        done.store(true, Ordering::Relaxed);
         drop(reader);
         let status = child.wait()?;
-        let _ = watchdog.join();
+        done.store(true, Ordering::Relaxed);
         let stderr = stderr_thread.join().unwrap_or_default();
+        self.record(&args, &recorded_stdout, &stderr, status.code(), started, stopped);
         read_result?;
         if stopped || status.success() {
             Ok(())
         } else {
-            Err(GitError {
-                args: args.iter().map(|a| a.to_string_lossy().into_owned()).collect(),
-                code: status.code(),
-                stderr,
-                stdout: String::new(),
-            }
-            .into())
+            Err(Self::error(&args, status.code(), b"", &stderr))
         }
     }
-}
 
-/// Kills a process group started with `process_group(0)` (group id == pid).
-fn kill_group(pid: u32) {
-    // SAFETY: plain syscall; a stale pid at worst hits an exited group.
-    unsafe {
-        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    /// Runs a long command (fetch, push, …) that reports progress on stderr.
+    /// Each progress line (split at `\r` and `\n`) goes to `on_progress`.
+    /// Returns stdout on success, [`Cancelled`] if `cancel` fired, or a
+    /// [`GitError`] with the full output.
+    pub fn run_with_progress<I, S>(&self, args: I, cancel: &CancelToken, mut on_progress: impl FnMut(&str)) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        self.check_cancelled()?;
+        let started = Instant::now();
+        // Either token stops the command.
+        let both = CancelToken::default();
+        {
+            let (b, c, own) = (both.clone(), cancel.clone(), self.cancel.clone());
+            std::thread::spawn(move || {
+                while !b.is_cancelled() {
+                    if c.is_cancelled() || own.as_ref().is_some_and(CancelToken::is_cancelled) {
+                        b.cancel();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+        }
+        let (mut child, done, stopped) = self.spawn_cancellable(&args, &both)?;
+        let stdout_thread = drain(child.stdout.take().expect("piped"));
+        let mut stderr = child.stderr.take().expect("piped");
+        let mut all_err = Vec::new();
+        let mut line = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            all_err.extend_from_slice(&chunk[..n]);
+            for &b in &chunk[..n] {
+                if b == b'\r' || b == b'\n' {
+                    if !line.is_empty() {
+                        on_progress(&String::from_utf8_lossy(&line));
+                        line.clear();
+                    }
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+        if !line.is_empty() {
+            on_progress(&String::from_utf8_lossy(&line));
+        }
+        let status = child.wait()?;
+        done.store(true, Ordering::Relaxed);
+        let was_stopped = stopped.load(Ordering::Relaxed);
+        // Ends the helper thread above.
+        both.cancel();
+        let stdout = stdout_thread.join().unwrap_or_default();
+        self.record(&args, &stdout, &all_err, status.code(), started, was_stopped);
+        if was_stopped {
+            return Err(Cancelled.into());
+        }
+        if status.success() { Ok(stdout) } else { Err(Self::error(&args, status.code(), &stdout, &all_err)) }
     }
 }
 
-fn drain_stderr(child: &mut Child) -> std::thread::JoinHandle<String> {
-    let mut stderr = child.stderr.take().expect("piped");
+fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut s = Vec::new();
-        let _ = stderr.read_to_end(&mut s);
-        String::from_utf8_lossy(&s).into_owned()
+        let _ = r.read_to_end(&mut s);
+        s
     })
 }
 
@@ -328,5 +521,105 @@ mod tests {
         })
         .unwrap();
         assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn progress_lines_are_split_at_carriage_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitRunner::new(dir.path());
+        let mut lines = Vec::new();
+        let out = git
+            .run_with_progress(
+                ["-c", r"alias.p=!printf 'a 10%%\rb 50%%\rc 100%%\ndone\n' >&2; echo out", "p"],
+                &CancelToken::default(),
+                |l| lines.push(l.to_owned()),
+            )
+            .unwrap();
+        assert_eq!(lines, ["a 10%", "b 50%", "c 100%", "done"]);
+        assert_eq!(out, b"out\n");
+    }
+
+    #[test]
+    fn progress_command_reports_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Recorder::default();
+        let git = GitRunner::new(dir.path()).with_recorder(rec.clone());
+        let cancel = CancelToken::default();
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c2.cancel();
+        });
+        let start = Instant::now();
+        let err = git.run_with_progress(["-c", "alias.slow=!sleep 30", "slow"], &cancel, |_| {}).unwrap_err();
+        assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let records = rec.snapshot();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].cancelled);
+    }
+
+    #[test]
+    fn recorder_keeps_every_command_including_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Recorder::default();
+        let git = GitRunner::new(dir.path()).with_recorder(rec.clone());
+        let _ = git.output(["--version"]);
+        let _ = git.output(["rev-parse", "HEAD"]);
+        let records = rec.snapshot();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].code, Some(0));
+        assert!(records[0].stdout.starts_with("git version"));
+        assert_ne!(records[1].code, Some(0));
+        assert!(records[1].stderr.contains("not a git repository"));
+    }
+
+    #[test]
+    fn runner_token_cancels_plain_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancelToken::default();
+        let git = GitRunner::new(dir.path()).with_cancel(cancel.clone());
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c2.cancel();
+        });
+        let start = Instant::now();
+        let err = git.output(["-c", "alias.slow=!sleep 30", "slow"]).unwrap_err();
+        assert!(err.downcast_ref::<Cancelled>().is_some(), "{err:#}");
+        assert!(start.elapsed() < Duration::from_secs(3));
+        // Once cancelled, nothing new starts…
+        let err = git.output(["--version"]).unwrap_err();
+        assert!(err.downcast_ref::<Cancelled>().is_some());
+        // …except through the uncancellable copy used for recovery.
+        assert!(git.uncancellable().output(["--version"]).is_ok());
+    }
+
+    #[test]
+    fn stream_stdout_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Recorder::default();
+        let git = GitRunner::new(dir.path()).with_recorder(rec.clone());
+        git.stream_records(["--version"], b'\n', &CancelToken::default(), |_| true).unwrap();
+        assert!(rec.snapshot()[0].stdout.starts_with("git version"));
+    }
+
+    #[test]
+    fn sigterm_lets_git_finish_cleanly() {
+        // A command that traps SIGTERM and exits quickly must not be SIGKILLed.
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitRunner::new(dir.path());
+        let cancel = CancelToken::default();
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c2.cancel();
+        });
+        let marker = dir.path().join("cleaned");
+        let script = format!("!trap 'touch {} ; exit 1' TERM; sleep 30 & wait", marker.display());
+        let err = git.run_with_progress(["-c", &format!("alias.t={script}"), "t"], &cancel, |_| {}).unwrap_err();
+        assert!(err.downcast_ref::<Cancelled>().is_some());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(marker.exists(), "the TERM handler must have run");
     }
 }

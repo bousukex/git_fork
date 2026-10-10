@@ -28,6 +28,9 @@ use crate::{
 pub struct RepoPaths {
     pub workdir: PathBuf,
     pub git_dir: PathBuf,
+    /// Shared by all linked worktrees of a repository (refs, objects,
+    /// config); equals `git_dir` for the main worktree.
+    pub common_dir: PathBuf,
 }
 
 impl RepoPaths {
@@ -38,7 +41,14 @@ impl RepoPaths {
 
     pub fn discover_with(git: &GitRunner) -> Result<RepoPaths> {
         let out = git
-            .output(["rev-parse", "--is-bare-repository", "--show-toplevel", "--absolute-git-dir"])
+            .output([
+                "rev-parse",
+                "--is-bare-repository",
+                "--show-toplevel",
+                "--absolute-git-dir",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ])
             .with_context(|| format!("{} is not a git repository", git.workdir().display()))?;
         let mut lines = out.lines();
         if lines.next() == Some(b"true") {
@@ -50,7 +60,8 @@ impl RepoPaths {
         };
         let workdir = path(lines.next())?;
         let git_dir = path(lines.next())?;
-        Ok(RepoPaths { workdir, git_dir })
+        let common_dir = path(lines.next())?;
+        Ok(RepoPaths { workdir, git_dir, common_dir })
     }
 }
 

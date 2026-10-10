@@ -71,3 +71,43 @@ pub fn sample_repo() -> tempfile::TempDir {
     dir
 }
 
+
+/// Polls a tab until `done` (10s timeout); returns whether it happened.
+pub fn poll_until(tab: &mut tine::repo::RepoTab, mut done: impl FnMut(&tine::repo::RepoTab) -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        tab.poll();
+        if done(tab) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// Loaded and no operation (or its refresh) pending.
+pub fn idle(tab: &tine::repo::RepoTab) -> bool {
+    !tab.history.loading && tab.history.elapsed.is_some() && tab.status_loaded && tab.refs.head.is_some() && !tab.busy()
+}
+
+/// main and topic diverge on f.txt (base → "main" / "topic"); g.txt is a
+/// separate tracked file for local edits.
+pub fn diverged_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut t = 1_760_000_000;
+    git(d, &["init", "-q", "-b", "main"], &mut t);
+    git(d, &["config", "user.name", "山田 太郎"], &mut t);
+    git(d, &["config", "user.email", "taro@example.com"], &mut t);
+    std::fs::write(d.join("f.txt"), "base\n").unwrap();
+    std::fs::write(d.join("g.txt"), "g\n").unwrap();
+    git(d, &["add", "-A"], &mut t);
+    git(d, &["commit", "-qm", "base"], &mut t);
+    git(d, &["checkout", "-q", "-b", "topic"], &mut t);
+    std::fs::write(d.join("f.txt"), "topic\n").unwrap();
+    git(d, &["commit", "-qam", "topic change"], &mut t);
+    git(d, &["checkout", "-q", "main"], &mut t);
+    std::fs::write(d.join("f.txt"), "main\n").unwrap();
+    git(d, &["commit", "-qam", "main change"], &mut t);
+    dir
+}

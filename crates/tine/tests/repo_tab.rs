@@ -505,7 +505,7 @@ fn line_actions_are_disabled_for_conflicts() {
     assert!(poll_until(&mut tab, |t| idle(t) && !t.status.conflicted.is_empty()));
     select_file(&mut tab, Side::Unstaged, "README.md");
     assert!(poll_until(&mut tab, |t| diff_ready(t, "README.md")));
-    assert!(tab.line_actions().unwrap().disabled.is_some());
+    assert!(tab.line_actions().is_none(), "conflicts are resolved per file, not by hunk");
 }
 
 #[test]

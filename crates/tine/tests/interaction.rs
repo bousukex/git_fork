@@ -127,3 +127,67 @@ fn second_hunk_button_stages_only_its_lines() {
     assert!(staged.contains("\nextra\n"), "{staged}");
     assert!(staged.contains("\nline 2\n"), "the first hunk must stay unstaged: {staged}");
 }
+
+fn head_branch(dir: &std::path::Path) -> String {
+    let out = std::process::Command::new("git").current_dir(dir).args(["symbolic-ref", "--short", "HEAD"]).output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn sidebar_menu_checkout_and_branch_dialog() {
+    let repo = common::diverged_repo();
+    let d = repo.path();
+    let mut h = app(vec![d.into()]);
+    settle(&mut h);
+    h.get_by_label("branch topic").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Check Out 'topic'").click();
+    settle(&mut h);
+    assert_eq!(head_branch(d), "topic");
+
+    h.get_by_label("Branch").click();
+    h.run_steps(2);
+    if let Some(tine::repo::dialog::Dialog::CreateBranch { name, .. }) = &mut h.state_mut().active_tab_mut().unwrap().dialog {
+        *name = "from-ui".into();
+    } else {
+        panic!("create branch dialog expected");
+    }
+    h.run_steps(2);
+    h.get_by_label("Create").click();
+    settle(&mut h);
+    assert_eq!(head_branch(d), "from-ui");
+}
+
+#[test]
+fn conflict_banner_abort_needs_confirmation() {
+    let repo = common::diverged_repo();
+    let d = repo.path();
+    let mut h = app(vec![d.into()]);
+    settle(&mut h);
+    h.state_mut()
+        .active_tab_mut()
+        .unwrap()
+        .integrate(tine::repo::dialog::Integration::Merge { target: "topic".into(), mode: Default::default() }, false);
+    settle(&mut h);
+    let tab = h.state_mut().active_tab_mut().unwrap();
+    assert_eq!(tab.status.state, tine_core::model::RepoState::Merging);
+
+    // Resolve via the conflict menu, then abort via the banner.
+    h.get_by_label("unstaged file f.txt").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Use Incoming Version (theirs)").click();
+    settle(&mut h);
+    assert!(h.state_mut().active_tab_mut().unwrap().status.conflicted.is_empty());
+
+    h.get_by_label("Abort…").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state_mut().active_tab_mut().unwrap().status.state,
+        tine_core::model::RepoState::Merging,
+        "nothing happens before confirming"
+    );
+    h.get_by_label("Abort merge").click();
+    settle(&mut h);
+    assert_eq!(h.state_mut().active_tab_mut().unwrap().status.state, tine_core::model::RepoState::Clean);
+    assert_eq!(std::fs::read_to_string(d.join("f.txt")).unwrap(), "main\n");
+}

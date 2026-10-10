@@ -162,3 +162,83 @@ fn line_staging_view() {
         },
     );
 }
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn merge_conflict_view() {
+    let repo = common::diverged_repo();
+    let path = repo.path().to_path_buf();
+    shoot(
+        "conflict",
+        [1360.0, 820.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            if tab.status.state == tine_core::model::RepoState::Clean {
+                tab.integrate(
+                    tine::repo::dialog::Integration::Merge { target: "topic".into(), mode: Default::default() },
+                    false,
+                );
+            }
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            tab.output_open = true;
+            settle(h);
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn reset_dialog() {
+    let repo = common::diverged_repo();
+    std::fs::write(repo.path().join("g.txt"), "unsaved\n").unwrap();
+    let path = repo.path().to_path_buf();
+    shoot(
+        "reset_dialog",
+        [1100.0, 700.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            let base = tab.history.commits.iter().find(|c| c.subject == "base").unwrap().id;
+            tab.request_reset(base, "base");
+            if let Some(tine::repo::dialog::Dialog::Reset { mode, .. }) = &mut tab.dialog {
+                *mode = tine_core::integrate::ResetMode::Hard;
+            }
+            settle(h);
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn stash_conflict_view() {
+    let repo = common::diverged_repo();
+    let d = repo.path().to_path_buf();
+    let mut t = 1_900_000_000;
+    std::fs::write(d.join("f.txt"), "stashed edit\n").unwrap();
+    git(&d, &["stash", "-q"], &mut t);
+    std::fs::write(d.join("f.txt"), "conflicting\n").unwrap();
+    git(&d, &["commit", "-qam", "Conflicting edit"], &mut t);
+    let path = d.clone();
+    shoot(
+        "stash_conflict",
+        [1360.0, 820.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            // Each theme starts from the clean tree (the stash is kept).
+            let mut t = 1_900_000_000;
+            git(&d, &["reset", "-q", "--hard"], &mut t);
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            let oid = tab.refs.stashes[0].id;
+            tab.stash_apply(oid, false);
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            tab.view = tine::repo::View::LocalChanges;
+            settle(h);
+        },
+    );
+}
