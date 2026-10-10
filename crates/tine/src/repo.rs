@@ -66,12 +66,23 @@ impl History {
         self.commits.extend(batch);
     }
 
-    fn finish(&mut self) {
-        self.take_reload();
+    /// Ends a load. A reload that failed before delivering anything keeps
+    /// the previous history instead of showing an empty list.
+    fn finish(&mut self, ok: bool) {
+        if ok {
+            self.take_reload();
+        } else {
+            self.reload_pending = false;
+        }
         self.graph.finish();
         self.loading = false;
         self.elapsed = self.started.take().map(|s| s.elapsed());
     }
+}
+
+/// What identifies a refs state for deciding whether history must reload.
+fn refs_key(r: &RefsSnapshot) -> (Option<tine_core::model::Head>, Vec<(&str, Oid)>) {
+    (r.head.clone(), r.refs.iter().map(|r| (r.full_name.as_str(), r.target)).collect())
 }
 
 /// A file diff being shown (or loaded).
@@ -149,6 +160,8 @@ pub struct RepoTab {
 #[derive(Default)]
 struct Gens {
     refs: Gen,
+    /// Refs request after which history reloads only if refs changed.
+    refs_then_log: Option<Gen>,
     status: Gen,
     log: Gen,
     next: Gen,
@@ -232,16 +245,30 @@ impl RepoTab {
     /// Reloads refs, status and history.
     pub fn refresh(&mut self) {
         self.gens.refs = self.gens.bump();
+        self.gens.refs_then_log = None;
         self.worker.refs(self.gens.refs);
         self.refresh_status();
-        self.gens.log = self.gens.bump();
-        self.history.begin_reload();
-        self.worker.log(self.gens.log, LogOptions::default());
+        self.reload_history();
     }
 
     pub fn refresh_status(&mut self) {
         self.gens.status = self.gens.bump();
         self.worker.status(self.gens.status);
+    }
+
+    /// Cheap check for changes made outside Tine: reloads refs and status,
+    /// and the history only if a branch, tag or HEAD actually moved.
+    pub fn refresh_if_changed(&mut self) {
+        self.gens.refs = self.gens.bump();
+        self.gens.refs_then_log = Some(self.gens.refs);
+        self.worker.refs(self.gens.refs);
+        self.refresh_status();
+    }
+
+    fn reload_history(&mut self) {
+        self.gens.log = self.gens.bump();
+        self.history.begin_reload();
+        self.worker.log(self.gens.log, LogOptions::default());
     }
 
     /// Applies finished background work. Returns true if anything changed.
@@ -258,11 +285,15 @@ impl RepoTab {
         match msg {
             Msg::Refs(seq, r) if seq == self.gens.refs => match r {
                 Ok(refs) => {
+                    let moved = refs_key(&refs) != refs_key(&self.refs);
                     self.refs_by_commit.clear();
                     for (i, r) in refs.refs.iter().enumerate() {
                         self.refs_by_commit.entry(r.target).or_default().push(i);
                     }
                     self.refs = refs;
+                    if self.gens.refs_then_log.take() == Some(seq) && moved {
+                        self.reload_history();
+                    }
                 }
                 Err(e) => self.error(format!("Failed to read branches: {e:#}")),
             },
@@ -286,7 +317,7 @@ impl RepoTab {
                 self.after_history_grew();
             }
             Msg::LogDone(seq, r) if seq == self.gens.log => {
-                self.history.finish();
+                self.history.finish(r.is_ok());
                 if let Err(e) = r {
                     self.error(format!("Failed to load history: {e:#}"));
                 }
@@ -334,7 +365,7 @@ impl RepoTab {
         if self.ops_in_flight > 0 {
             self.held_fs.merge(change);
         } else if change.refs {
-            self.refresh();
+            self.refresh_if_changed();
         } else if change.status {
             self.refresh_status();
         }
@@ -346,10 +377,10 @@ impl RepoTab {
     }
 
     pub fn select_commit(&mut self, id: Oid) {
+        self.view = View::History;
         if self.selected_commit == Some(id) {
             return;
         }
-        self.view = View::History;
         self.selected_commit = Some(id);
         self.commit = CommitPane { id: Some(id), seq: self.gens.bump(), ..Default::default() };
         self.commit_diff = DiffPane::default();
@@ -440,5 +471,55 @@ impl RepoTab {
 
     pub fn head_commit(&self) -> Option<Oid> {
         self.refs.head_target()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commit(n: u8) -> CommitSummary {
+        CommitSummary {
+            id: Oid::from_hex(format!("{n:02x}").repeat(20).as_bytes()).unwrap(),
+            parents: Vec::new(),
+            author_name: "a".into(),
+            author_email: "e".into(),
+            author_time: 0,
+            commit_time: 0,
+            subject: String::new(),
+        }
+    }
+
+    #[test]
+    fn failed_reload_keeps_previous_history() {
+        let mut h = History::default();
+        h.begin_reload();
+        h.push_batch(vec![commit(1), commit(2)]);
+        h.finish(true);
+        assert_eq!(h.commits.len(), 2);
+
+        h.begin_reload();
+        h.finish(false);
+        assert_eq!(h.commits.len(), 2, "old history must survive a failed reload");
+        assert!(!h.loading);
+
+        // A successful reload that yields nothing (all refs deleted) clears it.
+        h.begin_reload();
+        h.finish(true);
+        assert!(h.commits.is_empty() && h.index.is_empty() && h.graph.is_empty());
+    }
+
+    #[test]
+    fn reload_replaces_on_first_batch() {
+        let mut h = History::default();
+        h.begin_reload();
+        h.push_batch(vec![commit(1)]);
+        h.finish(true);
+        h.begin_reload();
+        assert_eq!(h.commits.len(), 1, "old rows stay visible until new data arrives");
+        h.push_batch(vec![commit(3)]);
+        assert_eq!(h.commits.len(), 1);
+        assert_eq!(h.index.get(&commit(3).id), Some(&0));
+        assert!(!h.index.contains_key(&commit(1).id));
     }
 }

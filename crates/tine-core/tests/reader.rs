@@ -260,4 +260,10 @@ fn ignored_paths_and_submodules() {
     repo.git(["commit", "-qm", "add submodule"]);
     let refs = repo.reader().refs().unwrap();
     assert_eq!(refs.submodules, [bstr::BString::from("libs/sub")]);
+
+    // Uncommitted work inside the submodule shows up as a modified submodule.
+    std::fs::write(repo.path().join("libs/sub/x"), "changed").unwrap();
+    let st = repo.reader().status().unwrap();
+    let sub = st.unstaged.iter().find(|f| f.path == "libs/sub").expect("dirty submodule listed");
+    assert!(sub.is_submodule);
 }

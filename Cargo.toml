@@ -13,6 +13,7 @@ tine-core = { path = "crates/tine-core" }
 anyhow = "1"
 bstr = "1"
 crossbeam-channel = "0.5"
+libc = "0.2"
 eframe = { version = "0.36", features = ["persistence"] }
 egui = "0.36"
 egui_extras = "0.36"

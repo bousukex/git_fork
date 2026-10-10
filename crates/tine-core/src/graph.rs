@@ -119,6 +119,36 @@ impl Graph {
         closed.chain(open)
     }
 
+    /// Pass-through lines intersecting `rows`, clipped to that range, as
+    /// `(lane, color, first_row, last_row)`. Drawing these as long segments
+    /// is far cheaper than one segment per row when many lanes are open.
+    pub fn through_spans(&self, rows: std::ops::Range<usize>) -> Vec<(Lane, u16, usize, usize)> {
+        if rows.is_empty() || self.rows.is_empty() {
+            return Vec::new();
+        }
+        let (a, b) = (rows.start as u32, (rows.end.min(self.rows.len()) - 1) as u32);
+        let mut ids: Vec<u32> =
+            (a / BLOCK..=b / BLOCK).filter_map(|blk| self.blocks.get(blk as usize)).flatten().copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut out: Vec<_> = ids
+            .into_iter()
+            .map(|i| self.spans[i as usize])
+            .filter(|s| s.first_row <= b && s.last_row >= a)
+            .map(|s| (s.lane, s.color, s.first_row.max(a) as usize, s.last_row.min(b) as usize))
+            .collect();
+        let last = (self.rows.len() - 1) as u32;
+        for (i, slot) in self.lanes.iter().enumerate() {
+            if let Some(s) = slot {
+                let first = s.opened_at + 1;
+                if first <= last && first <= b && last >= a {
+                    out.push((i as Lane, s.color, first.max(a) as usize, last.min(b) as usize));
+                }
+            }
+        }
+        out
+    }
+
     fn alloc(&mut self, avoid: Option<Lane>) -> Lane {
         let free = self.lanes.iter().enumerate().position(|(i, s)| s.is_none() && Some(i as Lane) != avoid);
         match free {
@@ -356,6 +386,47 @@ mod tests {
         g.finish();
         assert_eq!(through(&g, 1), [0]);
         assert!(g.lanes.is_empty());
+    }
+
+    /// `through_spans` must describe exactly the lines `through` reports.
+    fn assert_spans_match(g: &Graph, rows: std::ops::Range<usize>) {
+        for r in rows.clone() {
+            let mut per_row: Vec<_> = g.through(r).collect();
+            let mut from_spans: Vec<_> = g
+                .through_spans(rows.clone())
+                .into_iter()
+                .filter(|&(_, _, a, b)| a <= r && r <= b)
+                .map(|(l, c, _, _)| (l, c))
+                .collect();
+            per_row.sort();
+            from_spans.sort();
+            assert_eq!(per_row, from_spans, "row {r}");
+        }
+    }
+
+    #[test]
+    fn spans_match_per_row_lines() {
+        let g = layout(&[(5, &[4, 3]), (4, &[2]), (3, &[2]), (2, &[1]), (1, &[])]);
+        assert_spans_match(&g, 0..g.len());
+        assert_spans_match(&g, 1..3);
+
+        // Long lanes over several index blocks, while loading and after.
+        let mut g = Graph::new();
+        let id = |i: u32| Oid::from_hex(format!("{:040x}", 0x1000 + i).as_bytes()).unwrap();
+        for k in 0..5u8 {
+            g.push(oid(200 + k), &[oid(0)]);
+        }
+        for i in 0..600 {
+            g.push(id(i), &[id(i + 1)]);
+        }
+        assert_spans_match(&g, 0..g.len());
+        assert_spans_match(&g, 250..300);
+        g.push(id(600), &[oid(0)]);
+        g.push(oid(0), &[]);
+        g.finish();
+        assert_spans_match(&g, 0..g.len());
+        assert_spans_match(&g, 127..129);
+        assert!(g.through_spans(0..0).is_empty());
     }
 
     #[test]

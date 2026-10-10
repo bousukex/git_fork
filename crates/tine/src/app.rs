@@ -31,6 +31,7 @@ pub struct TineApp {
     open_error: Option<String>,
     debug: DebugOverlay,
     focused: bool,
+    ctx: egui::Context,
 }
 
 /// F12 overlay with frame timing and memory, for checking performance.
@@ -94,12 +95,16 @@ impl TineApp {
             open_error: None,
             debug: DebugOverlay::default(),
             focused: true,
+            ctx: cc.egui_ctx.clone(),
         };
-        let to_open = if paths.is_empty() { app.state.open.clone() } else { paths };
+        let restoring = paths.is_empty();
+        let to_open = if restoring { app.state.open.clone() } else { paths };
         for p in to_open {
             app.open(&p, &cc.egui_ctx);
         }
-        if !app.tabs.is_empty() {
+        // Restore the previous session's active tab; with paths given on the
+        // command line, the last one opened stays active.
+        if restoring && !app.tabs.is_empty() {
             app.active = app.state.active.min(app.tabs.len() - 1);
         }
         app
@@ -150,17 +155,33 @@ impl TineApp {
         }
         let (tx, rx) = bounded(1);
         self.picker = Some(rx);
+        let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             let dir = rfd::FileDialog::new().set_title("Open Repository").pick_folder();
             let _ = tx.send(dir);
+            ctx.request_repaint();
         });
     }
 
-    fn close_tab(&mut self, i: usize) {
-        self.tabs.remove(i);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
+    /// Closes tab `i`, keeping the same repository active when possible.
+    pub fn close_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
         }
+        self.tabs.remove(i);
+        if i < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Title of the active repository tab.
+    pub fn active_title(&self) -> Option<&str> {
+        self.tabs.get(self.active).map(|t| t.title.as_str())
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -343,12 +364,12 @@ impl eframe::App for TineApp {
             self.open(&r, &ctx);
         }
         // Coming back to the window: pick up changes made elsewhere, even
-        // if file watching is unavailable.
+        // if file watching is unavailable (history reloads only if refs moved).
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if focused && !self.focused
             && let Some(t) = self.tabs.get_mut(self.active)
         {
-            t.refresh_status();
+            t.refresh_if_changed();
         }
         self.focused = focused;
         self.shortcuts(&ctx);

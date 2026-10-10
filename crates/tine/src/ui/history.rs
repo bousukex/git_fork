@@ -143,11 +143,18 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             let graph = &tab.history.graph;
             let lanes = range.clone().filter_map(|i| graph.row(i)).map(|r| r.width).max().unwrap_or(1);
             let row_w = ui.available_width();
-            let graph_w = graph_paint::width_for(lanes).min(columns(Rect::from_min_size(Pos2::ZERO, vec2(row_w, 1.0))).desc.width() * 0.5);
+            let desc_w = columns(Rect::from_min_size(Pos2::ZERO, vec2(row_w, 1.0))).desc.width();
+            let layout = graph_paint::Layout::fit(lanes, desc_w * 0.5);
+            let graph_w = layout.width;
+            let rows = range.clone();
+            let mut first_graph_rect: Option<Rect> = None;
             for i in range {
                 let c = &tab.history.commits[i];
                 let selected = tab.selected_commit == Some(c.id);
                 let (rect, resp) = super::list_row(ui, ROW_HEIGHT, selected, true);
+                if i == rows.start {
+                    first_graph_rect = Some(Rect::from_min_size(columns(rect).desc.min, vec2(graph_w, ROW_HEIGHT)));
+                }
                 if resp.clicked() {
                     clicked = Some(c.id);
                 }
@@ -168,7 +175,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                 let cols = columns(rect);
                 let graph_rect = Rect::from_min_size(cols.desc.min, vec2(graph_w, ROW_HEIGHT));
                 let is_head = head == Some(c.id);
-                graph_paint::paint_row(&ui.painter_at(graph_rect), graph_rect, graph, i, is_head, p);
+                graph_paint::paint_row(&ui.painter_at(graph_rect), graph_rect, &layout, graph, i, is_head, p);
 
                 let painter = ui.painter_at(cols.desc);
                 let cy = rect.center().y;
@@ -210,6 +217,11 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                     p.text_weak,
                     Align2::LEFT_CENTER,
                 );
+            }
+            // Straight lanes as one segment each across all visible rows.
+            if let Some(first) = first_graph_rect {
+                let column = Rect::from_min_size(first.min, vec2(graph_w, ROW_HEIGHT * rows.len() as f32));
+                graph_paint::paint_through(&ui.painter_at(column), first, ROW_HEIGHT, &layout, graph, rows, p);
             }
         });
         offset = out.state.offset.y;

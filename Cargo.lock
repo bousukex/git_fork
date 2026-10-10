@@ -3707,6 +3707,7 @@ dependencies = [
  "anyhow",
  "bstr",
  "crossbeam-channel",
+ "libc",
  "log",
  "tempfile",
 ]

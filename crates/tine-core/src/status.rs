@@ -11,7 +11,9 @@ use crate::{
 };
 
 pub fn status(git: &GitRunner, git_dir: &Path) -> Result<WorkingStatus> {
-    let out = git.output(["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=dirty"])?;
+    // Submodule handling follows the user's config (`submodule.*.ignore`,
+    // `diff.ignoreSubmodules`), like `git status` on the command line.
+    let out = git.output(["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
     let mut st = parse(&out);
     st.state = repo_state(git_dir);
     Ok(st)

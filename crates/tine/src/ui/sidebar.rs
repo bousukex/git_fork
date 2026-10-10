@@ -18,7 +18,8 @@ enum Action {
     View(View),
     Reveal(Oid),
     ShowStash(Oid),
-    OpenSubmodule(String),
+    /// Path relative to the work tree, as raw bytes (may not be UTF-8).
+    OpenSubmodule(bstr::BString),
 }
 
 /// Branch names grouped into folders by `/`.
@@ -164,16 +165,17 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             }
         });
 
-        let submodules: Vec<String> =
-            tab.refs.submodules.iter().map(|s| s.to_string()).filter(|s| matches(s)).collect();
+        // Keep the raw path for opening; the display string may be lossy.
+        let submodules: Vec<(&bstr::BString, String)> =
+            tab.refs.submodules.iter().map(|s| (s, s.to_string())).filter(|(_, d)| matches(d)).collect();
         if !submodules.is_empty() {
             section(ui, "Submodules", submodules.len(), |ui| {
-                for s in submodules {
-                    let changed = tab.status.unstaged.iter().any(|f| f.is_submodule && f.path == s.as_str());
-                    let resp = item(ui, 0, &s, if changed { "modified" } else { "" }, false, false)
+                for (raw, display) in submodules {
+                    let changed = tab.status.unstaged.iter().any(|f| f.is_submodule && &f.path == raw);
+                    let resp = item(ui, 0, &display, if changed { "modified" } else { "" }, false, false)
                         .on_hover_text("Double-click to open in a new tab");
                     if resp.double_clicked() {
-                        actions.push(Action::OpenSubmodule(s));
+                        actions.push(Action::OpenSubmodule(raw.clone()));
                     }
                 }
             });
@@ -195,7 +197,10 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             Action::View(v) => tab.view = v,
             Action::Reveal(id) => tab.reveal_commit(id),
             Action::ShowStash(id) => tab.select_commit(id),
-            Action::OpenSubmodule(path) => tab.open_request = Some(tab.paths.workdir.join(path)),
+            Action::OpenSubmodule(path) => {
+                use std::os::unix::ffi::OsStrExt as _;
+                tab.open_request = Some(tab.paths.workdir.join(std::ffi::OsStr::from_bytes(&path)));
+            }
         }
     }
 }
