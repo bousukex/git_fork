@@ -309,13 +309,17 @@ impl TineApp {
         if let Some(cmd) = shortcuts::take(ctx, !self.tabs.is_empty()) {
             self.run_command(cmd);
         }
-        // Esc closes the topmost overlay (the search bar).
+        // Esc closes the topmost overlay: a browse view, else the search bar.
         if !ctx.text_edit_focused()
             && let Some(t) = self.tabs.get_mut(self.active)
-            && t.search.open
+            && (!t.browse.is_empty() || t.search.open)
             && input::take_key(ctx, Modifiers::NONE, Key::Escape)
         {
-            t.close_search();
+            if t.browse.is_empty() {
+                t.close_search();
+            } else {
+                t.close_browse();
+            }
         }
     }
 
@@ -332,6 +336,10 @@ impl TineApp {
             Command::CloseTab if !self.tabs.is_empty() => self.close_tab(self.active),
             _ => {
                 let Some(t) = self.tabs.get_mut(self.active) else { return };
+                // Switching views leaves File History / Blame.
+                if matches!(cmd, Command::SearchCommits | Command::LocalChanges | Command::AllCommits) {
+                    t.clear_browse();
+                }
                 match cmd {
                     Command::SearchCommits => t.open_search(),
                     Command::LocalChanges => t.view = View::LocalChanges,
@@ -350,6 +358,9 @@ impl TineApp {
     }
 
     pub fn open_quick_launch(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.request_files();
+        }
         let tabs: Vec<(String, PathBuf)> = self.tabs.iter().map(|t| (t.title.clone(), t.paths.workdir.clone())).collect();
         self.quick = Some(QuickLaunch::new(self.tabs.get(self.active), &tabs, &self.state.recent));
     }
@@ -374,6 +385,7 @@ impl TineApp {
         // Items describe the repository they were collected from.
         let origin = ql.origin.clone();
         let tab = origin.as_ref().and_then(|o| self.tabs.iter().find(|t| &t.paths.workdir == o));
+        ql.set_files(tab.and_then(|t| t.files.clone()));
         match quick_launch::show(ctx, ql, tab) {
             quick_launch::Outcome::Stay => {}
             quick_launch::Outcome::Close => self.quick = None,
@@ -411,6 +423,8 @@ impl TineApp {
             Action::Checkout(b) => t.checkout_branch(&b),
             Action::CheckoutRemote(r) => t.checkout_remote(&r),
             Action::Reveal(id) => t.reveal_commit(id),
+            Action::FileHistory(path) => t.file_history_of_local(path),
+            Action::Blame(path) => t.blame_of_local(path),
             Action::SwitchTab(_) | Action::Open(_) => {}
         }
     }
@@ -733,6 +747,10 @@ impl eframe::App for TineApp {
                     .default_size(220.0)
                     .frame(egui::Frame::NONE.fill(p.sidebar_bg).inner_margin(egui::Margin::symmetric(8, 4)))
                     .show(ui, |ui| ui::output::show(ui, tab));
+            }
+            if !tab.browse.is_empty() {
+                ui::browse::show(ui, tab);
+                return;
             }
             match tab.view {
                 View::History => {

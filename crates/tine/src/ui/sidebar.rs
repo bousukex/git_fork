@@ -253,7 +253,10 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
 
     for a in actions {
         match a {
-            Action::View(v) => tab.view = v,
+            Action::View(v) => {
+                tab.clear_browse();
+                tab.view = v;
+            }
             Action::Reveal(id) => tab.reveal_commit(id),
             Action::ShowStash(id) => tab.select_commit(id),
             Action::Ref(a) => super::menus::apply(tab, a),

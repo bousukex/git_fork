@@ -1,5 +1,6 @@
 pub mod app;
 pub mod askpass;
+pub mod blame_model;
 pub mod diff_model;
 pub mod fonts;
 /// Fuzzy matching lives in the core (the bench measures it too).

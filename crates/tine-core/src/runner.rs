@@ -360,6 +360,22 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.stream_terminated(args, delim, cancel, |rec, _| on_record(rec))
+    }
+
+    /// Like [`Self::stream_records`]; also says whether each record ended
+    /// with `delim` (only the last one can lack it: output cut off).
+    pub fn stream_terminated<I, S>(
+        &self,
+        args: I,
+        delim: u8,
+        cancel: &CancelToken,
+        mut on_record: impl FnMut(&[u8], bool) -> bool,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         let started = Instant::now();
         let (mut child, done, _) = self.spawn_cancellable(&args, cancel)?;
@@ -383,10 +399,11 @@ impl GitRunner {
             if self.recorder.is_some() && recorded_stdout.len() <= RECORD_LIMIT {
                 recorded_stdout.extend_from_slice(&buf);
             }
-            if buf.last() == Some(&delim) {
+            let terminated = buf.last() == Some(&delim);
+            if terminated {
                 buf.pop();
             }
-            if !on_record(&buf) {
+            if !on_record(&buf, terminated) {
                 stopped = true;
                 break Ok(());
             }

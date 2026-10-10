@@ -167,8 +167,49 @@ fn bench_fuzzy(repo: &Path, queries: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `blame <repo> <path> [rev]`: git blame and the parsing, timed apart,
+/// five runs.
+fn bench_blame(repo: &Path, path: &str, rev: Option<&str>) -> Result<()> {
+    let reader = CliReader::open(repo)?;
+    let git = reader.runner();
+    let rev = match rev {
+        Some(r) => git.output(["rev-parse", "--verify", r])?,
+        None => git.output(["rev-parse", "HEAD"])?,
+    };
+    let oid = tine_core::model::Oid::from_hex(rev.trim_ascii()).ok_or_else(|| anyhow::anyhow!("bad revision"))?;
+    println!("{} — blame {path} at {}", repo.display(), oid.to_hex());
+    let (mut git_times, mut parse_times, mut totals) = (Vec::new(), Vec::new(), Vec::new());
+    let mut size = (0, 0);
+    for _ in 0..5 {
+        // What tine_core::blame::blame does, step by step.
+        let start = Instant::now();
+        let out = git.output(["blame", "--porcelain", &oid.to_hex(), "--", path])?;
+        let git_done = Instant::now();
+        let b = tine_core::blame::parse_porcelain(&out)?;
+        let parsed = Instant::now();
+        git_times.push(git_done - start);
+        parse_times.push(parsed - git_done);
+        let total = Instant::now();
+        let b2 = tine_core::blame::blame(git, path.as_bytes(), Some(oid), false, &CancelToken::default())?;
+        totals.push(total.elapsed());
+        anyhow::ensure!(b2 == b, "the library and the steps disagree");
+        size = (b.lines.len(), b.commits.len());
+    }
+    println!("  {} lines, {} commits", size.0, size.1);
+    println!("  git blame   {}", percentiles(git_times));
+    println!("  parsing     {}", percentiles(parse_times));
+    println!("  blame()     {} (size checks + git + parsing)", percentiles(totals));
+    let (peak, _) = memory_mib();
+    println!("  memory: this process peak {peak:.0} MiB, git peak {:.0} MiB", children_peak_mib());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("blame") {
+        anyhow::ensure!(args.len() >= 3, "usage: tine-bench blame <repo> <path> [rev]");
+        return bench_blame(Path::new(&args[1]), &args[2], args.get(3).map(String::as_str));
+    }
     if args.first().map(String::as_str) == Some("fuzzy") {
         anyhow::ensure!(args.len() >= 2, "usage: tine-bench fuzzy <repo> [query…]");
         return bench_fuzzy(Path::new(&args[1]), &args[2..]);

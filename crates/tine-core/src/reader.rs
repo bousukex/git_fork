@@ -87,6 +87,21 @@ pub trait RepoReader: Send + Sync {
         cancel: &CancelToken,
         on_batch: &mut dyn FnMut(Vec<Oid>) -> bool,
     ) -> Result<crate::search::SearchEnd>;
+    /// Streams the history of one file ([`crate::file_history::file_history`]).
+    fn file_history(
+        &self,
+        start: Oid,
+        path: &[u8],
+        cancel: &CancelToken,
+        on_batch: &mut dyn FnMut(Vec<crate::file_history::FileHistoryEntry>) -> bool,
+    ) -> Result<crate::search::SearchEnd>;
+    /// [`crate::blame::blame`].
+    fn blame(&self, path: &[u8], rev: Option<Oid>, ignore_whitespace: bool, cancel: &CancelToken) -> Result<crate::blame::Blame>;
+    /// Every file in the index, once each (conflicted files have several
+    /// stages), as raw paths.
+    fn tracked_files(&self, cancel: &CancelToken) -> Result<Vec<bstr::BString>>;
+    /// Every file path in commit `rev`.
+    fn paths_at(&self, rev: Oid, cancel: &CancelToken) -> Result<Vec<bstr::BString>>;
 }
 
 #[derive(Debug, Clone)]
@@ -155,5 +170,31 @@ impl RepoReader for CliReader {
         on_batch: &mut dyn FnMut(Vec<Oid>) -> bool,
     ) -> Result<crate::search::SearchEnd> {
         crate::search::search(&self.git, kind, query, cancel, on_batch)
+    }
+
+    fn file_history(
+        &self,
+        start: Oid,
+        path: &[u8],
+        cancel: &CancelToken,
+        on_batch: &mut dyn FnMut(Vec<crate::file_history::FileHistoryEntry>) -> bool,
+    ) -> Result<crate::search::SearchEnd> {
+        crate::file_history::file_history(&self.git, start, path, cancel, on_batch)
+    }
+
+    fn blame(&self, path: &[u8], rev: Option<Oid>, ignore_whitespace: bool, cancel: &CancelToken) -> Result<crate::blame::Blame> {
+        crate::blame::blame(&self.git, path, rev, ignore_whitespace, cancel)
+    }
+
+    fn tracked_files(&self, cancel: &CancelToken) -> Result<Vec<bstr::BString>> {
+        let git = self.git.clone().with_cancel(cancel.clone());
+        let out = git.output(["ls-files", "--cached", "--deduplicate", "-z"])?;
+        Ok(out.split(|&b| b == 0).filter(|p| !p.is_empty()).map(bstr::BString::from).collect())
+    }
+
+    fn paths_at(&self, rev: Oid, cancel: &CancelToken) -> Result<Vec<bstr::BString>> {
+        let git = self.git.clone().with_cancel(cancel.clone());
+        let out = git.output(["ls-tree", "-r", "-z", "--name-only", &rev.to_hex()])?;
+        Ok(out.split(|&b| b == 0).filter(|p| !p.is_empty()).map(bstr::BString::from).collect())
     }
 }

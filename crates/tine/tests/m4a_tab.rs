@@ -121,81 +121,12 @@ fn errors_are_reported_not_fatal() {
     assert_eq!(tab.search.error.as_deref(), Some("boom"));
 }
 
-/// Wraps the git reader; `search` (and optionally `log`) wait for the
-/// test to let them through, so results arrive when the test says.
-struct Gated {
-    inner: tine_core::CliReader,
-    search_gate: std::sync::Mutex<crossbeam_channel::Receiver<()>>,
-    log_gate: Option<std::sync::Mutex<crossbeam_channel::Receiver<()>>>,
-}
+use common::gated::{Gate, Gates, gated_tab};
 
-impl tine_core::RepoReader for Gated {
-    fn paths(&self) -> &tine_core::RepoPaths {
-        self.inner.paths()
-    }
-    fn refs(&self) -> anyhow::Result<tine_core::model::RefsSnapshot> {
-        self.inner.refs()
-    }
-    fn status(&self) -> anyhow::Result<tine_core::model::WorkingStatus> {
-        self.inner.status()
-    }
-    fn log(
-        &self,
-        opts: &tine_core::log::LogOptions,
-        cancel: &tine_core::CancelToken,
-        on_batch: &mut dyn FnMut(Vec<tine_core::model::CommitSummary>) -> bool,
-    ) -> anyhow::Result<()> {
-        if let Some(gate) = &self.log_gate {
-            // Never released: the test delivers history by hand.
-            let _ = gate.lock().unwrap().recv();
-            return Ok(());
-        }
-        self.inner.log(opts, cancel, on_batch)
-    }
-    fn commit_details(&self, id: tine_core::model::Oid) -> anyhow::Result<tine_core::model::CommitDetails> {
-        self.inner.commit_details(id)
-    }
-    fn commit_files(
-        &self,
-        id: tine_core::model::Oid,
-        parent: Option<tine_core::model::Oid>,
-    ) -> anyhow::Result<Vec<tine_core::model::ChangedFile>> {
-        self.inner.commit_files(id, parent)
-    }
-    fn file_diff(
-        &self,
-        source: tine_core::diff::DiffSource,
-        file: &tine_core::model::ChangedFile,
-        opts: tine_core::diff::DiffOptions,
-    ) -> anyhow::Result<tine_core::model::FileDiff> {
-        self.inner.file_diff(source, file, opts)
-    }
-    fn search(
-        &self,
-        kind: tine_core::search::SearchKind,
-        query: &str,
-        cancel: &tine_core::CancelToken,
-        on_batch: &mut dyn FnMut(Vec<tine_core::model::Oid>) -> bool,
-    ) -> anyhow::Result<SearchEnd> {
-        let _ = self.search_gate.lock().unwrap().recv();
-        self.inner.search(kind, query, cancel, on_batch)
-    }
-}
-
-/// A tab whose searches (and, with `gate_log`, history) wait for the test.
-fn gated_tab(dir: &std::path::Path, gate_log: bool) -> (RepoTab, crossbeam_channel::Sender<()>, crossbeam_channel::Sender<()>) {
-    let inner = tine_core::CliReader::open(dir).unwrap();
-    let git = inner.runner().clone();
-    let (search_tx, search_rx) = crossbeam_channel::unbounded();
-    let (log_tx, log_rx) = crossbeam_channel::unbounded();
-    let reader = Gated {
-        inner,
-        search_gate: std::sync::Mutex::new(search_rx),
-        log_gate: gate_log.then(|| std::sync::Mutex::new(log_rx)),
-    };
-    let mut tab = RepoTab::with_reader(std::sync::Arc::new(reader), git, &egui::Context::default());
-    assert!(poll_until(&mut tab, |t| t.status_loaded && t.refs.head.is_some() && (gate_log || !t.history.loading)));
-    (tab, search_tx, log_tx)
+/// Searches wait for the test; with `gate_log`, the history never arrives
+/// by itself (the test delivers it).
+fn tab_with_gates(dir: &std::path::Path, gate_log: bool) -> (RepoTab, std::sync::Arc<Gates>) {
+    gated_tab(dir, Gates { search: Gate::closed(), log: if gate_log { Gate::closed() } else { Gate::default() }, ..Default::default() })
 }
 
 /// Waits (polling) until the pending search has started.
@@ -207,7 +138,7 @@ fn started(tab: &mut RepoTab) -> tine_core::CancelToken {
 #[test]
 fn a_replaced_search_really_stops_and_its_results_are_dropped() {
     let repo = sample_repo();
-    let (mut tab, release, _log) = gated_tab(repo.path(), false);
+    let (mut tab, gates) = tab_with_gates(repo.path(), false);
     tab.open_search();
     tab.search.query = "a".into();
     tab.search_changed();
@@ -218,8 +149,9 @@ fn a_replaced_search_really_stops_and_its_results_are_dropped() {
     assert!(first.is_cancelled(), "the old search is stopped at once");
     let second = started(&mut tab);
     assert!(!second.is_cancelled());
-    release.send(()).unwrap();
-    release.send(()).unwrap();
+    assert!(poll_until(&mut tab, |_| gates.search.arrived() == 2));
+    gates.search.release_next();
+    gates.search.release_next();
     assert!(poll_until(&mut tab, |t| t.search.complete));
     assert_eq!(subjects(&tab), ["Document usage in README"], "nothing from the old search");
 }
@@ -227,7 +159,7 @@ fn a_replaced_search_really_stops_and_its_results_are_dropped() {
 #[test]
 fn closing_or_dropping_stops_a_running_search() {
     let repo = sample_repo();
-    let (mut tab, _release, _log) = gated_tab(repo.path(), false);
+    let (mut tab, _gates) = tab_with_gates(repo.path(), false);
     tab.open_search();
     tab.search.query = "a".into();
     tab.search_changed();
@@ -252,7 +184,7 @@ fn hash_search_follows_history_as_it_loads_and_is_replaced() {
         &tine_core::log::LogOptions::default(),
     )
     .unwrap();
-    let (mut tab, _release, _log) = gated_tab(repo.path(), true);
+    let (mut tab, _gates) = tab_with_gates(repo.path(), true);
     let target = all[5].id;
     // History arrives in parts; the search starts after the first one.
     tab.deliver(Msg::LogBatch(tab.log_seq(), all[..3].to_vec()));

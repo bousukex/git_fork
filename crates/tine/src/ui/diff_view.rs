@@ -61,7 +61,13 @@ pub enum DiffEvent {
 }
 
 /// Shows `pane`. `actions` enables hunk/line staging (local changes only).
-pub fn show(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions, actions: Option<LineActions>) -> Vec<DiffEvent> {
+/// `id` keeps this diff's scroll state apart from the other diffs (commit
+/// details, local changes, file history) and tabs.
+pub fn show(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, pane: &DiffPane, opts: DiffOptions, actions: Option<LineActions>) -> Vec<DiffEvent> {
+    ui.push_id(egui::Id::new(id), |ui| show_inner(ui, pane, opts, actions)).inner
+}
+
+fn show_inner(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions, actions: Option<LineActions>) -> Vec<DiffEvent> {
     let mut events = Vec::new();
     let Some(file) = &pane.file else {
         placeholder(ui, "Select a file to see its changes");

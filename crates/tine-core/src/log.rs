@@ -13,6 +13,9 @@ use crate::{
 /// Field order matters: the subject comes last so a stray `\x1f` inside it
 /// cannot shift the other fields. Records are NUL-terminated (`-z`).
 const FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s";
+/// The fields of [`FORMAT`], for other commands that parse commit headers
+/// with [`Parser`].
+pub(crate) const FIELDS: &str = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s";
 
 /// Which commits to list.
 #[derive(Debug, Clone, Default)]
@@ -23,7 +26,7 @@ pub struct LogOptions {
 }
 
 #[derive(Default)]
-struct Interner(HashMap<Box<[u8]>, Arc<str>>);
+pub(crate) struct Interner(HashMap<Box<[u8]>, Arc<str>>);
 
 impl Interner {
     fn get(&mut self, bytes: &[u8]) -> Arc<str> {
@@ -36,12 +39,17 @@ impl Interner {
     }
 }
 
-struct Parser {
+pub(crate) struct Parser {
     names: Interner,
 }
 
 impl Parser {
-    fn parse(&mut self, record: &[u8]) -> Option<CommitSummary> {
+    pub(crate) fn new() -> Self {
+        Parser { names: Interner::default() }
+    }
+
+    /// Parses one commit header written with [`FIELDS`].
+    pub(crate) fn parse(&mut self, record: &[u8]) -> Option<CommitSummary> {
         // `git log -z` separates records with NUL but a leading newline can
         // appear between records for some formats; tolerate it.
         let record = record.strip_prefix(b"\n").unwrap_or(record);
@@ -107,7 +115,7 @@ pub fn stream(
     }
     args.push("--".into());
 
-    let mut parser = Parser { names: Interner::default() };
+    let mut parser = Parser::new();
     let mut batch = Vec::with_capacity(batch_size);
     let mut keep_going = true;
     let result = git.stream_records(&args, 0, cancel, |rec| {

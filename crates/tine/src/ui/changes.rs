@@ -26,6 +26,8 @@ enum ListEvent {
     Discard(Vec<ChangedFile>),
     Resolve(Vec<bstr::BString>, Resolution),
     MergeTool(bstr::BString),
+    FileHistory(bstr::BString),
+    Blame(bstr::BString),
 }
 
 /// The commit subject and description fields.
@@ -123,6 +125,15 @@ fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab
                         }
                     });
                     ui.separator();
+                    let block = tab.local_browse_block(f);
+                    if ui.add_enabled(block.is_none(), egui::Button::new("File History")).on_disabled_hover_text(block.unwrap_or_default()).clicked() {
+                        events.push(ListEvent::FileHistory(f.path.clone()));
+                        ui.close();
+                    }
+                    if ui.add_enabled(block.is_none(), egui::Button::new("Blame")).on_disabled_hover_text(block.unwrap_or_default()).clicked() {
+                        events.push(ListEvent::Blame(f.path.clone()));
+                        ui.close();
+                    }
                     if ui.button("Copy Path").clicked() {
                         ui.ctx().copy_text(f.path.to_str_lossy().into_owned());
                         ui.close();
@@ -433,7 +444,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
             ui.centered_and_justified(|ui| ui.label(RichText::new("No local changes").color(p.text_weak)));
         } else {
             let actions = tab.line_actions();
-            for e in super::diff_view::show(ui, &tab.changes_diff, tab.diff_opts, actions) {
+            for e in super::diff_view::show(ui, ("changes-diff", &tab.paths.workdir), &tab.changes_diff, tab.diff_opts, actions) {
                 match e {
                     DiffEvent::Options(opts) => tab.set_diff_options(opts),
                     DiffEvent::Select(rows, anchor) => tab.select_diff_rows(rows, anchor),
@@ -464,6 +475,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
             ListEvent::Discard(files) => tab.request_discard(files),
             ListEvent::Resolve(paths, how) => tab.resolve(paths, how),
             ListEvent::MergeTool(path) => tab.open_mergetool(path),
+            ListEvent::FileHistory(path) => tab.file_history_of_local(path),
+            ListEvent::Blame(path) => tab.blame_of_local(path),
         }
     }
 }

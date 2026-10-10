@@ -1,6 +1,7 @@
 //! State of one open repository (one tab) and its reaction to worker results.
 
 mod actions;
+pub mod browse;
 pub mod dialog;
 pub mod remote;
 pub mod search;
@@ -15,7 +16,7 @@ use std::{
 };
 
 use tine_core::{
-    CliReader, GitRunner, RepoPaths, RepoReader,
+    CancelToken, CliReader, GitRunner, RepoPaths, RepoReader,
     diff::{DiffOptions, DiffSource},
     graph::Graph,
     log::LogOptions,
@@ -264,6 +265,22 @@ pub struct RepoTab {
     ops_moved_refs: bool,
     /// Commit search (Ctrl+F).
     pub search: search::Search,
+    /// File History / Blame views over the current view (top = shown).
+    pub browse: Vec<browse::Browse>,
+    /// The diff shown in File History.
+    pub browse_diff: DiffPane,
+    /// Tracked files for Quick Launch (loaded when it opens).
+    pub files: Option<Arc<crate::worker::FileIndex>>,
+    /// The listing in flight (0: none) and its token.
+    files_seq: Gen,
+    files_cancel: Option<CancelToken>,
+    /// The index may have changed since `files` was listed.
+    files_stale: bool,
+    /// Paths in HEAD (which local files have history), keyed by HEAD.
+    pub head_paths: Option<(Oid, Arc<std::collections::HashSet<BString>>)>,
+    head_paths_seq: Gen,
+    /// The work tree changed during an operation: catch up afterwards.
+    work_tree_dirty: bool,
 }
 
 #[derive(Default)]
@@ -349,6 +366,15 @@ impl RepoTab {
             output_focus: None,
             ops_moved_refs: false,
             search: search::Search::default(),
+            browse: Vec::new(),
+            browse_diff: DiffPane::default(),
+            files: None,
+            files_seq: 0,
+            files_cancel: None,
+            files_stale: true,
+            head_paths: None,
+            head_paths_seq: 0,
+            work_tree_dirty: false,
             changes_multi: Default::default(),
             changes_next: None,
             pending_discard: None,
@@ -403,6 +429,9 @@ impl RepoTab {
     }
 
     pub fn refresh_status(&mut self) {
+        // Every reload of the work tree's state passes here (F5, refocus,
+        // file watching, after operations).
+        self.work_tree_changed();
         self.gens.status = self.gens.bump();
         self.status_req_regen = ops_registry::generation(self.repo_key());
         self.worker.status(self.gens.status);
@@ -447,6 +476,9 @@ impl RepoTab {
             self.handle(msg);
         }
         self.poll_search();
+        if self.work_tree_dirty && !self.op_active() {
+            self.work_tree_changed();
+        }
         // An operation finished elsewhere (another tab or worktree of this
         // repository): reload once nothing else is queued.
         let generation = ops_registry::generation(self.repo_key());
@@ -493,6 +525,7 @@ impl RepoTab {
                         self.refs_by_commit.entry(r.target).or_default().push(i);
                     }
                     self.refs = refs;
+                    self.request_head_paths();
                     if self.gens.refs_then_log.take() == Some(seq) && moved {
                         self.reload_history();
                     }
@@ -537,6 +570,31 @@ impl RepoTab {
                 self.after_history_grew();
             }
             Msg::SearchBatch(seq, ids) => self.on_search_batch(seq, ids),
+            Msg::FileHistoryBatch(seq, batch) => self.on_file_history_batch(seq, batch),
+            Msg::FileHistoryDone(seq, r) => self.on_file_history_done(seq, r),
+            Msg::Blame(seq, r) => self.on_blame(seq, r),
+            Msg::Files(seq, r) if seq == self.files_seq => {
+                self.files_seq = 0;
+                self.files_cancel = None;
+                match r {
+                    // Only a listing nothing invalidated meanwhile is fresh
+                    // (an invalidation drops the request: `files_seq` = 0).
+                    Ok(index) => {
+                        self.files = Some(index);
+                        self.files_stale = false;
+                    }
+                    // Stays stale: the next Quick Launch tries again.
+                    Err(e) if e.is::<tine_core::Cancelled>() => {}
+                    Err(e) => self.error(format!("Failed to list files: {e:#}")),
+                }
+            }
+            Msg::HeadPaths(seq, head, r) if seq == self.head_paths_seq => {
+                self.head_paths_seq = 0;
+                match r {
+                    Ok(paths) => self.head_paths = Some((head, paths)),
+                    Err(e) => self.error(format!("Failed to list the files of HEAD: {e:#}")),
+                }
+            }
             Msg::SearchDone(seq, r) => self.on_search_done(seq, r),
             Msg::LogDone(seq, r) if seq == self.gens.log => {
                 self.history.finish(r.is_ok());
@@ -560,6 +618,9 @@ impl RepoTab {
                 }
                 Err(e) => self.commit.details = Some(Err(format!("{e:#}"))),
             },
+            Msg::Diff(seq, r) if seq == self.browse_diff.seq && seq != 0 => {
+                self.browse_diff.doc = Some(r.map(|d| Arc::new(DiffDoc::new(d))).map_err(|e| format!("{e:#}")));
+            }
             Msg::Diff(seq, r) if seq == self.commit_diff.seq => {
                 self.commit_diff.doc = Some(r.map(|d| Arc::new(DiffDoc::new(d))).map_err(|e| format!("{e:#}")));
             }
@@ -600,6 +661,54 @@ impl RepoTab {
         }
     }
 
+    /// Lists the tracked files for Quick Launch, unless a current list is
+    /// there (or on its way).
+    pub fn request_files(&mut self) {
+        if self.files_seq != 0 || (self.files.is_some() && !self.files_stale) {
+            return;
+        }
+        let cancel = CancelToken::default();
+        self.files_seq = self.gens.bump();
+        self.files_cancel = Some(cancel.clone());
+        self.worker.files(self.files_seq, cancel);
+    }
+
+    /// The token of the file listing in flight (tests).
+    #[doc(hidden)]
+    pub fn files_cancel_token(&self) -> Option<CancelToken> {
+        self.files_cancel.clone()
+    }
+
+    /// Lists HEAD's paths when HEAD moved.
+    fn request_head_paths(&mut self) {
+        let Some(head) = self.head_commit() else {
+            self.head_paths = None;
+            return;
+        };
+        if self.head_paths.as_ref().is_some_and(|(h, _)| *h == head) || self.head_paths_seq != 0 {
+            return;
+        }
+        self.head_paths_seq = self.gens.bump();
+        self.worker.head_paths(self.head_paths_seq, head, CancelToken::default());
+    }
+
+    /// The work tree or index may have changed: outdated file lists and
+    /// work-tree blames are dropped or reloaded — after the running
+    /// operation, if there is one.
+    pub(super) fn work_tree_changed(&mut self) {
+        if self.op_active() {
+            self.work_tree_dirty = true;
+            return;
+        }
+        self.work_tree_dirty = false;
+        self.files_stale = true;
+        if let Some(c) = self.files_cancel.take() {
+            c.cancel();
+            self.files_seq = 0;
+        }
+        self.browse_work_tree_changed();
+    }
+
     fn on_fs_change(&mut self, change: FsChange) {
         if ops_registry::active_for(self.repo_key()) {
             self.held_fs.merge(change);
@@ -616,6 +725,10 @@ impl RepoTab {
     }
 
     pub fn select_commit(&mut self, id: Oid) {
+        // Selecting a commit shows the history (leaving File History/Blame).
+        if !self.browse.is_empty() {
+            self.clear_browse();
+        }
         self.view = View::History;
         if self.selected_commit == Some(id) {
             return;
@@ -1152,10 +1265,12 @@ impl RepoTab {
             return;
         }
         self.diff_opts = opts;
-        if let (Some(file), Some(source)) = (self.commit_diff.file.clone(), self.commit_diff.source) {
-            self.commit_diff.seq = self.gens.bump();
-            self.commit_diff.doc = None;
-            self.worker.diff(self.commit_diff.seq, source, file, opts);
+        for pane in [&mut self.commit_diff, &mut self.browse_diff] {
+            if let (Some(file), Some(source)) = (pane.file.clone(), pane.source) {
+                pane.seq = self.gens.bump();
+                pane.doc = None;
+                self.worker.diff(pane.seq, source, file, opts);
+            }
         }
         self.load_changes_diff();
     }
@@ -1171,6 +1286,10 @@ impl Drop for RepoTab {
     /// a tab reopened on this work tree can take them over.
     fn drop(&mut self) {
         use crate::{ops_registry::OrphanedResult, worker::FollowUp};
+        self.stop_browse();
+        if let Some(c) = self.files_cancel.take() {
+            c.cancel();
+        }
         let repo = self.repo_key().to_path_buf();
         let origin = self.paths.workdir.clone();
         for msg in self.worker.poll().collect::<Vec<_>>() {

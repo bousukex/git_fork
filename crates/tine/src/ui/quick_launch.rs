@@ -25,6 +25,10 @@ pub enum Action {
     /// Switch to the open repository with this work tree.
     SwitchTab(PathBuf),
     Open(PathBuf),
+    /// File History of a tracked file (from HEAD).
+    FileHistory(bstr::BString),
+    /// Blame of a tracked file (the work tree's version).
+    Blame(bstr::BString),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +38,7 @@ pub enum ItemKind {
     RemoteBranch,
     Tag,
     Repository,
+    File,
 }
 
 impl ItemKind {
@@ -44,6 +49,7 @@ impl ItemKind {
             ItemKind::RemoteBranch => "Remote",
             ItemKind::Tag => "Tag",
             ItemKind::Repository => "Repository",
+            ItemKind::File => "File",
         }
     }
 }
@@ -75,6 +81,19 @@ const COMMANDS: &[Command] = &[
 
 const MAX_SHOWN: usize = 50;
 
+/// A result: one of the fixed items, or a tracked file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    Item(usize),
+    File(usize),
+}
+
+/// A listed result, for tests.
+pub struct Listed {
+    pub kind: ItemKind,
+    pub label: String,
+}
+
 pub struct QuickLaunch {
     /// Work tree of the repository the items were collected from; actions
     /// on branches, tags and repository commands run there, even if another
@@ -84,9 +103,13 @@ pub struct QuickLaunch {
     selected: usize,
     items: Vec<Item>,
     prepared: Vec<Prepared>,
-    /// (item index, match) for the current query.
-    results: Vec<(usize, fuzzy::Match)>,
-    shown_query: Option<String>,
+    /// Tracked files of the origin repository (arrive after opening).
+    files: Option<std::sync::Arc<crate::worker::FileIndex>>,
+    results: Vec<(Hit, fuzzy::Match)>,
+    /// Bumped whenever `files` is replaced: file hits index into one list.
+    files_gen: u64,
+    /// Query and file list generation the results are for.
+    shown_query: Option<(String, u64)>,
     focus: bool,
 }
 
@@ -154,30 +177,76 @@ impl QuickLaunch {
             selected: 0,
             items,
             prepared,
+            files: tab.and_then(|t| t.files.clone()),
+            files_gen: 0,
             results: Vec::new(),
             shown_query: None,
             focus: true,
         }
     }
 
+    /// Files arrived (or were listed again).
+    pub fn set_files(&mut self, files: Option<std::sync::Arc<crate::worker::FileIndex>>) {
+        let same = match (&self.files, &files) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.files = files;
+            // Hits of the old list mean other files now (or none at all).
+            self.files_gen += 1;
+            self.results.clear();
+            self.shown_query = None;
+        }
+    }
+
     fn refresh_results(&mut self) {
-        if self.shown_query.as_deref() == Some(self.query.as_str()) {
+        let key = (self.query.clone(), self.files_gen);
+        if self.shown_query.as_ref() == Some(&key) {
             return;
         }
         self.results = if self.query.trim().is_empty() {
             // Commands first, then everything else, in the order collected.
-            (0..self.items.len().min(MAX_SHOWN)).map(|i| (i, fuzzy::Match { score: 0, positions: Vec::new() })).collect()
+            (0..self.items.len().min(MAX_SHOWN))
+                .map(|i| (Hit::Item(i), fuzzy::Match { score: 0, positions: Vec::new() }))
+                .collect()
         } else {
-            fuzzy::top_prepared(&self.query, &self.prepared, MAX_SHOWN)
+            let mut hits: Vec<(Hit, fuzzy::Match)> = fuzzy::top_prepared(&self.query, &self.prepared, MAX_SHOWN)
+                .into_iter()
+                .map(|(i, m)| (Hit::Item(i), m))
+                .collect();
+            if let Some(files) = &self.files {
+                hits.extend(fuzzy::top_prepared(&self.query, &files.prepared, MAX_SHOWN).into_iter().map(|(i, m)| (Hit::File(i), m)));
+            }
+            // Best first; on a tie, commands and refs before files.
+            hits.sort_by_key(|(h, m)| (std::cmp::Reverse(m.score), matches!(h, Hit::File(_))));
+            hits.truncate(MAX_SHOWN);
+            hits
         };
         self.selected = 0;
-        self.shown_query = Some(self.query.clone());
+        self.shown_query = Some(key);
     }
 
-    /// Items currently listed (for tests).
-    pub fn listed(&mut self) -> Vec<&Item> {
+    fn item(&self, hit: Hit) -> Option<Item> {
+        match hit {
+            Hit::Item(i) => self.items.get(i).cloned(),
+            Hit::File(i) => {
+                let path = self.files.as_ref()?.paths.get(i)?.clone();
+                Some(Item {
+                    kind: ItemKind::File,
+                    label: path.to_string(),
+                    detail: "Enter: history · Shift+Enter: blame".into(),
+                    action: Action::FileHistory(path),
+                })
+            }
+        }
+    }
+
+    /// Results currently listed (for tests).
+    pub fn listed(&mut self) -> Vec<Listed> {
         self.refresh_results();
-        self.results.iter().map(|(i, _)| &self.items[*i]).collect()
+        self.results.iter().filter_map(|(h, _)| self.item(*h)).map(|i| Listed { kind: i.kind, label: i.label }).collect()
     }
 }
 
@@ -186,10 +255,12 @@ pub fn block_reason(item: &Item, tab: Option<&RepoTab>) -> Option<&'static str> 
     let Some(tab) = tab else {
         return match &item.action {
             Action::Command(c) if c.needs_repo() => Some("Open a repository first"),
+            Action::FileHistory(_) | Action::Blame(_) => Some("Open a repository first"),
             _ => None,
         };
     };
     match &item.action {
+        Action::FileHistory(path) | Action::Blame(path) => tab.path_browse_block(path),
         Action::Command(Command::Fetch) => tab.remote_block(Needs::Idle, false),
         Action::Command(Command::Pull) => tab.remote_block(Needs::CleanState, true),
         Action::Command(Command::Push) => tab.remote_block(Needs::Idle, true),
@@ -232,6 +303,7 @@ pub fn show(ctx: &egui::Context, ql: &mut QuickLaunch, tab: Option<&RepoTab>) ->
     let down = input::take_key(ctx, Modifiers::NONE, Key::ArrowDown);
     let up = input::take_key(ctx, Modifiers::NONE, Key::ArrowUp);
     let enter = input::take_key(ctx, Modifiers::NONE, Key::Enter);
+    let shift_enter = input::take_key(ctx, Modifiers::SHIFT, Key::Enter);
     let escape = input::take_key(ctx, Modifiers::NONE, Key::Escape);
     let mut clicked = None;
 
@@ -259,8 +331,8 @@ pub fn show(ctx: &egui::Context, ql: &mut QuickLaunch, tab: Option<&RepoTab>) ->
             ui.label(RichText::new("Nothing matches").color(p.text_weak));
         }
         egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
-            for (row, (i, m)) in ql.results.iter().enumerate() {
-                let item = &ql.items[*i];
+            for (row, (hit, m)) in ql.results.iter().enumerate() {
+                let Some(item) = &ql.item(*hit) else { continue };
                 let block = block_reason(item, tab);
                 let selected = row == ql.selected;
                 let (text_color, strong) = if block.is_some() { (p.text_weak, p.text_weak) } else { (p.text, p.accent) };
@@ -293,15 +365,49 @@ pub fn show(ctx: &egui::Context, ql: &mut QuickLaunch, tab: Option<&RepoTab>) ->
         });
     });
 
-    let chosen = clicked.or(enter.then_some(ql.selected));
+    let chosen = clicked.or((enter || shift_enter).then_some(ql.selected));
     if let Some(row) = chosen
-        && let Some((i, _)) = ql.results.get(row)
+        && let Some((hit, _)) = ql.results.get(row)
     {
-        let item = &ql.items[*i];
-        if block_reason(item, tab).is_none() {
-            return Outcome::Run(item.action.clone());
+        let Some(item) = ql.item(*hit) else { return Outcome::Stay };
+        if block_reason(&item, tab).is_none() {
+            return Outcome::Run(match item.action {
+                // Shift+Enter on a file: blame instead of history.
+                Action::FileHistory(path) if shift_enter => Action::Blame(path),
+                action => action,
+            });
         }
         ql.selected = row;
     }
     if escape || modal.should_close() { Outcome::Close } else { Outcome::Stay }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::worker::FileIndex;
+
+    fn index(paths: &[&str]) -> Arc<FileIndex> {
+        Arc::new(FileIndex {
+            paths: paths.iter().map(|p| bstr::BString::from(*p)).collect(),
+            prepared: paths.iter().map(|p| Prepared::new(p)).collect(),
+        })
+    }
+
+    #[test]
+    fn a_new_file_list_replaces_the_old_hits() {
+        let mut ql = QuickLaunch::new(None, &[], &[]);
+        ql.set_files(Some(index(&["src/zeta.rs", "src/alpha.rs", "src/beta.rs"])));
+        ql.query = "src".into();
+        assert_eq!(ql.listed().len(), 3);
+        // Listed again while the query is unchanged: shorter and reordered.
+        ql.set_files(Some(index(&["src/beta.rs"])));
+        let labels: Vec<String> = ql.listed().into_iter().map(|l| l.label).collect();
+        assert_eq!(labels, ["src/beta.rs"], "no stale index into the old list");
+        ql.set_files(Some(index(&["lib/other.rs", "src/gamma.rs"])));
+        let labels: Vec<String> = ql.listed().into_iter().map(|l| l.label).collect();
+        assert_eq!(labels, ["src/gamma.rs"]);
+    }
 }

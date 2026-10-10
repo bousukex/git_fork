@@ -65,7 +65,7 @@ fn frame_with_key(h: &mut Harness<'_, tine::app::TineApp>, key: egui::Key) -> Du
 fn stats(mut times: Vec<Duration>) -> String {
     times.sort();
     let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
-    format!("{} frames: p50 {:.2?}, p95 {:.2?}, max {:.2?}", times.len(), at(0.5), at(0.95), times[times.len() - 1])
+    format!("{} samples: p50 {:.2?}, p95 {:.2?}, max {:.2?}", times.len(), at(0.5), at(0.95), times[times.len() - 1])
 }
 
 /// Frame cost while a commit search runs, and when its matches arrive.
@@ -121,3 +121,67 @@ fn search_while_scrolling() {
     println!("frames while searching and scrolling: {}", stats(times));
 }
 
+
+/// Blame of a long file: building the display model, the request to the
+/// frame that first shows it (five times), then scrolling.
+/// `TINE_PERF_BLAME` names the file (default "sequencer.c", as in git/git).
+#[test]
+#[ignore = "needs TINE_PERF_REPO"]
+fn blame_and_scroll() {
+    let Ok(repo) = std::env::var("TINE_PERF_REPO") else { return };
+    let file = std::env::var("TINE_PERF_BLAME").unwrap_or_else(|_| "sequencer.c".into());
+    let mut h = Harness::builder()
+        .with_size([1360.0, 860.0])
+        .build_eframe(|cc| tine::app::TineApp::new(cc, vec![repo.clone().into()]));
+    let start = Instant::now();
+    while !h.state().is_idle() {
+        assert!(start.elapsed() < Duration::from_secs(60), "history did not load");
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let head = h.state_mut().active_tab_mut().unwrap().head_commit().unwrap();
+
+    // The display model alone (built on the worker thread).
+    let git = tine_core::CliReader::open(std::path::Path::new(&repo)).unwrap().runner().clone();
+    let blame = tine_core::blame::blame(&git, file.as_bytes(), Some(head), false, &tine_core::CancelToken::default()).unwrap();
+    let t = Instant::now();
+    let doc = tine::blame_model::BlameDoc::new(blame);
+    println!("BlameDoc for {} lines: {:.2?}", doc.blame.lines.len(), t.elapsed());
+
+    let (mut shown, mut first_frames) = (Vec::new(), Vec::new());
+    for _ in 0..5 {
+        let start = Instant::now();
+        h.state_mut().active_tab_mut().unwrap().open_blame(Some(head), file.clone().into(), None);
+        loop {
+            // The frame in which the result is applied also draws it first.
+            let t = Instant::now();
+            h.step();
+            let frame = t.elapsed();
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            if let Some(tine::repo::browse::Browse::Blame(v)) = tab.browse.last()
+                && let Some(doc) = &v.doc
+            {
+                doc.as_ref().expect("blamed");
+                shown.push(start.elapsed());
+                first_frames.push(frame);
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "blame did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        h.state_mut().active_tab_mut().unwrap().clear_browse();
+        h.step();
+    }
+    println!("blame {file} at {}: request → shown: {}", head.short(), stats(shown));
+    println!("the frame that first shows it: {}", stats(first_frames));
+    h.state_mut().active_tab_mut().unwrap().open_blame(Some(head), file.clone().into(), None);
+    while !matches!(h.state_mut().active_tab_mut().unwrap().browse.last(), Some(tine::repo::browse::Browse::Blame(v)) if v.doc.is_some()) {
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let times: Vec<Duration> =
+        (0..300).map(|i| frame_with_key(&mut h, if i % 3 == 2 { egui::Key::ArrowDown } else { egui::Key::PageDown })).collect();
+    println!("frames while scrolling the blame: {}", stats(times));
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    println!("{}", status.lines().filter(|l| l.starts_with("VmHWM") || l.starts_with("VmRSS")).collect::<Vec<_>>().join("  "));
+}

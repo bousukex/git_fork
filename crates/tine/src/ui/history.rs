@@ -51,7 +51,7 @@ fn badge_color(kind: RefKind, p: &Palette) -> egui::Color32 {
 }
 
 /// Moves the selection with the keyboard; returns the new row.
-fn keyboard_nav(ui: &egui::Ui, current: Option<usize>, total: usize, page: usize) -> Option<usize> {
+pub(super) fn keyboard_nav(ui: &egui::Ui, current: Option<usize>, total: usize, page: usize) -> Option<usize> {
     if total == 0 || ui.ctx().memory(|m| m.focused().is_some()) || !input::views_have_keys(ui.ctx()) {
         return None;
     }

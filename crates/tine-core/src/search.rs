@@ -142,8 +142,8 @@ pub fn search(
 /// Groups ids from `rx` into batches: the first at once, then whatever
 /// arrived after at most [`FLUSH_EVERY`] (or [`MAX_BATCH`] ids). Ends when
 /// the sender is gone (complete), `cancel` fires or `on_batch` declines.
-pub fn batch_stream(rx: &Receiver<Oid>, cancel: &CancelToken, mut on_batch: impl FnMut(Vec<Oid>) -> bool) -> SearchEnd {
-    let mut batch: Vec<Oid> = Vec::new();
+pub fn batch_stream<T>(rx: &Receiver<T>, cancel: &CancelToken, mut on_batch: impl FnMut(Vec<T>) -> bool) -> SearchEnd {
+    let mut batch: Vec<T> = Vec::new();
     let mut sent_any = false;
     // When the oldest unsent id must go out.
     let mut due: Option<Instant> = None;

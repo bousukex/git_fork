@@ -11,6 +11,8 @@ const FILE_ROW_H: f32 = 22.0;
 enum Action {
     Reveal(Oid),
     SelectFile(usize),
+    FileHistory(usize),
+    Blame(usize),
 }
 
 fn info(ui: &mut egui::Ui, d: &CommitDetails, actions: &mut Vec<Action>) {
@@ -83,6 +85,21 @@ fn files(ui: &mut egui::Ui, tab: &RepoTab, actions: &mut Vec<Action>) {
                     if resp.clicked() {
                         actions.push(Action::SelectFile(i));
                     }
+                    resp.context_menu(|ui| {
+                        if ui.button("File History").clicked() {
+                            actions.push(Action::FileHistory(i));
+                            ui.close();
+                        }
+                        let label = if f.kind == tine_core::model::ChangeKind::Deleted { "Blame Before Deletion" } else { "Blame at This Commit" };
+                        if ui.button(label).clicked() {
+                            actions.push(Action::Blame(i));
+                            ui.close();
+                        }
+                        if ui.button("Copy Path").clicked() {
+                            ui.ctx().copy_text(f.path.to_string());
+                            ui.close();
+                        }
+                    });
                     status_badge(ui.painter(), Pos2::new(rect.left() + 14.0, rect.center().y), f.kind, p);
                     let (name, dir) = split_path(&f.path);
                     let text_rect = Rect::from_min_max(Pos2::new(rect.left() + 28.0, rect.top()), rect.right_bottom());
@@ -139,17 +156,29 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             files(ui, tab, &mut actions);
         });
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(p.bg)).show(ui, |ui| {
-        for e in super::diff_view::show(ui, &tab.commit_diff, tab.diff_opts, None) {
+        for e in super::diff_view::show(ui, ("commit-diff", &tab.paths.workdir), &tab.commit_diff, tab.diff_opts, None) {
             if let super::diff_view::DiffEvent::Options(opts) = e {
                 tab.set_diff_options(opts);
             }
         }
     });
 
+    let parent = match &tab.commit.details {
+        Some(Ok(d)) => d.parents.first().copied(),
+        _ => None,
+    };
     for a in actions {
         match a {
             Action::Reveal(id) => tab.reveal_commit(id),
             Action::SelectFile(i) => tab.select_commit_file(i),
+            Action::FileHistory(i) | Action::Blame(i) => {
+                let (Some(id), Some(file)) = (tab.commit.id, tab.commit.files.get(i).cloned()) else { continue };
+                if matches!(a, Action::FileHistory(_)) {
+                    tab.file_history_of_commit_file(id, parent, &file);
+                } else {
+                    tab.blame_of_commit_file(id, parent, &file);
+                }
+            }
         }
     }
 }

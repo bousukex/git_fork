@@ -412,3 +412,33 @@ fn commit_search() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn file_history_and_blame() {
+    let _serial = serial();
+    let repo = sample_repo();
+    let path = repo.path().to_path_buf();
+    for (name, blame) in [("file_history", false), ("blame", true)] {
+        shoot(
+            name,
+            [1200.0, 640.0],
+            |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+            |h| {
+                settle(h);
+                let tab = h.state_mut().active_tab_mut().unwrap();
+                let head = tab.head_commit().unwrap();
+                if blame {
+                    tab.open_blame(Some(head), "main.rs".into(), None);
+                    settle(h);
+                    if let Some(tine::repo::browse::Browse::Blame(v)) = h.state_mut().active_tab_mut().unwrap().browse.last_mut() {
+                        v.selected = Some(1);
+                    }
+                } else {
+                    tab.open_file_history(head, "main.rs".into(), None);
+                }
+                settle(h);
+            },
+        );
+    }
+}

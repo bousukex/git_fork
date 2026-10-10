@@ -59,12 +59,16 @@ pub fn char_cols(c: char) -> usize {
     if wide { 2 } else { 1 }
 }
 
-fn display_text(bytes: &[u8]) -> (String, usize) {
+/// A line as shown: lossy UTF-8, tabs expanded, CR dropped, cut when very
+/// long; with its width in monospace columns.
+pub fn display_text(bytes: &[u8]) -> (String, usize) {
     let s = String::from_utf8_lossy(bytes);
-    let mut out = String::with_capacity(s.len());
+    // The limit counts characters (not UTF-8 bytes: Japanese text would be
+    // cut at a third of it).
+    let mut out = String::with_capacity(s.len().min(MAX_LINE_CHARS * 4 + 4));
     let mut cols = 0;
-    for c in s.chars() {
-        if out.len() >= MAX_LINE_CHARS {
+    for (n, c) in s.chars().enumerate() {
+        if n >= MAX_LINE_CHARS {
             out.push('…');
             cols += 1;
             break;
@@ -138,5 +142,15 @@ mod tests {
         assert_eq!(display_text(b"x\r").0, "x");
         let long = vec![b'x'; 5000];
         assert!(display_text(&long).0.ends_with('…'));
+        // 2000 Japanese characters fit; the limit isn't in bytes.
+        let japanese = "日".repeat(MAX_LINE_CHARS);
+        assert!(!display_text(japanese.as_bytes()).0.ends_with('…'));
+        let over = "日".repeat(MAX_LINE_CHARS + 1);
+        let (cut, _) = display_text(over.as_bytes());
+        assert_eq!(cut.chars().count(), MAX_LINE_CHARS + 1, "2000 characters and the ellipsis");
+        // Invalid UTF-8 and tabs count as what is shown.
+        let mut mixed = vec![0xff; 10];
+        mixed.extend_from_slice(b"\tx");
+        assert_eq!(display_text(&mixed).0, format!("{}  x", "\u{fffd}".repeat(10)));
     }
 }

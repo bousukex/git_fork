@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod gated;
+
 use std::process::Command;
 
 use egui_kittest::Harness;

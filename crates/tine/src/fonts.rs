@@ -186,7 +186,7 @@ mod glyph_tests {
 
     /// Symbols used in the UI. A symbol missing from every loaded font
     /// renders as an empty box, so check them against the real fonts.
-    pub const UI_SYMBOLS: &str = "✓×⊘▶?…→▼↑↓☰−■!";
+    pub const UI_SYMBOLS: &str = "✓×⊘▶?…→←▼↑↓☰−■!";
 
     #[test]
     fn ui_symbols_have_glyphs() {

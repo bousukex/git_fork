@@ -113,6 +113,18 @@ pub enum Msg {
     HeadMessage(Gen, anyhow::Result<String>),
     SearchBatch(Gen, Vec<Oid>),
     SearchDone(Gen, anyhow::Result<tine_core::search::SearchEnd>),
+    FileHistoryBatch(Gen, Vec<tine_core::file_history::FileHistoryEntry>),
+    FileHistoryDone(Gen, anyhow::Result<tine_core::search::SearchEnd>),
+    Blame(Gen, anyhow::Result<Arc<crate::blame_model::BlameDoc>>),
+    Files(Gen, anyhow::Result<Arc<FileIndex>>),
+    /// The paths in a commit (HEAD), for "is this file committed?".
+    HeadPaths(Gen, Oid, anyhow::Result<Arc<std::collections::HashSet<bstr::BString>>>),
+}
+
+/// The repository's tracked files, prepared for Quick Launch matching.
+pub struct FileIndex {
+    pub paths: Vec<bstr::BString>,
+    pub prepared: Vec<tine_core::fuzzy::Prepared>,
 }
 
 /// What a queued write operation was, so the UI can react to its result.
@@ -269,6 +281,11 @@ impl Worker {
         self.fail_spawns = true;
     }
 
+    #[doc(hidden)]
+    pub fn allow_spawns_for_test(&mut self) {
+        self.fail_spawns = false;
+    }
+
     /// Runs `job` on its own thread; reports (and returns) a failure to
     /// start it.
     fn spawn(&self, name: &str, job: impl FnOnce(&dyn RepoReader, &Sender<Msg>) + Send + 'static) -> Result<(), String> {
@@ -338,6 +355,67 @@ impl Worker {
         // The search must still end (as failed), or it would stay "running".
         if let Err(e) = started {
             let _ = self.tx.send(Msg::SearchDone(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// Streams the history of `path` from `start`.
+    pub fn file_history(&self, seq: Gen, start: Oid, path: bstr::BString, cancel: CancelToken) {
+        let ctx = self.ctx.clone();
+        let started = self.spawn("file-history", move |r, tx| {
+            let result = r.file_history(start, &path, &cancel, &mut |batch| {
+                let ok = tx.send(Msg::FileHistoryBatch(seq, batch)).is_ok();
+                ctx.request_repaint();
+                ok
+            });
+            let _ = tx.send(Msg::FileHistoryDone(seq, result));
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::FileHistoryDone(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// Blames `path` at `rev` (the work tree without one) and prepares it
+    /// for display.
+    pub fn blame(&self, seq: Gen, path: bstr::BString, rev: Option<Oid>, ignore_whitespace: bool, cancel: CancelToken) {
+        let started = self.spawn("blame", move |r, tx| {
+            let result = r
+                .blame(&path, rev, ignore_whitespace, &cancel)
+                .map(|b| Arc::new(crate::blame_model::BlameDoc::new(b)));
+            let _ = tx.send(Msg::Blame(seq, result));
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::Blame(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// Lists and prepares the tracked files (for Quick Launch).
+    pub fn files(&self, seq: Gen, cancel: CancelToken) {
+        let started = self.spawn("files", move |r, tx| {
+            let result = r.tracked_files(&cancel).and_then(|paths| {
+                let mut prepared = Vec::with_capacity(paths.len());
+                for p in &paths {
+                    if prepared.len() % 4096 == 0 && cancel.is_cancelled() {
+                        return Err(tine_core::Cancelled.into());
+                    }
+                    prepared.push(tine_core::fuzzy::Prepared::new(&p.to_string()));
+                }
+                Ok(Arc::new(FileIndex { paths, prepared }))
+            });
+            let _ = tx.send(Msg::Files(seq, result));
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::Files(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// The paths in commit `rev`.
+    pub fn head_paths(&self, seq: Gen, rev: Oid, cancel: CancelToken) {
+        let started = self.spawn("head-paths", move |r, tx| {
+            let result = r.paths_at(rev, &cancel).map(|p| Arc::new(p.into_iter().collect()));
+            let _ = tx.send(Msg::HeadPaths(seq, rev, result));
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::HeadPaths(seq, rev, Err(anyhow::anyhow!(e))));
         }
     }
 

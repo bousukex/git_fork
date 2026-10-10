@@ -1,5 +1,6 @@
 pub mod askpass;
 pub mod banner;
+pub mod browse;
 pub mod changes;
 pub mod detail;
 pub mod dialogs;
