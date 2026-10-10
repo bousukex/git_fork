@@ -3683,6 +3683,7 @@ dependencies = [
  "egui_extras",
  "egui_kittest",
  "env_logger",
+ "libc",
  "log",
  "memmap2",
  "notify",

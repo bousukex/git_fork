@@ -68,3 +68,70 @@ fn reports_relevant_changes_only() {
     }
     assert!(c.refs, "{c:?}");
 }
+
+#[test]
+fn constant_reads_by_other_tools_do_not_delay_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().canonicalize().unwrap();
+    git(&d, &["init", "-q", "-b", "main"]);
+    std::fs::write(d.join("a.txt"), "1\n").unwrap();
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-qm", "init"]);
+
+    let (tx, rx) = unbounded();
+    let runner = GitRunner::new(&d).with_env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let _w = RepoWatcher::start(d.clone(), d.join(".git"), runner, tx, egui::Context::default());
+    std::thread::sleep(Duration::from_millis(500));
+
+    // A shell prompt or editor polling git: reads every 20ms.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = {
+        let (d, stop) = (d.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                git(&d, &["rev-parse", "HEAD"]);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    git(&d, &["commit", "-q", "--allow-empty", "-m", "second"]);
+    let c = next_change(&rx, Duration::from_secs(3));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    poller.join().unwrap();
+    assert!(c.is_some_and(|c| c.refs), "{c:?}");
+}
+
+#[test]
+fn continuous_changes_are_reported_within_two_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().canonicalize().unwrap();
+    git(&d, &["init", "-q", "-b", "main"]);
+    std::fs::write(d.join("a.txt"), "0\n").unwrap();
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-qm", "init"]);
+    let (tx, rx) = unbounded();
+    let runner = GitRunner::new(&d).with_env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let _w = RepoWatcher::start(d.clone(), d.join(".git"), runner, tx, egui::Context::default());
+    std::thread::sleep(Duration::from_millis(500));
+
+    // A tracked file rewritten every 100ms (never quiet for 300ms).
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (d, stop) = (d.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                i += 1;
+                std::fs::write(d.join("a.txt"), format!("{i}\n")).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    let start = std::time::Instant::now();
+    let c = next_change(&rx, Duration::from_secs(4));
+    let took = start.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(c.is_some_and(|c| c.status), "{c:?}");
+    assert!(took < Duration::from_millis(2600), "{took:?}");
+}

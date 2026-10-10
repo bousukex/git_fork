@@ -35,6 +35,8 @@ pub enum Integration {
     Rebase { onto: String },
     CherryPick { commit: String },
     Revert { commit: String },
+    /// Pull `branch` (its name on the remote) from `remote`.
+    Pull { remote: String, branch: String, rebase: bool },
 }
 
 impl Integration {
@@ -44,6 +46,7 @@ impl Integration {
             Integration::Rebase { onto } => format!("rebase onto {onto}"),
             Integration::CherryPick { commit } => format!("cherry-pick {commit}"),
             Integration::Revert { commit } => format!("revert {commit}"),
+            Integration::Pull { remote, branch, .. } => format!("pull {remote}/{branch}"),
         }
     }
 }
@@ -78,4 +81,22 @@ pub enum Dialog {
     /// Marking resolved files that still contain conflict markers.
     MarkResolved { paths: Vec<bstr::BString> },
     UndoStashApply { oid: Oid },
+    /// `remote: None` fetches all remotes.
+    Fetch { remote: Option<String>, prune: bool },
+    /// `remote_branch`: e.g. `origin/main` (empty until chosen).
+    Pull { remote_branch: String, rebase: bool, stash_first: bool },
+    /// `lease`: the remote branch a force push may replace, as (remote,
+    /// branch, where its remote-tracking ref pointed when the dialog showed
+    /// it). Taken again only when the user picks another target.
+    Push {
+        branch: String,
+        remote: String,
+        remote_branch: String,
+        set_upstream: bool,
+        tags: bool,
+        force: bool,
+        lease: (String, String, Option<Oid>),
+    },
+    /// Deleting `full_ref` (e.g. `refs/heads/x`) on `remote`.
+    DeleteRemoteRef { remote: String, full_ref: String },
 }

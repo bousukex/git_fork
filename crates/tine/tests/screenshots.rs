@@ -11,6 +11,18 @@ use common::{git, sample_repo, settle};
 use egui::Theme;
 use egui_kittest::Harness;
 
+static PROMPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Credential prompts are process-wide and would show in every app: the
+/// test that opens one runs alone ([`exclusive`]), the others side by side.
+fn serial() -> std::sync::RwLockReadGuard<'static, ()> {
+    PROMPTS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+    PROMPTS.write().unwrap_or_else(|e| e.into_inner())
+}
+
 fn out_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/screenshots");
     std::fs::create_dir_all(&dir).unwrap();
@@ -44,12 +56,14 @@ fn shoot<S: eframe::App + 'static>(
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn ime_probe() {
+    let _serial = serial();
     shoot("ime_probe", [900.0, 520.0], |_| tine::probe::ImeProbe::default(), |_| {});
 }
 
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn history_view() {
+    let _serial = serial();
     let repo = sample_repo();
     let path = repo.path().to_path_buf();
     shoot(
@@ -69,6 +83,7 @@ fn history_view() {
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn local_changes_view() {
+    let _serial = serial();
     let repo = sample_repo();
     let path = repo.path().to_path_buf();
     shoot(
@@ -117,6 +132,7 @@ fn many_branches_repo(n: usize) -> tempfile::TempDir {
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn many_lanes() {
+    let _serial = serial();
     let repo = many_branches_repo(45);
     let path = repo.path().to_path_buf();
     shoot("many_lanes", [1100.0, 700.0], |cc| tine::app::TineApp::new(cc, vec![path.clone()]), |h| {
@@ -130,6 +146,7 @@ fn many_lanes() {
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn line_staging_view() {
+    let _serial = serial();
     let repo = sample_repo();
     let d = repo.path();
     let mut t = 1_950_000_000;
@@ -166,6 +183,7 @@ fn line_staging_view() {
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn merge_conflict_view() {
+    let _serial = serial();
     let repo = common::diverged_repo();
     let path = repo.path().to_path_buf();
     shoot(
@@ -192,6 +210,7 @@ fn merge_conflict_view() {
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn reset_dialog() {
+    let _serial = serial();
     let repo = common::diverged_repo();
     std::fs::write(repo.path().join("g.txt"), "unsaved\n").unwrap();
     let path = repo.path().to_path_buf();
@@ -215,6 +234,7 @@ fn reset_dialog() {
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn stash_conflict_view() {
+    let _serial = serial();
     let repo = common::diverged_repo();
     let d = repo.path().to_path_buf();
     let mut t = 1_900_000_000;
@@ -241,4 +261,109 @@ fn stash_conflict_view() {
             settle(h);
         },
     );
+}
+
+/// A clone of a bare remote with one unpushed commit (and the dirs to keep).
+fn remote_setup() -> (tempfile::TempDir, tempfile::TempDir) {
+    let (bare, mine) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut t = 1_880_000_000;
+    git(bare.path(), &["init", "-q", "--bare", "-b", "main"], &mut t);
+    git(mine.path(), &["clone", "-q", &format!("file://{}", bare.path().display()), "."], &mut t);
+    git(mine.path(), &["config", "user.name", "山田 太郎"], &mut t);
+    git(mine.path(), &["config", "user.email", "taro@example.com"], &mut t);
+    std::fs::write(mine.path().join("f.txt"), "f\n").unwrap();
+    git(mine.path(), &["add", "-A"], &mut t);
+    git(mine.path(), &["commit", "-qm", "First commit"], &mut t);
+    git(mine.path(), &["push", "-q", "origin", "main"], &mut t);
+    git(mine.path(), &["switch", "-q", "-c", "feature/ログイン"], &mut t);
+    std::fs::write(mine.path().join("g.txt"), "g\n").unwrap();
+    git(mine.path(), &["add", "-A"], &mut t);
+    git(mine.path(), &["commit", "-qm", "ログイン画面を追加"], &mut t);
+    (bare, mine)
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn push_dialog() {
+    let _serial = serial();
+    let (_bare, mine) = remote_setup();
+    let path = mine.path().to_path_buf();
+    shoot(
+        "push_dialog",
+        [1100.0, 700.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            tab.open_push_dialog(None);
+            if let Some(tine::repo::dialog::Dialog::Push { force, tags, .. }) = &mut tab.dialog {
+                *force = true;
+                *tags = true;
+            }
+            settle(h);
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn askpass_dialog() {
+    let _exclusive = exclusive();
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = tine_core::RepoPaths { workdir: dir.path().into(), git_dir: dir.path().into(), common_dir: dir.path().into() };
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let (env_tx, env_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+    tine::ops_registry::submit(
+        std::path::Path::new("/test/screenshot/askpass"),
+        &paths,
+        tine::worker::OpKind::Push("main".into()),
+        tx,
+        egui::Context::default(),
+        Box::new(move |ctx| {
+            let env = tine::askpass::env_for(ctx.id, "Push", std::path::Path::new("/home/me/プロジェクト"), None).unwrap();
+            env_tx.send(env).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(60));
+            Ok(tine::worker::OpOutcome::default())
+        }),
+    )
+    .unwrap();
+    let env = env_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let get = |k: &str| env.iter().find(|(n, _)| n == k).unwrap().1.clone();
+    let (socket, token) =
+        (PathBuf::from(get(tine::askpass::SOCKET_ENV)), get(tine::askpass::TOKEN_ENV).into_string().unwrap());
+    // Two prompts in turn: one for each theme.
+    let asker = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let _ = tine::askpass::request(&socket, &token, "", "Password for 'https://alice@github.com': ");
+        }
+    });
+    let repo = sample_repo();
+    let repo_path = repo.path().to_path_buf();
+    shoot(
+        "askpass_dialog",
+        [1100.0, 700.0],
+        |cc| tine::app::TineApp::new(cc, vec![repo_path.clone()]),
+        |h| {
+            settle(h);
+            while tine::askpass::pending().is_none() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            settle(h);
+        },
+    );
+    // Answer both prompts so the asker finishes.
+    for _ in 0..2 {
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if let Some(p) = tine::askpass::pending() {
+                tine::askpass::answer(p.id, tine::askpass::Answer::Value(String::new()));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = asker.join();
+    release_tx.send(()).unwrap();
 }

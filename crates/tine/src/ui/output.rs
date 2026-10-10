@@ -25,7 +25,11 @@ fn status(s: &OpSnapshot, p: &Palette) -> (&'static str, Color32, String) {
 /// The most recent progress of a running operation (for the toolbar).
 pub fn running_summary(tab: &RepoTab) -> Option<(ops_registry::OpId, String)> {
     ops_registry::snapshots_for(tab.repo_key()).into_iter().find(|s| s.state.is_active()).map(|s| {
-        let detail = s.progress.clone().unwrap_or_else(|| "running…".into());
+        let detail = match s.state {
+            OpState::AwaitingAuth => "waiting for credentials…".into(),
+            OpState::Cancelling => "cancelling…".into(),
+            _ => s.progress.clone().unwrap_or_else(|| "running…".into()),
+        };
         (s.id, format!("{}: {detail}", s.kind.label()))
     })
 }

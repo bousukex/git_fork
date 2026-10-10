@@ -12,6 +12,7 @@ pub mod ops;
 pub mod patch;
 pub mod reader;
 pub mod refs;
+pub mod remote;
 pub mod runner;
 pub mod sequencer;
 pub mod stash;

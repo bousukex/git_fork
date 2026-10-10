@@ -15,6 +15,7 @@ use tine_core::{
     autostash::{self, AutoStash},
     branches::{self, Created, DeleteCheck, RemoteCheckout},
     integrate::{self, DirtyWorkTree, ResetMode, Step},
+    remote,
     model::{GitRef, Oid, RepoState},
     sequencer::{self, Resolution},
     stash,
@@ -57,6 +58,17 @@ fn step_outcome(step: Step, done: String, what: &str, state: RepoState) -> OpOut
     }
 }
 
+/// Adds advice to errors that look like missing credentials.
+pub(super) fn with_auth_hint(git: &GitRunner, e: anyhow::Error) -> anyhow::Error {
+    if e.is::<tine_core::Cancelled>() {
+        return e;
+    }
+    match remote::auth_hint(git, &format!("{e:#}")) {
+        Some(hint) => anyhow::anyhow!("{e:#}\n{hint}"),
+        None => e,
+    }
+}
+
 /// Git refused to switch because local changes would be overwritten.
 fn blocked_by_local_changes(e: &anyhow::Error) -> bool {
     let m = format!("{e:#}");
@@ -92,7 +104,7 @@ impl RepoTab {
     }
 
     /// Reports why an action can't run, if it can't.
-    fn allowed(&mut self, needs: Needs) -> bool {
+    pub(super) fn allowed(&mut self, needs: Needs) -> bool {
         match self.block_reason(needs) {
             Some(why) => {
                 self.error(why.to_owned());
@@ -102,7 +114,7 @@ impl RepoTab {
         }
     }
 
-    fn current_branch(&self) -> String {
+    pub(super) fn current_branch(&self) -> String {
         match &self.refs.head {
             Some(tine_core::model::Head::Branch { name, .. } | tine_core::model::Head::Unborn { name }) => name.clone(),
             _ => "HEAD".into(),
@@ -375,8 +387,9 @@ impl RepoTab {
             Integration::Rebase { onto } => OpKind::Rebase(onto.clone()),
             Integration::CherryPick { commit } => OpKind::CherryPick(commit.clone()),
             Integration::Revert { commit } => OpKind::Revert(commit.clone()),
+            Integration::Pull { remote, branch, .. } => OpKind::Pull(format!("{remote}/{branch}")),
         };
-        self.run_op(kind, move |git| {
+        self.run_op_ctx(kind, move |ctx, git| {
             if let Err(e) = integrate::ensure_ready(git, &git_dir, stash_first) {
                 return Err(if e.is::<DirtyWorkTree>() { NeedsDecision::LocalChanges(action).into() } else { e });
             }
@@ -397,6 +410,20 @@ impl RepoTab {
                     Integration::Revert { commit } => {
                         let step = integrate::revert(git, &git_dir, commit)?;
                         step_outcome(step, format!("Reverted {commit}"), "Revert", RepoState::Reverting)
+                    }
+                    Integration::Pull { remote, branch, rebase } => {
+                        let net = ctx.network(git.clone())?;
+                        let before = git.output(["rev-parse", "-q", "--verify", "HEAD"]).unwrap_or_default();
+                        let step = remote::pull(&net, &git_dir, remote, branch, *rebase, &mut |l| ctx.progress(l))
+                            .map_err(|e| with_auth_hint(git, e))?;
+                        let after = git.output(["rev-parse", "-q", "--verify", "HEAD"]).unwrap_or_default();
+                        let done = if step == Step::Done && before == after {
+                            format!("{current} is already up to date with {remote}/{branch}")
+                        } else {
+                            format!("Pulled {remote}/{branch} into {current}")
+                        };
+                        let state = if *rebase { RepoState::Rebasing } else { RepoState::Merging };
+                        step_outcome(step, done, "Pull", state)
                     }
                 })
             };

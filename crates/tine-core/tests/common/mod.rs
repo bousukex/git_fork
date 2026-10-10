@@ -33,6 +33,22 @@ impl TestRepo {
         repo
     }
 
+    /// An empty bare repository (a remote to push to).
+    pub fn new_bare() -> Self {
+        let repo = TestRepo { dir: tempfile::tempdir().unwrap(), clock: Cell::new(1_700_000_000) };
+        repo.git(["init", "-q", "--bare", "-b", "main"]);
+        repo
+    }
+
+    /// A clone of the repository at `path`, through a `file://` URL (git's
+    /// transport rather than its local-path shortcuts).
+    pub fn clone_from(path: &Path) -> Self {
+        let repo = TestRepo { dir: tempfile::tempdir().unwrap(), clock: Cell::new(1_700_000_000) };
+        let url = format!("file://{}", path.display());
+        repo.git(["clone", "-q", &url, "."]);
+        repo
+    }
+
     /// A second repository cloned from this one (for remote-tracking refs).
     pub fn clone_repo(&self) -> TestRepo {
         let repo = TestRepo { dir: tempfile::tempdir().unwrap(), clock: Cell::new(self.clock.get()) };

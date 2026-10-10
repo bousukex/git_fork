@@ -28,7 +28,17 @@ pub enum Step {
 /// an empty step only if git says so; any other error (a hook, signing, a
 /// lock) is returned as is.
 pub(crate) fn run_step(git: &GitRunner, git_dir: &Path, args: &[&str], expect: RepoState) -> Result<Step> {
-    match git.output(args) {
+    run_step_with(git, git_dir, expect, || git.output(args))
+}
+
+/// [`run_step`] for a command run by `command` (e.g. with progress).
+pub(crate) fn run_step_with(
+    git: &GitRunner,
+    git_dir: &Path,
+    expect: RepoState,
+    command: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<Step> {
+    match command() {
         Ok(_) => Ok(if status::has_conflicts(git)? { Step::Conflicts } else { Step::Done }),
         Err(e) => {
             if e.downcast_ref::<crate::Cancelled>().is_some() {

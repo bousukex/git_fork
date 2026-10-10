@@ -1,4 +1,5 @@
 pub mod app;
+pub mod askpass;
 pub mod diff_model;
 pub mod fonts;
 pub mod ops_registry;

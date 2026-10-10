@@ -494,3 +494,42 @@ fn stash_and_switch_to_a_commit_moves_blocking_untracked_files_away() {
     let out = std::process::Command::new("git").current_dir(d).args(["show", "stash@{0}^3:n.txt"]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mine\n");
 }
+
+#[test]
+fn cancelled_checkout_still_shows_where_head_went() {
+    let repo = diverged_repo();
+    let d = repo.path();
+    set_hook(d, "post-checkout", "#!/bin/sh\nsleep 30\n");
+    let mut tab = open(d);
+    tab.checkout_branch("topic");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let running = tine::ops_registry::snapshots_for(tab.repo_key()).into_iter().find(|s| s.state.is_active()).unwrap();
+    let start = std::time::Instant::now();
+    tine::ops_registry::cancel(running.id);
+    assert!(poll_until(&mut tab, |t| idle(t) && !t.errors.is_empty()));
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+    assert!(tab.errors.last().unwrap().contains("cancelled"), "{:?}", tab.errors);
+    // The switch itself happened before the hook: the tab must show it.
+    assert_eq!(head_name(d), "topic");
+    assert!(matches!(&tab.refs.head, Some(tine_core::model::Head::Branch { name, .. }) if name == "topic"), "{:?}", tab.refs.head);
+    assert!(tine_core::maintenance::leftover_locks(&tab.paths).is_empty());
+}
+
+#[test]
+fn stash_conflict_after_a_successful_merge_keeps_the_stash() {
+    let repo = diverged_repo();
+    let d = repo.path();
+    let mut t = 1_900_000_000;
+    git(d, &["checkout", "-q", "-b", "side"], &mut t);
+    std::fs::write(d.join("g.txt"), "side\n").unwrap();
+    git(d, &["commit", "-qam", "side edits g"], &mut t);
+    git(d, &["checkout", "-q", "main"], &mut t);
+    std::fs::write(d.join("g.txt"), "local edit\n").unwrap();
+    let mut tab = open(d);
+    tab.integrate(tine::repo::dialog::Integration::Merge { target: "refs/heads/side".into(), mode: Default::default() }, true);
+    assert!(poll_until(&mut tab, |t| idle(t) && t.stash_conflict.is_some()));
+    assert_eq!(tab.refs.stashes.len(), 1, "the stash is kept");
+    assert_eq!(tab.stash_conflict.as_ref().unwrap().oid, tab.refs.stashes[0].id);
+    assert_eq!(tab.status.state, RepoState::Clean);
+    assert_eq!(tab.status.conflicted.len(), 1);
+}

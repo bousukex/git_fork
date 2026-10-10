@@ -25,6 +25,14 @@ pub enum RefAction {
     StashApply(Oid),
     StashPop(Oid),
     StashDrop(Oid, String),
+    /// Fetch one remote (`None`: all).
+    Fetch(Option<String>),
+    /// Pull into the current branch, from a remote branch if given.
+    Pull(Option<String>),
+    Push(String),
+    PushTag(String, String),
+    /// Delete (remote, full ref) on the remote.
+    DeleteRemote(String, String),
 }
 
 pub fn apply(tab: &mut RepoTab, a: RefAction) {
@@ -45,6 +53,11 @@ pub fn apply(tab: &mut RepoTab, a: RefAction) {
         RefAction::StashApply(o) => tab.stash_apply(o, false),
         RefAction::StashPop(o) => tab.stash_apply(o, true),
         RefAction::StashDrop(o, l) => tab.request_drop_stash(o, &l),
+        RefAction::Fetch(r) => tab.open_fetch_dialog(r),
+        RefAction::Pull(from) => tab.open_pull_dialog(from),
+        RefAction::Push(b) => tab.open_push_dialog(Some(b)),
+        RefAction::PushTag(t, r) => tab.push_tag(&t, &r),
+        RefAction::DeleteRemote(r, f) => tab.request_delete_remote_ref(&r, &f),
     }
 }
 
@@ -170,6 +183,31 @@ pub fn branch_menu(ui: &mut egui::Ui, tab: &RepoTab, r: &GitRef, out: &mut Optio
     }
     if r.kind == RefKind::LocalBranch {
         ui.separator();
+        if r.is_head && item(ui, "Pull…", tab.remote_block(Needs::CleanState, true)) {
+            *out = Some(RefAction::Pull(None));
+        }
+        if item(ui, format!("Push '{name}'…"), tab.remote_block(Needs::Idle, false)) {
+            *out = Some(RefAction::Push(name.clone()));
+        }
+    }
+    if r.kind == RefKind::RemoteBranch
+        && let Some((remote, branch)) = crate::repo::remote::split_remote_branch(&tab.refs.remotes, name)
+    {
+        ui.separator();
+        if let Some(cur) = current_branch(tab)
+            && item(ui, format!("Pull '{name}' into '{cur}'…"), tab.remote_block(Needs::CleanState, true))
+        {
+            *out = Some(RefAction::Pull(Some(name.clone())));
+        }
+        if item(ui, format!("Fetch '{remote}'"), tab.remote_block(Needs::Idle, false)) {
+            *out = Some(RefAction::Fetch(Some(remote.clone())));
+        }
+        if item(ui, format!("Delete '{branch}' on '{remote}'…"), tab.remote_block(Needs::Idle, false)) {
+            *out = Some(RefAction::DeleteRemote(remote, format!("refs/heads/{branch}")));
+        }
+    }
+    if r.kind == RefKind::LocalBranch {
+        ui.separator();
         if item(ui, "Rename…", clean) {
             *out = Some(RefAction::Rename(name.clone()));
         }
@@ -196,9 +234,34 @@ pub fn tag_menu(ui: &mut egui::Ui, tab: &RepoTab, r: &GitRef, out: &mut Option<R
     if item(ui, format!("Create Branch from '{name}'…"), idle) {
         *out = Some(RefAction::CreateBranch(r.full_name.clone(), name.clone()));
     }
+    if !tab.refs.remotes.is_empty() {
+        ui.separator();
+        let block = tab.remote_block(Needs::Idle, false);
+        for remote in &tab.refs.remotes {
+            if item(ui, format!("Push to '{remote}'"), block) {
+                *out = Some(RefAction::PushTag(name.clone(), remote.clone()));
+            }
+        }
+        for remote in &tab.refs.remotes {
+            if item(ui, format!("Delete on '{remote}'…"), block) {
+                *out = Some(RefAction::DeleteRemote(remote.clone(), r.full_name.clone()));
+            }
+        }
+    }
     ui.separator();
     if item(ui, "Delete…", idle) {
         *out = Some(RefAction::DeleteTag(name.clone()));
+    }
+}
+
+/// Menu of a remote's header in the sidebar.
+pub fn remote_menu(ui: &mut egui::Ui, tab: &RepoTab, remote: &str, out: &mut Option<RefAction>) {
+    if item(ui, format!("Fetch '{remote}'…"), tab.remote_block(Needs::Idle, false)) {
+        *out = Some(RefAction::Fetch(Some(remote.to_owned())));
+    }
+    if ui.button("Copy Remote Name").clicked() {
+        ui.ctx().copy_text(remote.to_owned());
+        ui.close();
     }
 }
 

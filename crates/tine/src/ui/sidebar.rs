@@ -164,19 +164,29 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
         }
         section(ui, "Branches", n, |ui| show_tree(ui, tab, &local, 0, "local", selected, &mut actions));
 
-        let mut remotes: BTreeMap<&str, Tree<'_>> = BTreeMap::new();
+        // Every configured remote, also those without fetched branches yet.
+        let mut remotes: BTreeMap<&str, Tree<'_>> =
+            tab.refs.remotes.iter().map(|r| (r.as_str(), Tree::default())).collect();
         let mut n = 0;
         for r in of_kind(RefKind::RemoteBranch) {
-            let (remote, name) = r.short_name.split_once('/').unwrap_or((&r.short_name, ""));
+            let (remote, name) = crate::repo::remote::split_remote_branch(&tab.refs.remotes, &r.short_name)
+                .map(|(remote, _)| {
+                    let remote = tab.refs.remotes.iter().find(|x| **x == remote).expect("from the list").as_str();
+                    (remote, &r.short_name[remote.len() + 1..])
+                })
+                .unwrap_or_else(|| r.short_name.split_once('/').unwrap_or((&r.short_name, "")));
             remotes.entry(remote).or_default().insert(name, r);
             n += 1;
         }
         section(ui, "Remotes", n, |ui| {
             for (remote, tree) in &remotes {
-                egui::CollapsingHeader::new(RichText::new(*remote).size(13.0))
+                let resp = egui::CollapsingHeader::new(RichText::new(*remote).size(13.0))
                     .id_salt(("remote", *remote))
                     .default_open(true)
                     .show(ui, |ui| show_tree(ui, tab, tree, 0, remote, selected, &mut actions));
+                let mut chosen = None;
+                resp.header_response.context_menu(|ui| super::menus::remote_menu(ui, tab, remote, &mut chosen));
+                actions.extend(chosen.map(Action::Ref));
             }
         });
 

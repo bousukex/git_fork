@@ -416,6 +416,101 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
                 }
                 cancel = no;
             }
+            Dialog::Fetch { remote, prune } => {
+                ui.heading("Fetch");
+                let label = |r: &Option<String>| r.clone().unwrap_or_else(|| "All remotes".into());
+                egui::ComboBox::from_label("Remote").selected_text(label(remote)).show_ui(ui, |ui| {
+                    ui.selectable_value(remote, None, "All remotes");
+                    for r in &tab.refs.remotes {
+                        ui.selectable_value(remote, Some(r.clone()), r);
+                    }
+                });
+                ui.checkbox(prune, "Remove remote branches that no longer exist (prune)");
+                let (ok, no) = buttons(ui, "Fetch", false, true);
+                if ok {
+                    let (r, pr) = (remote.clone(), *prune);
+                    act = Some(Box::new(move |t| t.fetch(r, pr)));
+                }
+                cancel = no;
+            }
+            Dialog::Pull { remote_branch, rebase, stash_first } => {
+                ui.heading(format!("Pull into {current}"));
+                let shown = if remote_branch.is_empty() { "Choose a remote branch".to_owned() } else { remote_branch.clone() };
+                egui::ComboBox::from_label("From").selected_text(shown).width(300.0).show_ui(ui, |ui| {
+                    for r in tab.refs.refs.iter().filter(|r| r.kind == RefKind::RemoteBranch) {
+                        ui.selectable_value(remote_branch, r.short_name.clone(), &r.short_name);
+                    }
+                });
+                ui.checkbox(rebase, "Rebase my commits instead of merging (--rebase)");
+                let ok_enabled = stash_choice(ui, dirty, stash_first) && !remote_branch.is_empty();
+                let (ok, no) = buttons(ui, "Pull", false, ok_enabled);
+                if ok {
+                    let (rb, re, s) = (remote_branch.clone(), *rebase, *stash_first && dirty);
+                    act = Some(Box::new(move |t| t.pull(&rb, re, s)));
+                }
+                cancel = no;
+            }
+            Dialog::Push { branch, remote, remote_branch, set_upstream, tags, force, lease } => {
+                ui.heading(format!("Push {branch}"));
+                egui::Grid::new("push-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("To remote");
+                    egui::ComboBox::from_id_salt("push-remote").selected_text(remote.as_str()).show_ui(ui, |ui| {
+                        for r in &tab.refs.remotes {
+                            ui.selectable_value(remote, r.clone(), r);
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("As branch");
+                    ui.add(egui::TextEdit::singleline(remote_branch).desired_width(260.0));
+                    ui.end_row();
+                });
+                let target = remote_branch.trim().to_owned();
+                // What a force push may overwrite is fixed when the target is
+                // first shown, not re-read when a fetch moves it meanwhile.
+                if lease.0 != *remote || lease.1 != target {
+                    *lease = (remote.clone(), target.clone(), tab.tracking_target(remote, &target));
+                }
+                let issue = ref_name_problem(remote_branch);
+                if let Some(why) = issue {
+                    problem(ui, why);
+                }
+                ui.checkbox(set_upstream, format!("Track {remote}/{target} as the upstream of {branch}"));
+                ui.checkbox(tags, "Also push all tags");
+                ui.checkbox(force, RichText::new("Force push (overwrite the remote branch)").color(p.status_deleted));
+                if *force {
+                    let text = match lease.2 {
+                        Some(o) => format!(
+                            "Replaces {remote}/{target} only if it is still at {} (as last fetched); commits others pushed since are not overwritten.",
+                            o.short()
+                        ),
+                        None => format!("Only if {remote} has no branch '{target}' yet (none was fetched)."),
+                    };
+                    hint(ui, &text);
+                }
+                let (ok, no) = buttons(ui, if *force { "Force Push" } else { "Push" }, *force, issue.is_none());
+                if ok {
+                    let (b, r, rb, u, tg) = (branch.clone(), remote.clone(), remote_branch.clone(), *set_upstream, *tags);
+                    let lease = force.then_some(lease.2);
+                    act = Some(Box::new(move |t| t.push(&b, &r, &rb, u, tg, lease)));
+                }
+                cancel = no;
+            }
+            Dialog::DeleteRemoteRef { remote, full_ref } => {
+                let (what, name) = match full_ref.strip_prefix("refs/tags/") {
+                    Some(t) => ("tag", t),
+                    None => ("branch", full_ref.strip_prefix("refs/heads/").unwrap_or(full_ref)),
+                };
+                ui.heading(format!("Delete {what} '{name}' on {remote}?"));
+                ui.label(format!(
+                    "The {what} is removed from {remote} for everyone. Local branches and tags are not changed."
+                ));
+                let (ok, no) = buttons(ui, "Delete on Remote", true, true);
+                if ok {
+                    let (r, f) = (remote.clone(), full_ref.clone());
+                    act = Some(Box::new(move |t| t.delete_remote_ref(&r, &f)));
+                }
+                cancel = no;
+            }
             Dialog::UndoStashApply { oid } => {
                 ui.heading("Undo applying the stash?");
                 ui.label(format!(

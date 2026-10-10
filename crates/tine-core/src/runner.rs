@@ -289,7 +289,10 @@ impl GitRunner {
         }
         let out = out?;
         let code = out.status.code();
-        let was_stopped = stopped.load(Ordering::Relaxed);
+        // A failure right as the token fired (e.g. a credential prompt the
+        // user cancelled made git give up) is a cancellation too.
+        let was_stopped = stopped.load(Ordering::Relaxed)
+            || (!out.status.success() && self.cancel.as_ref().is_some_and(CancelToken::is_cancelled));
         self.record(args, &out.stdout, &out.stderr, code, started, was_stopped);
         if was_stopped {
             return Err(Cancelled.into());
@@ -459,7 +462,7 @@ impl GitRunner {
         }
         let status = child.wait()?;
         done.store(true, Ordering::Relaxed);
-        let was_stopped = stopped.load(Ordering::Relaxed);
+        let was_stopped = stopped.load(Ordering::Relaxed) || (!status.success() && (cancel.is_cancelled() || self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)));
         // Ends the helper thread above.
         both.cancel();
         let stdout = stdout_thread.join().unwrap_or_default();

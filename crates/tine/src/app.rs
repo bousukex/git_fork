@@ -252,8 +252,29 @@ impl TineApp {
                 self.pick_folder();
             }
             ui.separator();
-            for label in ["Fetch", "Pull", "Push"] {
-                ui.add_enabled(false, egui::Button::new(label)).on_disabled_hover_text("Coming in M3b");
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                let remote_buttons = [
+                    ("Fetch", "Fetch from remotes", t.remote_block(crate::repo::Needs::Idle, false)),
+                    ("Pull", "Pull into the current branch", t.remote_block(crate::repo::Needs::CleanState, true)),
+                    ("Push", "Push the current branch", t.remote_block(crate::repo::Needs::Idle, true)),
+                ];
+                for (label, tip, block) in remote_buttons {
+                    let resp = ui
+                        .add_enabled(block.is_none(), egui::Button::new(label))
+                        .on_hover_text(tip)
+                        .on_disabled_hover_text(block.unwrap_or_default());
+                    if resp.clicked() {
+                        match label {
+                            "Fetch" => t.open_fetch_dialog(None),
+                            "Pull" => t.open_pull_dialog(None),
+                            _ => t.open_push_dialog(None),
+                        }
+                    }
+                }
+            } else {
+                for label in ["Fetch", "Pull", "Push"] {
+                    ui.add_enabled(false, egui::Button::new(label));
+                }
             }
             if let Some(t) = self.tabs.get_mut(self.active) {
                 let block = t.block_reason(crate::repo::Needs::CleanState);
@@ -502,6 +523,7 @@ impl eframe::App for TineApp {
 
         let Some(tab) = self.tabs.get_mut(self.active) else {
             egui::CentralPanel::default().show(ui, |ui| self.welcome(ui));
+            let _ = ui::askpass::show(&ctx);
             return;
         };
 
@@ -538,7 +560,12 @@ impl eframe::App for TineApp {
                 View::LocalChanges => ui::changes::show(ui, tab, &self.state.messages),
             }
         });
-        ui::dialogs::show(&ctx, tab);
+        // Credential prompts belong to operations, not tabs, and come first:
+        // a tab's dialog waits until no prompt is open (egui stacks modals
+        // by when they first appeared, so it could otherwise cover one).
+        if !ui::askpass::show(&ctx) {
+            ui::dialogs::show(&ctx, tab);
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

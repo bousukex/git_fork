@@ -2,6 +2,7 @@
 
 mod actions;
 pub mod dialog;
+pub mod remote;
 
 pub use actions::{Needs, StashConflict};
 

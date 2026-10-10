@@ -630,3 +630,24 @@ fn cancelled_commit_stops_the_hook_and_leaves_no_lock() {
     assert!(tine_core::maintenance::leftover_locks(repo.reader().paths()).is_empty());
     assert_eq!(head(&repo), before);
 }
+
+#[test]
+fn autostash_reapply_conflict_keeps_the_stash() {
+    let repo = TestRepo::new();
+    repo.commit_file("g.txt", "g\n", "g");
+    repo.git(["checkout", "-q", "-b", "side"]);
+    repo.commit_file("g.txt", "side\n", "side edits g");
+    repo.git(["checkout", "-q", "main"]);
+    let git = repo.runner();
+    let gd = git_dir(&repo);
+    repo.write("g.txt", "local edit\n");
+    // The merge itself works (fast-forward); bringing the edit back conflicts.
+    let (r, report) =
+        autostash::run(&git, &gd, "merge", false, || integrate::merge(&git, &gd, "side", MergeMode::Default));
+    assert_eq!(r.unwrap(), Step::Done);
+    let AutoStash::Conflicted { oid, .. } = &report else { panic!("{report:?}") };
+    assert_eq!(stash::index_of(&git, *oid).unwrap(), Some(0), "the stash is kept");
+    assert!(read(&repo, "g.txt").contains("<<<<<<<"), "{}", read(&repo, "g.txt"));
+    assert_eq!(repo.reader().status().unwrap().conflicted.len(), 1);
+    assert_eq!(head(&repo), repo.git(["rev-parse", "side"]), "the merge stays done");
+}

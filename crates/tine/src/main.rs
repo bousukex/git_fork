@@ -3,6 +3,10 @@ use std::path::PathBuf;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // Started by git or ssh to ask for credentials: answer through the app.
+    if let Some(code) = tine::askpass::run_client() {
+        std::process::exit(code);
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,tine=info,tine_core=info"))
         .init();
 

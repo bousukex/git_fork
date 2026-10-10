@@ -148,6 +148,10 @@ pub enum OpKind {
     UnstageResolved,
     /// State handed over from a closed tab (not a git operation).
     Recovered,
+    Fetch(String),
+    Pull(String),
+    Push(String),
+    DeleteRemoteRef(String),
 }
 
 impl OpKind {
@@ -186,6 +190,10 @@ impl OpKind {
             OpKind::UndoStashApply => "Undo stash apply",
             OpKind::UnstageResolved => "Unstage resolved files",
             OpKind::Recovered => "Recovered state",
+            OpKind::Fetch(_) => "Fetch",
+            OpKind::Pull(_) => "Pull",
+            OpKind::Push(_) => "Push",
+            OpKind::DeleteRemoteRef(_) => "Delete on remote",
         }
     }
 }

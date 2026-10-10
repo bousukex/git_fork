@@ -84,6 +84,8 @@ pub struct OpContext {
     pub cancel: CancelToken,
     recorder: Recorder,
     ctx: egui::Context,
+    kind: OpKind,
+    workdir: PathBuf,
 }
 
 impl OpContext {
@@ -93,26 +95,43 @@ impl OpContext {
         base.clone().with_recorder(self.recorder.clone()).with_cancel(self.cancel.clone())
     }
 
-    /// Reports a progress line (shown in the toolbar and Output panel).
-    pub fn progress(&self, line: &str) {
-        with(|r| {
-            if let Some(e) = r.entry_mut(self.id) {
-                e.progress = Some(line.to_owned());
-            }
-        });
-        self.ctx.request_repaint();
+    /// `git` for talking to remotes: credential prompts go to the app's
+    /// dialog (see [`crate::askpass`]).
+    pub fn network(&self, git: GitRunner) -> anyhow::Result<GitRunner> {
+        let env = crate::askpass::env_for(self.id, self.kind.label(), &self.workdir, Some(self.ctx.clone()))?;
+        Ok(env.into_iter().fold(git, |g, (k, v)| g.with_env(k, v)))
     }
 
-    pub fn set_awaiting_auth(&self, waiting: bool) {
-        with(|r| {
-            if let Some(e) = r.entry_mut(self.id)
-                && matches!(e.state, OpState::Running | OpState::AwaitingAuth)
-            {
-                e.state = if waiting { OpState::AwaitingAuth } else { OpState::Running };
-            }
-        });
+    /// Reports a progress line (shown in the toolbar and Output panel).
+    pub fn progress(&self, line: &str) {
+        set_progress(self.id, line);
         self.ctx.request_repaint();
     }
+}
+
+/// Sets the latest progress line of operation `id`.
+pub fn set_progress(id: OpId, line: &str) {
+    with(|r| {
+        if let Some(e) = r.entry_mut(id) {
+            e.progress = Some(line.to_owned());
+        }
+    });
+}
+
+/// Marks operation `id` as waiting for credentials (or running again).
+pub fn set_awaiting_auth(id: OpId, waiting: bool) {
+    with(|r| {
+        if let Some(e) = r.entry_mut(id)
+            && matches!(e.state, OpState::Running | OpState::AwaitingAuth)
+        {
+            e.state = if waiting { OpState::AwaitingAuth } else { OpState::Running };
+        }
+    });
+}
+
+/// Current state of operation `id`.
+pub fn state(id: OpId) -> Option<OpState> {
+    with(|r| r.entries.iter().find(|e| e.id == id).map(|e| e.state.clone()))
 }
 
 pub type OpFn = Box<dyn FnOnce(&OpContext) -> anyhow::Result<OpOutcome> + Send>;
@@ -219,9 +238,17 @@ fn run_queue(repo: PathBuf, rx: crossbeam_channel::Receiver<Job>) {
             // Cancelled while still queued: never started.
             Err(Cancelled.into())
         } else {
-            let ctx = OpContext { id: job.id, cancel, recorder, ctx: job.ctx.clone() };
+            let ctx = OpContext {
+                id: job.id,
+                cancel,
+                recorder,
+                ctx: job.ctx.clone(),
+                kind: job.kind.clone(),
+                workdir: job.paths.workdir.clone(),
+            };
             (job.run)(&ctx)
         };
+        crate::askpass::forget(job.id);
         let outcome = outcome_of(&result);
         let notes = if outcome == Outcome::Cancelled {
             let locks = tine_core::maintenance::leftover_locks(&job.paths);

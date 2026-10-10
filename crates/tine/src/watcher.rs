@@ -128,36 +128,41 @@ fn run(
 
     let mut change = FsChange::default();
     let mut worktree: BTreeSet<BString> = BTreeSet::new();
+    // First and latest relevant event of the batch. Other events (git
+    // merely reading files, objects being written) never delay a flush.
     let mut first_event: Option<Instant> = None;
+    let mut last_event: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
-        match erx.recv_timeout(if first_event.is_some() { QUIET } else { Duration::from_millis(500) }) {
+        let timeout = match (first_event, last_event) {
+            (Some(first), Some(last)) => (last + QUIET).min(first + MAX_DELAY).saturating_duration_since(Instant::now()),
+            _ => Duration::from_millis(500),
+        };
+        match erx.recv_timeout(timeout) {
             Ok(Ok(event)) => {
                 let event: notify::Event = event;
-                if matches!(event.kind, EventKind::Access(_)) {
-                    continue;
-                }
-                for path in &event.paths {
-                    match classify(path, workdir, git_dir) {
-                        Some(Kind::Refs) => change.refs = true,
-                        Some(Kind::Status) => change.status = true,
-                        Some(Kind::Worktree(p)) => {
-                            worktree.insert(p);
+                if !matches!(event.kind, EventKind::Access(_)) {
+                    for path in &event.paths {
+                        match classify(path, workdir, git_dir) {
+                            Some(Kind::Refs) => change.refs = true,
+                            Some(Kind::Status) => change.status = true,
+                            Some(Kind::Worktree(p)) => {
+                                worktree.insert(p);
+                            }
+                            None => continue,
                         }
-                        None => continue,
+                        let now = Instant::now();
+                        first_event.get_or_insert(now);
+                        last_event = Some(now);
                     }
-                    first_event.get_or_insert_with(Instant::now);
-                }
-                if !first_event.is_some_and(|t| t.elapsed() >= MAX_DELAY) {
-                    continue;
                 }
             }
-            Ok(Err(e)) => {
-                log::warn!("watch error: {e}");
-                continue;
-            }
-            Err(RecvTimeoutError::Timeout) if first_event.is_none() => continue,
+            Ok(Err(e)) => log::warn!("watch error: {e}"),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+        let due = first_event.is_some_and(|t| t.elapsed() >= MAX_DELAY) || last_event.is_some_and(|t| t.elapsed() >= QUIET);
+        if !due {
+            continue;
         }
 
         // Flush the batch.
@@ -174,6 +179,7 @@ fn run(
         }
         worktree.clear();
         first_event = None;
+        last_event = None;
         if change.any() {
             log::debug!("fs change: {change:?}");
             if tx.send(Msg::Fs(change)).is_err() {
