@@ -3,13 +3,18 @@
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, bounded};
-use egui::{Key, KeyboardShortcut, Modifiers, RichText};
+use egui::{Key, Modifiers, RichText};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    input,
     repo::{RepoTab, View},
+    shortcuts::{self, Command},
     theme::Palette,
-    ui,
+    ui::{
+        self,
+        quick_launch::{self, QuickLaunch},
+    },
 };
 
 const STORAGE_KEY: &str = "tine-state";
@@ -41,6 +46,15 @@ pub struct TineApp {
     /// Results from closed tabs whose work tree is not open (yet); handed
     /// to a tab when that work tree is opened again.
     held_orphans: Vec<crate::ops_registry::OrphanedResult>,
+    quick: Option<QuickLaunch>,
+    /// Repositories being opened in the background, in request order.
+    opening: Vec<Opening>,
+}
+
+/// A repository being discovered off the UI thread.
+struct Opening {
+    path: PathBuf,
+    rx: Receiver<anyhow::Result<tine_core::CliReader>>,
 }
 
 /// F12 overlay with frame timing and memory, for checking performance.
@@ -107,11 +121,15 @@ impl TineApp {
             ctx: cc.egui_ctx.clone(),
             notices: Vec::new(),
             held_orphans: Vec::new(),
+            quick: None,
+            opening: Vec::new(),
         };
         let restoring = paths.is_empty();
         let to_open = if restoring { app.state.open.clone() } else { paths };
+        // At startup (before the window shows) opening synchronously keeps
+        // the tab order and the restored active tab simple.
         for p in to_open {
-            app.open(&p, &cc.egui_ctx);
+            app.open_now(&p, &cc.egui_ctx);
         }
         // Restore the previous session's active tab; with paths given on the
         // command line, the last one opened stays active.
@@ -150,7 +168,9 @@ impl TineApp {
         }
     }
 
-    fn open(&mut self, path: &Path, ctx: &egui::Context) {
+    /// Opens (or switches to) a repository; git's discovery runs in the
+    /// background so a slow file system can't freeze the window.
+    pub fn open(&mut self, path: &Path, ctx: &egui::Context) {
         if let Some(i) = self.tabs.iter().position(|t| t.paths.workdir == path) {
             self.active = i;
             return;
@@ -159,7 +179,46 @@ impl TineApp {
             self.open_error = Some(format!("Folder not found: {}", path.display()));
             return;
         }
-        match RepoTab::open(path, ctx) {
+        if self.opening.iter().any(|o| o.path == path) {
+            return;
+        }
+        let (tx, rx) = bounded(1);
+        let (p, c) = (path.to_path_buf(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(tine_core::CliReader::open(&p));
+            c.request_repaint();
+        });
+        self.opening.push(Opening { path: path.to_path_buf(), rx });
+    }
+
+    /// Adds repositories whose discovery finished, in the order requested.
+    fn poll_opening(&mut self, ctx: &egui::Context) {
+        while let Some(first) = self.opening.first() {
+            let result = match first.rx.try_recv() {
+                Ok(r) => r,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(anyhow::anyhow!("opening failed")),
+            };
+            let o = self.opening.remove(0);
+            self.add_tab(&o.path, result.map(|reader| RepoTab::from_reader(reader, ctx)), ctx);
+        }
+    }
+
+    /// Opens a repository right away (startup).
+    fn open_now(&mut self, path: &Path, ctx: &egui::Context) {
+        if let Some(i) = self.tabs.iter().position(|t| t.paths.workdir == path) {
+            self.active = i;
+            return;
+        }
+        if !path.is_dir() {
+            self.open_error = Some(format!("Folder not found: {}", path.display()));
+            return;
+        }
+        self.add_tab(path, RepoTab::open(path, ctx), ctx);
+    }
+
+    fn add_tab(&mut self, path: &Path, tab: anyhow::Result<RepoTab>, _ctx: &egui::Context) {
+        match tab {
             Ok(tab) => {
                 let workdir = tab.paths.workdir.clone();
                 if let Some(i) = self.tabs.iter().position(|t| t.paths.workdir == workdir) {
@@ -224,24 +283,135 @@ impl TineApp {
         self.tabs.get_mut(self.active)
     }
 
+    /// Decides who owns the keyboard this frame (see [`input::Layer`]). A
+    /// tab dialog that appears while Quick Launch is open closes it.
+    fn decide_layer(&mut self, ctx: &egui::Context) {
+        let layer = if crate::askpass::pending().is_some() {
+            input::Layer::Prompt
+        } else if self.tabs.get(self.active).is_some_and(RepoTab::modal_open) {
+            input::Layer::Dialog
+        } else if self.quick.is_some() {
+            input::Layer::QuickLaunch
+        } else {
+            input::Layer::Views
+        };
+        if layer == input::Layer::Dialog {
+            self.quick = None;
+        }
+        input::set_layer(ctx, layer);
+    }
+
+    /// Global keys, unless a modal layer has them.
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let open = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
-        let refresh = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
-        let refresh2 = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
-        let close = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
-        if ctx.input_mut(|i| i.consume_shortcut(&open)) {
-            self.pick_folder();
+        if input::layer(ctx) != input::Layer::Views {
+            return;
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&refresh) || i.consume_shortcut(&refresh2))
+        if let Some(cmd) = shortcuts::take(ctx, !self.tabs.is_empty()) {
+            self.run_command(cmd);
+        }
+        // Esc closes the topmost overlay (the search bar).
+        if !ctx.text_edit_focused()
             && let Some(t) = self.tabs.get_mut(self.active)
+            && t.search.open
+            && input::take_key(ctx, Modifiers::NONE, Key::Escape)
         {
-            t.refresh();
+            t.close_search();
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&close)) && !self.tabs.is_empty() {
-            self.close_tab(self.active);
+    }
+
+    /// Runs a command from a shortcut or Quick Launch.
+    pub fn run_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::QuickLaunch => self.open_quick_launch(),
+            Command::OpenRepository => self.pick_folder(),
+            Command::DebugOverlay => self.debug.open = !self.debug.open,
+            Command::NextTab | Command::PreviousTab if !self.tabs.is_empty() => {
+                let n = self.tabs.len();
+                self.active = if cmd == Command::NextTab { (self.active + 1) % n } else { (self.active + n - 1) % n };
+            }
+            Command::CloseTab if !self.tabs.is_empty() => self.close_tab(self.active),
+            _ => {
+                let Some(t) = self.tabs.get_mut(self.active) else { return };
+                match cmd {
+                    Command::SearchCommits => t.open_search(),
+                    Command::LocalChanges => t.view = View::LocalChanges,
+                    Command::AllCommits => t.view = View::History,
+                    Command::Fetch => t.open_fetch_dialog(None),
+                    Command::Pull => t.open_pull_dialog(None),
+                    Command::Push => t.open_push_dialog(None),
+                    Command::Stash => t.open_stash_dialog(),
+                    Command::NewBranch => t.open_create_branch("HEAD", "HEAD"),
+                    Command::Refresh => t.refresh(),
+                    Command::ToggleOutput => t.output_open = !t.output_open,
+                    _ => {}
+                }
+            }
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
-            self.debug.open = !self.debug.open;
+    }
+
+    pub fn open_quick_launch(&mut self) {
+        let tabs: Vec<(String, PathBuf)> = self.tabs.iter().map(|t| (t.title.clone(), t.paths.workdir.clone())).collect();
+        self.quick = Some(QuickLaunch::new(self.tabs.get(self.active), &tabs, &self.state.recent));
+    }
+
+    /// Adds a repository to the recent list (as opening one does).
+    pub fn remember_recent(&mut self, path: PathBuf) {
+        self.state.recent.retain(|p| p != &path);
+        self.state.recent.insert(0, path);
+        self.state.recent.truncate(MAX_RECENT);
+    }
+
+    /// The open Quick Launch palette (for tests).
+    pub fn quick_launch(&mut self) -> Option<&mut QuickLaunch> {
+        self.quick.as_mut()
+    }
+
+    fn quick_launch_frame(&mut self, ctx: &egui::Context) {
+        if input::layer(ctx) != input::Layer::QuickLaunch {
+            return;
+        }
+        let Some(ql) = self.quick.as_mut() else { return };
+        // Items describe the repository they were collected from.
+        let origin = ql.origin.clone();
+        let tab = origin.as_ref().and_then(|o| self.tabs.iter().find(|t| &t.paths.workdir == o));
+        match quick_launch::show(ctx, ql, tab) {
+            quick_launch::Outcome::Stay => {}
+            quick_launch::Outcome::Close => self.quick = None,
+            quick_launch::Outcome::Run(action) => {
+                self.quick = None;
+                self.run_action(action, origin, ctx);
+            }
+        }
+    }
+
+    /// Runs a Quick Launch action; repository actions go to `origin` (made
+    /// active first), whichever tab is active now.
+    fn run_action(&mut self, action: quick_launch::Action, origin: Option<PathBuf>, ctx: &egui::Context) {
+        use quick_launch::Action;
+        let tab_of = |tabs: &[RepoTab], path: &Path| tabs.iter().position(|t| t.paths.workdir == path);
+        match action {
+            Action::SwitchTab(path) => {
+                if let Some(i) = tab_of(&self.tabs, &path) {
+                    self.active = i;
+                }
+                return;
+            }
+            Action::Open(path) => return self.open(&path, ctx),
+            Action::Command(c) if !c.needs_repo() => return self.run_command(c),
+            _ => {}
+        }
+        let Some(i) = origin.as_deref().and_then(|o| tab_of(&self.tabs, o)) else {
+            self.notices.push("The repository Quick Launch was opened for is no longer open".into());
+            return;
+        };
+        self.active = i;
+        let t = &mut self.tabs[i];
+        match action {
+            Action::Command(c) => self.run_command(c),
+            Action::Checkout(b) => t.checkout_branch(&b),
+            Action::CheckoutRemote(r) => t.checkout_remote(&r),
+            Action::Reveal(id) => t.reveal_commit(id),
+            Action::SwitchTab(_) | Action::Open(_) => {}
         }
     }
 
@@ -254,14 +424,14 @@ impl TineApp {
             ui.separator();
             if let Some(t) = self.tabs.get_mut(self.active) {
                 let remote_buttons = [
-                    ("Fetch", "Fetch from remotes", t.remote_block(crate::repo::Needs::Idle, false)),
-                    ("Pull", "Pull into the current branch", t.remote_block(crate::repo::Needs::CleanState, true)),
-                    ("Push", "Push the current branch", t.remote_block(crate::repo::Needs::Idle, true)),
+                    ("Fetch", "Fetch from remotes", Command::Fetch, t.remote_block(crate::repo::Needs::Idle, false)),
+                    ("Pull", "Pull into the current branch", Command::Pull, t.remote_block(crate::repo::Needs::CleanState, true)),
+                    ("Push", "Push the current branch", Command::Push, t.remote_block(crate::repo::Needs::Idle, true)),
                 ];
-                for (label, tip, block) in remote_buttons {
+                for (label, tip, cmd, block) in remote_buttons {
                     let resp = ui
                         .add_enabled(block.is_none(), egui::Button::new(label))
-                        .on_hover_text(tip)
+                        .on_hover_text(with_hint(tip, cmd))
                         .on_disabled_hover_text(block.unwrap_or_default());
                     if resp.clicked() {
                         match label {
@@ -280,7 +450,7 @@ impl TineApp {
                 let block = t.block_reason(crate::repo::Needs::CleanState);
                 let resp = ui
                     .add_enabled(block.is_none(), egui::Button::new("Stash"))
-                    .on_hover_text("Stash local changes")
+                    .on_hover_text(with_hint("Stash local changes", Command::Stash))
                     .on_disabled_hover_text(block.unwrap_or_default());
                 if resp.clicked() {
                     t.open_stash_dialog();
@@ -288,7 +458,7 @@ impl TineApp {
                 let block = t.block_reason(crate::repo::Needs::Idle);
                 let resp = ui
                     .add_enabled(block.is_none(), egui::Button::new("Branch"))
-                    .on_hover_text("Create a branch at HEAD")
+                    .on_hover_text(with_hint("Create a branch at HEAD", Command::NewBranch))
                     .on_disabled_hover_text(block.unwrap_or_default());
                 if resp.clicked() {
                     t.open_create_branch("HEAD", "HEAD");
@@ -368,6 +538,13 @@ impl TineApp {
                     }
                 });
             }
+            // Repositories still being opened (in the background).
+            for o in &self.opening {
+                let name = o.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                ui.add_enabled(false, egui::Button::new(format!("Opening {name}…")))
+                    .on_disabled_hover_text(o.path.display().to_string());
+                ui.spinner();
+            }
             if ui.small_button("+").on_hover_text("Open repository").clicked() {
                 self.pick_folder();
             }
@@ -411,6 +588,14 @@ impl TineApp {
     }
 }
 
+/// A tooltip with the command's shortcut, e.g. "Fetch from remotes (Ctrl+Shift+F)".
+fn with_hint(text: &str, cmd: Command) -> String {
+    match shortcuts::hint(cmd) {
+        Some(keys) => format!("{text} ({keys})"),
+        None => text.to_owned(),
+    }
+}
+
 fn error_banner(ui: &mut egui::Ui, tab: &mut RepoTab) {
     if tab.errors.is_empty() {
         return;
@@ -447,6 +632,9 @@ impl eframe::App for TineApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let p = Palette::of(&ctx);
+        input::begin_frame(&ctx);
+        self.poll_opening(&ctx);
+        self.decide_layer(&ctx);
         self.debug.record(frame.info().cpu_usage);
         self.debug.show(&ctx, self.tabs.get(self.active));
         if let Some(rx) = &self.picker
@@ -515,17 +703,19 @@ impl eframe::App for TineApp {
                 self.notices.clear();
             }
         }
-        if !self.tabs.is_empty() {
+        if !self.tabs.is_empty() || !self.opening.is_empty() {
             egui::Panel::top("tabs")
                 .frame(egui::Frame::NONE.fill(p.toolbar_bg).inner_margin(egui::Margin::symmetric(8, 3)))
                 .show(ui, |ui| self.tab_strip(ui));
         }
 
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        if self.tabs.is_empty() {
             egui::CentralPanel::default().show(ui, |ui| self.welcome(ui));
+            self.quick_launch_frame(&ctx);
             let _ = ui::askpass::show(&ctx);
             return;
-        };
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
 
         egui::Panel::left("sidebar")
             .resizable(true)
@@ -565,6 +755,7 @@ impl eframe::App for TineApp {
         // by when they first appeared, so it could otherwise cover one).
         if !ui::askpass::show(&ctx) {
             ui::dialogs::show(&ctx, tab);
+            self.quick_launch_frame(&ctx);
         }
     }
 

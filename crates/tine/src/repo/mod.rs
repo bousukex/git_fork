@@ -3,6 +3,7 @@
 mod actions;
 pub mod dialog;
 pub mod remote;
+pub mod search;
 
 pub use actions::{Needs, StashConflict};
 
@@ -51,6 +52,8 @@ pub struct History {
     /// A reload started and its first batch has not arrived yet; the old
     /// history stays visible until then.
     reload_pending: bool,
+    /// Bumped whenever the list is replaced (rows mean other commits).
+    pub epoch: u64,
     started: Option<Instant>,
     pub elapsed: Option<Duration>,
 }
@@ -65,6 +68,7 @@ impl History {
 
     fn take_reload(&mut self) {
         if std::mem::take(&mut self.reload_pending) {
+            self.epoch += 1;
             self.commits.clear();
             self.index.clear();
             self.graph = Graph::new();
@@ -258,6 +262,8 @@ pub struct RepoTab {
     pub output_focus: Option<OpId>,
     /// Some finished operation may have moved refs.
     ops_moved_refs: bool,
+    /// Commit search (Ctrl+F).
+    pub search: search::Search,
 }
 
 #[derive(Default)]
@@ -279,15 +285,26 @@ impl Gens {
 
 impl RepoTab {
     pub fn open(path: &Path, ctx: &egui::Context) -> anyhow::Result<Self> {
-        let reader = CliReader::open(path)?;
-        let paths = reader.paths().clone();
+        Ok(Self::from_reader(CliReader::open(path)?, ctx))
+    }
+
+    /// A tab for a repository already discovered (possibly off the UI
+    /// thread).
+    pub fn from_reader(reader: CliReader, ctx: &egui::Context) -> Self {
         let git = reader.runner().clone();
+        Self::with_reader(Arc::new(reader), git, ctx)
+    }
+
+    /// A tab reading through any [`RepoReader`] (tests wrap the git one to
+    /// control when results arrive); `git` runs the operations.
+    pub fn with_reader(reader: Arc<dyn RepoReader>, git: GitRunner, ctx: &egui::Context) -> Self {
+        let paths = reader.paths().clone();
         let title = paths
             .workdir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| paths.workdir.display().to_string());
-        let worker = Worker::new(Arc::new(reader), ctx.clone());
+        let worker = Worker::new(reader, ctx.clone());
         let mut tab = RepoTab {
             paths,
             title,
@@ -331,6 +348,7 @@ impl RepoTab {
             rebase_progress: None,
             output_focus: None,
             ops_moved_refs: false,
+            search: search::Search::default(),
             changes_multi: Default::default(),
             changes_next: None,
             pending_discard: None,
@@ -352,18 +370,18 @@ impl RepoTab {
         ));
         tab.ensure_commit_graph();
         tab.refresh();
-        Ok(tab)
+        tab
     }
 
     /// Builds git's commit-graph cache when missing; until it exists the
     /// first page of history waits for a full walk of the repository.
     fn ensure_commit_graph(&mut self) {
-        if maintenance::has_commit_graph(&self.git) {
-            return;
-        }
+        // Checked off the UI thread too: opening a tab runs no git here.
         let git = self.git.clone();
-        self.activity.push("Writing commit-graph cache (git commit-graph write --reachable)…".into());
         self.worker.job("commit-graph", move || {
+            if maintenance::has_commit_graph(&git) {
+                return Ok(String::new());
+            }
             let t = Instant::now();
             maintenance::write_commit_graph(&git)?;
             Ok(format!("commit-graph cache written in {:.1?}", t.elapsed()))
@@ -409,7 +427,13 @@ impl RepoTab {
         self.refs_synced.min(self.status_synced) >= ops_registry::generation(self.repo_key())
     }
 
+    fn worker_ctx(&self) -> &egui::Context {
+        self.worker.ctx()
+    }
+
     fn reload_history(&mut self) {
+        // Other commits may be reachable now.
+        self.rerun_search();
         self.gens.log = self.gens.bump();
         self.history.begin_reload();
         self.worker.log(self.gens.log, LogOptions::default());
@@ -422,6 +446,7 @@ impl RepoTab {
         for msg in msgs {
             self.handle(msg);
         }
+        self.poll_search();
         // An operation finished elsewhere (another tab or worktree of this
         // repository): reload once nothing else is queued.
         let generation = ops_registry::generation(self.repo_key());
@@ -430,6 +455,30 @@ impl RepoTab {
             self.refresh_if_changed();
         }
         changed
+    }
+
+    /// The history request whose batches are accepted (for tests that
+    /// deliver history by hand).
+    #[doc(hidden)]
+    pub fn log_seq(&self) -> Gen {
+        self.gens.log
+    }
+
+    #[doc(hidden)]
+    pub fn worker_mut(&mut self) -> &mut Worker {
+        &mut self.worker
+    }
+
+    /// A dialog of this tab is waiting for the user (it owns the keyboard).
+    pub fn modal_open(&self) -> bool {
+        self.dialog.is_some() || self.pending_discard.is_some() || self.pending_line_discard.is_some()
+    }
+
+    /// Applies a message as if a background job had sent it (tests use
+    /// this to deliver results out of order).
+    #[doc(hidden)]
+    pub fn deliver(&mut self, msg: Msg) {
+        self.handle(msg);
     }
 
     fn handle(&mut self, msg: Msg) {
@@ -484,10 +533,15 @@ impl RepoTab {
             }
             Msg::LogBatch(seq, batch) if seq == self.gens.log => {
                 self.history.push_batch(batch);
+                self.sync_search_rows();
                 self.after_history_grew();
             }
+            Msg::SearchBatch(seq, ids) => self.on_search_batch(seq, ids),
+            Msg::SearchDone(seq, r) => self.on_search_done(seq, r),
             Msg::LogDone(seq, r) if seq == self.gens.log => {
                 self.history.finish(r.is_ok());
+                // Finishing may replace the history (e.g. with nothing).
+                self.sync_search_rows();
                 if let Err(e) = r {
                     self.error(format!("Failed to load history: {e:#}"));
                 }
@@ -517,6 +571,7 @@ impl RepoTab {
                 self.changes_diff.stale = false;
             }
             Msg::Job(r) => match r {
+                Ok(line) if line.is_empty() => {}
                 Ok(line) => self.activity.push(line),
                 Err(e) => self.error(format!("{e:#}")),
             },
@@ -573,6 +628,7 @@ impl RepoTab {
 
     /// Selects a commit and scrolls to it (loading it first if needed).
     pub fn reveal_commit(&mut self, id: Oid) {
+        self.show_in_search(id);
         self.select_commit(id);
         match self.history.index.get(&id) {
             Some(&row) => self.scroll_to_row = Some(row),

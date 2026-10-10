@@ -3699,6 +3699,7 @@ name = "tine-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "tine-core",
 ]
 
@@ -3711,6 +3712,7 @@ dependencies = [
  "crossbeam-channel",
  "libc",
  "log",
+ "memchr",
  "tempfile",
 ]
 

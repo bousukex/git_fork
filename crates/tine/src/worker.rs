@@ -111,6 +111,8 @@ pub enum Msg {
     /// A queued write operation finished.
     OpDone(OpId, OpKind, anyhow::Result<OpOutcome>),
     HeadMessage(Gen, anyhow::Result<String>),
+    SearchBatch(Gen, Vec<Oid>),
+    SearchDone(Gen, anyhow::Result<tine_core::search::SearchEnd>),
 }
 
 /// What a queued write operation was, so the UI can react to its result.
@@ -204,6 +206,9 @@ pub struct Worker {
     rx: Receiver<Msg>,
     ctx: egui::Context,
     log_cancel: Option<CancelToken>,
+    search_cancel: Option<CancelToken>,
+    /// Tests: make starting background threads fail.
+    fail_spawns: bool,
     /// Key of the repository's shared write queue.
     repo: PathBuf,
 }
@@ -213,11 +218,15 @@ impl Worker {
         let (tx, rx) = unbounded();
         // Linked worktrees share refs, so they share one write queue.
         let repo = repo_key(&reader.paths().common_dir);
-        Self { reader, tx, rx, ctx, log_cancel: None, repo }
+        Self { reader, tx, rx, ctx, log_cancel: None, search_cancel: None, fail_spawns: false, repo }
     }
 
     pub fn repo_key(&self) -> &Path {
         &self.repo
+    }
+
+    pub fn ctx(&self) -> &egui::Context {
+        &self.ctx
     }
 
     /// Queues a write operation behind any others for this repository; its
@@ -235,7 +244,7 @@ impl Worker {
     }
 
     pub fn head_message(&self, seq: Gen, git: tine_core::GitRunner) {
-        self.spawn("head-message", move |_, tx| {
+        let _ = self.spawn("head-message", move |_, tx| {
             let _ = tx.send(Msg::HeadMessage(seq, tine_core::ops::head_message(&git)));
         });
     }
@@ -254,27 +263,41 @@ impl Worker {
         self.rx.try_iter()
     }
 
-    fn spawn(&self, name: &str, job: impl FnOnce(&dyn RepoReader, &Sender<Msg>) + Send + 'static) {
+    /// Makes later background threads fail to start (tests).
+    #[doc(hidden)]
+    pub fn fail_spawns_for_test(&mut self) {
+        self.fail_spawns = true;
+    }
+
+    /// Runs `job` on its own thread; reports (and returns) a failure to
+    /// start it.
+    fn spawn(&self, name: &str, job: impl FnOnce(&dyn RepoReader, &Sender<Msg>) + Send + 'static) -> Result<(), String> {
         let reader = self.reader.clone();
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
-        let spawned = std::thread::Builder::new().name(format!("tine-{name}")).spawn(move || {
-            job(&*reader, &tx);
-            ctx.request_repaint();
-        });
-        if let Err(e) = spawned {
-            let _ = self.tx.send(Msg::Job(Err(anyhow::anyhow!("failed to start worker thread: {e}"))));
-        }
+        let spawned = if self.fail_spawns {
+            Err(std::io::Error::other("refused by the test"))
+        } else {
+            std::thread::Builder::new().name(format!("tine-{name}")).spawn(move || {
+                job(&*reader, &tx);
+                ctx.request_repaint();
+            })
+        };
+        spawned.map(drop).map_err(|e| {
+            let msg = format!("failed to start worker thread: {e}");
+            let _ = self.tx.send(Msg::Job(Err(anyhow::anyhow!(msg.clone()))));
+            msg
+        })
     }
 
     pub fn refs(&self, seq: Gen) {
-        self.spawn("refs", move |r, tx| {
+        let _ = self.spawn("refs", move |r, tx| {
             let _ = tx.send(Msg::Refs(seq, r.refs()));
         });
     }
 
     pub fn status(&self, seq: Gen) {
-        self.spawn("status", move |r, tx| {
+        let _ = self.spawn("status", move |r, tx| {
             let _ = tx.send(Msg::Status(seq, r.status()));
         });
     }
@@ -287,7 +310,7 @@ impl Worker {
         let cancel = CancelToken::default();
         self.log_cancel = Some(cancel.clone());
         let ctx = self.ctx.clone();
-        self.spawn("log", move |r, tx| {
+        let _ = self.spawn("log", move |r, tx| {
             let result = r.log(&opts, &cancel, &mut |batch| {
                 let ok = tx.send(Msg::LogBatch(seq, batch)).is_ok();
                 ctx.request_repaint();
@@ -297,8 +320,29 @@ impl Worker {
         });
     }
 
+    /// Starts a search, stopping the previous one. `cancel` is also kept by
+    /// the caller (closing the search bar stops it).
+    pub fn search(&mut self, seq: Gen, kind: tine_core::search::SearchKind, query: String, cancel: CancelToken) {
+        if let Some(c) = self.search_cancel.replace(cancel.clone()) {
+            c.cancel();
+        }
+        let ctx = self.ctx.clone();
+        let started = self.spawn("search", move |r, tx| {
+            let result = r.search(kind, &query, &cancel, &mut |batch| {
+                let ok = tx.send(Msg::SearchBatch(seq, batch)).is_ok();
+                ctx.request_repaint();
+                ok
+            });
+            let _ = tx.send(Msg::SearchDone(seq, result));
+        });
+        // The search must still end (as failed), or it would stay "running".
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::SearchDone(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
     pub fn details(&self, seq: Gen, id: Oid) {
-        self.spawn("details", move |r, tx| {
+        let _ = self.spawn("details", move |r, tx| {
             let result = r.commit_details(id).and_then(|d| {
                 let parent = d.parents.first().copied();
                 Ok((d, r.commit_files(id, parent)?))
@@ -308,22 +352,23 @@ impl Worker {
     }
 
     pub fn diff(&self, seq: Gen, source: DiffSource, file: ChangedFile, opts: DiffOptions) {
-        self.spawn("diff", move |r, tx| {
+        let _ = self.spawn("diff", move |r, tx| {
             let _ = tx.send(Msg::Diff(seq, r.file_diff(source, &file, opts)));
         });
     }
 
     /// Runs a maintenance or write job; its result arrives as [`Msg::Job`].
     pub fn job(&self, name: &str, f: impl FnOnce() -> anyhow::Result<String> + Send + 'static) {
-        self.spawn(name, move |_, tx| {
+        let _ = self.spawn(name, move |_, tx| {
             let _ = tx.send(Msg::Job(f()));
         });
     }
 }
 
 impl Drop for Worker {
+    /// A closed tab stops its background reads.
     fn drop(&mut self) {
-        if let Some(c) = self.log_cancel.take() {
+        for c in [self.log_cancel.take(), self.search_cancel.take()].into_iter().flatten() {
             c.cancel();
         }
     }

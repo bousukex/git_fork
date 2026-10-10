@@ -28,9 +28,48 @@ enum ListEvent {
     MergeTool(bstr::BString),
 }
 
+/// The commit subject and description fields.
+pub fn commit_field_ids(tab: &RepoTab) -> (egui::Id, egui::Id) {
+    (egui::Id::new(("commit-subject", &tab.paths.workdir)), egui::Id::new(("commit-body", &tab.paths.workdir)))
+}
+
+/// Keyboard focus of a file list (set by clicking a row in it).
+pub fn list_focus_id(tab: &RepoTab, side: Side) -> egui::Id {
+    egui::Id::new(("changes-list", side == Side::Staged, &tab.paths.workdir))
+}
+
+/// Space/Enter stage or unstage the selection, Delete asks to discard it,
+/// while the list has keyboard focus (and no IME is composing).
+fn list_keys(ui: &egui::Ui, side: Side, tab: &RepoTab, events: &mut Vec<ListEvent>) {
+    let ctx = ui.ctx();
+    if !crate::input::views_have_keys(ctx) || !ctx.memory(|m| m.has_focus(list_focus_id(tab, side))) || tab.busy() {
+        return;
+    }
+    let selection: Vec<ChangedFile> = tab.selected_on(side);
+    if selection.is_empty() {
+        return;
+    }
+    let toggle = crate::input::take_key(ctx, Modifiers::NONE, Key::Space) || crate::input::take_key(ctx, Modifiers::NONE, Key::Enter);
+    if toggle {
+        events.push(match side {
+            Side::Unstaged => ListEvent::Stage(selection.into_iter().filter(|f| f.kind != ChangeKind::Conflicted).collect()),
+            Side::Staged => ListEvent::Unstage(selection),
+        });
+    } else if side == Side::Unstaged && crate::input::take_key(ctx, Modifiers::NONE, Key::Delete) {
+        events.push(ListEvent::Discard(selection.into_iter().filter(|f| f.kind != ChangeKind::Conflicted).collect()));
+    }
+}
+
 fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab: &RepoTab, events: &mut Vec<ListEvent>) {
     let p = Palette::of(ui.ctx());
     let busy = tab.busy();
+    let focus_id = list_focus_id(tab, side);
+    // A widget for the list itself holds the keyboard focus (rows come and
+    // go as they scroll).
+    let list = ui.interact(ui.available_rect_before_wrap(), focus_id, egui::Sense::focusable_noninteractive());
+    let side_name = if side == Side::Staged { "staged" } else { "unstaged" };
+    list.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, format!("{side_name} files")));
+    list_keys(ui, side, tab, events);
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         egui::ScrollArea::vertical().id_salt(id).auto_shrink(false).show_rows(ui, ROW_H, files.len(), |ui, range| {
@@ -42,6 +81,9 @@ fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab
                 resp.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{side_name} file {}", f.path.to_str_lossy()))
                 });
+                if resp.clicked() || resp.secondary_clicked() {
+                    ui.memory_mut(|m| m.request_focus(focus_id));
+                }
                 if resp.double_clicked() {
                     events.push(ListEvent::Toggle(f.clone()));
                 } else if resp.clicked() {
@@ -175,7 +217,12 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
     ui.add_space(6.0);
 
     // Ctrl+Enter commits; consume it before the text fields see it.
-    let ctrl_enter = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
+    // Ctrl+Enter commits only from the commit box itself (not from the
+    // sidebar filter, a dialog or Quick Launch).
+    let (subject_id, body_id) = commit_field_ids(tab);
+    let in_box = ui.ctx().memory(|m| m.has_focus(subject_id) || m.has_focus(body_id));
+    let ctrl_enter =
+        in_box && crate::input::views_have_keys(ui.ctx()) && crate::input::take_key(ui.ctx(), Modifiers::COMMAND, Key::Enter);
 
     ui.horizontal(|ui| {
         let counter = tab.commit_subject.chars().count();
@@ -184,6 +231,7 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
         let gaps = ui.spacing().item_spacing.x * 2.0;
         ui.add(
             egui::TextEdit::singleline(&mut tab.commit_subject)
+                .id(subject_id)
                 .hint_text("Commit subject")
                 .desired_width(ui.available_width() - counter_w - history_w - gaps),
         );
@@ -209,6 +257,7 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
     });
     ui.add(
         egui::TextEdit::multiline(&mut tab.commit_body)
+            .id(body_id)
             .hint_text("Description")
             .desired_rows(4)
             .desired_width(f32::INFINITY),

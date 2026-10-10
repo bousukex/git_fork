@@ -89,7 +89,7 @@ fn body(ui: &mut egui::Ui, prompt: &Prompt, input: &mut Input) -> Option<Answer>
     ui.add_space(6.0);
     ui.add(egui::Label::new(prompt.text.trim()).wrap().selectable(true));
     ui.add_space(6.0);
-    let enter = ui.input(|i| i.key_pressed(Key::Enter) && !i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
+    let enter = crate::input::pressed(ui.ctx(), egui::Modifiers::NONE, Key::Enter);
     let mut out = None;
     match prompt.kind {
         PromptKind::HostKey => {

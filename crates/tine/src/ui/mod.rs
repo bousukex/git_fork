@@ -8,6 +8,7 @@ pub mod graph_paint;
 pub mod history;
 pub mod menus;
 pub mod output;
+pub mod quick_launch;
 pub mod sidebar;
 
 use std::sync::Arc;

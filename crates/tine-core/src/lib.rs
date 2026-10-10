@@ -3,6 +3,7 @@
 pub mod autostash;
 pub mod branches;
 pub mod diff;
+pub mod fuzzy;
 pub mod graph;
 pub mod integrate;
 pub mod log;
@@ -14,6 +15,7 @@ pub mod reader;
 pub mod refs;
 pub mod remote;
 pub mod runner;
+pub mod search;
 pub mod sequencer;
 pub mod stash;
 pub mod status;

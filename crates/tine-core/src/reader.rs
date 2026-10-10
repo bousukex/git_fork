@@ -79,6 +79,14 @@ pub trait RepoReader: Send + Sync {
     fn commit_details(&self, id: Oid) -> Result<CommitDetails>;
     fn commit_files(&self, id: Oid, parent: Option<Oid>) -> Result<Vec<ChangedFile>>;
     fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions) -> Result<FileDiff>;
+    /// Streams commits matching a search ([`crate::search::search`]).
+    fn search(
+        &self,
+        kind: crate::search::SearchKind,
+        query: &str,
+        cancel: &CancelToken,
+        on_batch: &mut dyn FnMut(Vec<Oid>) -> bool,
+    ) -> Result<crate::search::SearchEnd>;
 }
 
 #[derive(Debug, Clone)]
@@ -137,5 +145,15 @@ impl RepoReader for CliReader {
 
     fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions) -> Result<FileDiff> {
         diff::file_diff(&self.git, source, file, opts)
+    }
+
+    fn search(
+        &self,
+        kind: crate::search::SearchKind,
+        query: &str,
+        cancel: &CancelToken,
+        on_batch: &mut dyn FnMut(Vec<Oid>) -> bool,
+    ) -> Result<crate::search::SearchEnd> {
+        crate::search::search(&self.git, kind, query, cancel, on_batch)
     }
 }

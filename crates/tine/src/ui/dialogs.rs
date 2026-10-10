@@ -70,13 +70,7 @@ fn buttons_with_enter(ui: &mut egui::Ui, confirm: &str, danger: bool, enabled: b
         if danger {
             b = b.fill(p.status_deleted);
         }
-        let enter = enabled
-            && enter_ok
-            && ui.input(|i| {
-                i.key_pressed(Key::Enter)
-                    && !i.modifiers.shift
-                    && !i.events.iter().any(|e| matches!(e, egui::Event::Ime(_)))
-            });
+        let enter = enabled && enter_ok && crate::input::pressed(ui.ctx(), egui::Modifiers::NONE, Key::Enter);
         out.0 = ui.add_enabled(enabled, b).clicked() || enter;
         out.1 = ui.button("Cancel").clicked();
     });

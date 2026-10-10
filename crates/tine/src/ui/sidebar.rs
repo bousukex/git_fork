@@ -126,11 +126,18 @@ fn section(ui: &mut egui::Ui, title: &str, count: usize, add: impl FnOnce(&mut e
         .show(ui, add);
 }
 
+/// The branch filter field at the top of the sidebar.
+pub fn filter_id(tab: &RepoTab) -> egui::Id {
+    egui::Id::new(("sidebar-filter", &tab.paths.workdir))
+}
+
 pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
     let mut actions = Vec::new();
     ui.add_space(6.0);
+    let id = filter_id(tab);
     ui.add(
         egui::TextEdit::singleline(&mut tab.sidebar_filter)
+            .id(id)
             .hint_text("Filter")
             .desired_width(f32::INFINITY),
     );

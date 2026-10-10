@@ -66,6 +66,22 @@ fn parse_i64(b: &[u8]) -> Option<i64> {
     b.to_str().ok()?.trim().parse().ok()
 }
 
+/// What the history shows: all branches, remote branches and tags, plus
+/// HEAD when it points at a commit (detached or not; never when unborn).
+pub fn default_revisions(git: &GitRunner) -> Vec<String> {
+    let mut revs: Vec<String> = ["--branches", "--remotes", "--tags"].map(String::from).into();
+    if head_exists(git) {
+        revs.push("HEAD".into());
+    }
+    revs
+}
+
+/// True when the history is empty: no commit at HEAD and no refs at all
+/// (git log then fails instead of printing nothing).
+pub fn nothing_to_log(git: &GitRunner) -> Result<bool> {
+    Ok(!head_exists(git) && git.output(["for-each-ref", "--count=1"])?.is_empty())
+}
+
 /// True when HEAD points at a commit (false in a fresh repository).
 pub fn head_exists(git: &GitRunner) -> bool {
     git.output(["rev-parse", "--verify", "-q", "HEAD^{commit}"]).is_ok()
@@ -85,10 +101,7 @@ pub fn stream(
         args.push(format!("--max-count={n}"));
     }
     if opts.revisions.is_empty() {
-        args.extend(["--branches", "--remotes", "--tags"].map(String::from));
-        if head_exists(git) {
-            args.push("HEAD".into());
-        }
+        args.extend(default_revisions(git));
     } else {
         args.extend(opts.revisions.iter().cloned());
     }
@@ -113,7 +126,7 @@ pub fn stream(
     // An empty repository with no refs at all makes `git log` fail with
     // "does not have any commits yet"; that's just an empty history.
     if let Err(e) = result {
-        if !head_exists(git) && git.output(["for-each-ref", "--count=1"])?.is_empty() {
+        if nothing_to_log(git)? {
             return Ok(());
         }
         return Err(e);

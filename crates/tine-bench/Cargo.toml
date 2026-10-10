@@ -9,3 +9,4 @@ publish = false
 [dependencies]
 tine-core.workspace = true
 anyhow.workspace = true
+libc.workspace = true

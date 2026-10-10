@@ -367,3 +367,48 @@ fn askpass_dialog() {
     let _ = asker.join();
     release_tx.send(()).unwrap();
 }
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn quick_launch() {
+    let _serial = serial();
+    let repo = sample_repo();
+    let path = repo.path().to_path_buf();
+    shoot(
+        "quick_launch",
+        [1100.0, 700.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            h.state_mut().run_command(tine::shortcuts::Command::QuickLaunch);
+            h.state_mut().quick_launch().unwrap().query = "fe".into();
+            settle(h);
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn commit_search() {
+    let _serial = serial();
+    let repo = sample_repo();
+    let path = repo.path().to_path_buf();
+    for (name, only) in [("search", false), ("search_only_matches", true)] {
+        shoot(
+            name,
+            [1100.0, 600.0],
+            |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+            |h| {
+                settle(h);
+                let tab = h.state_mut().active_tab_mut().unwrap();
+                tab.open_search();
+                tab.search.query = "readme".into();
+                tab.search.only_matches = only;
+                tab.search_changed();
+                settle(h);
+                h.state_mut().active_tab_mut().unwrap().step_match(true);
+                settle(h);
+            },
+        );
+    }
+}

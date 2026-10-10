@@ -2,9 +2,13 @@ pub mod app;
 pub mod askpass;
 pub mod diff_model;
 pub mod fonts;
+/// Fuzzy matching lives in the core (the bench measures it too).
+pub use tine_core::fuzzy;
+pub mod input;
 pub mod ops_registry;
 pub mod probe;
 pub mod repo;
+pub mod shortcuts;
 pub mod theme;
 pub mod ui;
 pub mod watcher;
