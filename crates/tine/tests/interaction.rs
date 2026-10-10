@@ -76,3 +76,54 @@ fn stage_all_and_commit_buttons() {
     assert_eq!(tab.history.commits[0].subject, "UIからのコミット");
     assert_eq!(tab.status.change_count(), 0);
 }
+
+#[test]
+fn stage_hunk_button() {
+    let repo = sample_repo();
+    let mut h = app(vec![repo.path().into()]);
+    h.state_mut().show_local_changes();
+    settle(&mut h);
+    // README.md is selected first and has one hunk.
+    h.get_by_label("Stage Hunk").click();
+    settle(&mut h);
+    let tab = h.state_mut().active_tab_mut().unwrap();
+    assert!(tab.status.staged.iter().any(|f| f.path == "README.md"), "{:?}", tab.status.staged);
+    assert!(!tab.status.unstaged.iter().any(|f| f.path == "README.md"));
+}
+
+#[test]
+fn second_hunk_button_stages_only_its_lines() {
+    use common::git;
+    let repo = sample_repo();
+    let d = repo.path();
+    let mut t = 1_950_000_000;
+    let body: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(d.join("long.txt"), &body).unwrap();
+    git(d, &["add", "long.txt"], &mut t);
+    git(d, &["commit", "-qm", "long"], &mut t);
+    std::fs::write(d.join("long.txt"), body.replace("line 2\n", "line two\n").replace("line 28\n", "line 28\nextra\n")).unwrap();
+
+    let mut h = app(vec![d.into()]);
+    h.state_mut().show_local_changes();
+    settle(&mut h);
+    let tab = h.state_mut().active_tab_mut().unwrap();
+    let f = tab.list(tine::repo::Side::Unstaged).into_iter().find(|f| f.path == "long.txt").unwrap();
+    tab.click_change(tine::repo::Side::Unstaged, &f, false, false);
+    settle(&mut h);
+    let tab = h.state_mut().active_tab_mut().unwrap();
+    let Some(Ok(doc)) = &tab.changes_diff.doc else { panic!("no diff") };
+    let rows: std::collections::BTreeSet<usize> =
+        doc.rows.iter().enumerate().filter(|(_, r)| r.text == "line two" || r.text == "extra").map(|(i, _)| i).collect();
+    assert_eq!(rows.len(), 2);
+    tab.select_diff_rows(rows, None);
+    h.run_steps(2);
+
+    let buttons = h.get_all_by_label("Stage Lines (1)").collect::<Vec<_>>();
+    assert_eq!(buttons.len(), 2, "one button per hunk");
+    buttons[1].click();
+    settle(&mut h);
+    let staged = std::process::Command::new("git").current_dir(d).args(["show", ":long.txt"]).output().unwrap();
+    let staged = String::from_utf8(staged.stdout).unwrap();
+    assert!(staged.contains("\nextra\n"), "{staged}");
+    assert!(staged.contains("\nline 2\n"), "the first hunk must stay unstaged: {staged}");
+}

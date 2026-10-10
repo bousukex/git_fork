@@ -138,8 +138,10 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             files(ui, tab, &mut actions);
         });
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(p.bg)).show(ui, |ui| {
-        if let Some(opts) = super::diff_view::show(ui, &tab.commit_diff, tab.diff_opts) {
-            tab.set_diff_options(opts);
+        for e in super::diff_view::show(ui, &tab.commit_diff, tab.diff_opts, None) {
+            if let super::diff_view::DiffEvent::Options(opts) = e {
+                tab.set_diff_options(opts);
+            }
         }
     });
 

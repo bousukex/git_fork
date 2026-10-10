@@ -4,7 +4,7 @@ use bstr::ByteSlice;
 use egui::{Align2, FontId, Key, Modifiers, Pos2, Rect, RichText};
 use tine_core::model::{ChangeKind, ChangedFile, RepoState};
 
-use super::{paint_text, split_path, status_badge};
+use super::{diff_view::DiffEvent, paint_text, split_path, status_badge};
 use crate::{
     repo::{RepoTab, Side},
     theme::Palette,
@@ -211,6 +211,32 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
     }
 }
 
+fn line_discard_dialog(ctx: &egui::Context, tab: &mut RepoTab) {
+    let Some(d) = &tab.pending_line_discard else { return };
+    let p = Palette::of(ctx);
+    let (n, path) = (d.lines.len(), d.file.path.to_str_lossy().into_owned());
+    let mut confirm = false;
+    let mut cancel = false;
+    let modal = egui::Modal::new(egui::Id::new("line-discard-dialog")).show(ctx, |ui| {
+        ui.set_width(420.0);
+        ui.heading(format!("Discard {n} changed line{}?", if n == 1 { "" } else { "s" }));
+        ui.add_space(6.0);
+        ui.label(RichText::new(path).monospace().small());
+        ui.label("The selected changes are removed from the file and cannot be undone.");
+        ui.add_space(8.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let discard = egui::Button::new(RichText::new("Discard").color(egui::Color32::WHITE)).fill(p.status_deleted);
+            confirm = ui.add(discard).clicked();
+            cancel = ui.button("Cancel").clicked();
+        });
+    });
+    if confirm {
+        tab.confirm_line_discard();
+    } else if cancel || modal.should_close() {
+        tab.pending_line_discard = None;
+    }
+}
+
 fn discard_dialog(ctx: &egui::Context, tab: &mut RepoTab) {
     let Some(files) = &tab.pending_discard else { return };
     let p = Palette::of(ctx);
@@ -288,12 +314,20 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
             ui.centered_and_justified(|ui| ui.spinner());
         } else if tab.status.change_count() == 0 {
             ui.centered_and_justified(|ui| ui.label(RichText::new("No local changes").color(p.text_weak)));
-        } else if let Some(opts) = super::diff_view::show(ui, &tab.changes_diff, tab.diff_opts) {
-            tab.set_diff_options(opts);
+        } else {
+            let actions = tab.line_actions();
+            for e in super::diff_view::show(ui, &tab.changes_diff, tab.diff_opts, actions) {
+                match e {
+                    DiffEvent::Options(opts) => tab.set_diff_options(opts),
+                    DiffEvent::Select(rows, anchor) => tab.select_diff_rows(rows, anchor),
+                    DiffEvent::Apply(mode, target) => tab.apply_lines(mode, target),
+                }
+            }
         }
     });
 
     discard_dialog(ui.ctx(), tab);
+    line_discard_dialog(ui.ctx(), tab);
 
     for e in events {
         match e {

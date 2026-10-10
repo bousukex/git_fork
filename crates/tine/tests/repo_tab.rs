@@ -319,3 +319,212 @@ fn operations_survive_closing_and_reopening_the_tab() {
     b.on_external_op_done(orphans[0].kind.clone(), Ok(tine::worker::OpOutcome::default()));
     assert!(poll_until(&mut b, |t| idle(t) && t.history.commits.first().is_some_and(|c| c.subject == "閉じたタブからのコミット")));
 }
+
+/// A committed 30-line file edited in two far-apart places.
+fn two_hunk_repo() -> tempfile::TempDir {
+    let repo = sample_repo();
+    let d = repo.path();
+    let mut t = 1_950_000_000;
+    let body: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(d.join("long.txt"), &body).unwrap();
+    git(d, &["add", "long.txt"], &mut t);
+    git(d, &["commit", "-qm", "long file"], &mut t);
+    let edited = body.replace("line 2\n", "line two\n").replace("line 28\n", "line 28\nextra after 28\n");
+    std::fs::write(d.join("long.txt"), edited).unwrap();
+    repo
+}
+
+fn select_file(tab: &mut RepoTab, side: Side, path: &str) {
+    let f = tab.list(side).into_iter().find(|f| f.path == path).unwrap();
+    tab.click_change(side, &f, false, false);
+}
+
+fn doc_rows(tab: &RepoTab) -> Vec<(tine::diff_model::RowKind, String)> {
+    match &tab.changes_diff.doc {
+        Some(Ok(d)) => d.rows.iter().map(|r| (r.kind, r.text.clone())).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn diff_ready(tab: &RepoTab, path: &str) -> bool {
+    tab.changes_diff.file.as_ref().is_some_and(|f| f.path == path)
+        && matches!(tab.changes_diff.doc, Some(Ok(_)))
+        && !tab.changes_diff.stale
+}
+
+#[test]
+fn stage_hunk_and_selected_lines() {
+    use tine::diff_model::RowKind;
+    use tine::repo::PatchTarget;
+    use tine_core::patch::PatchMode;
+
+    let repo = two_hunk_repo();
+    let ctx = egui::Context::default();
+    let mut tab = RepoTab::open(repo.path(), &ctx).unwrap();
+    tab.view = View::LocalChanges;
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.unstaged.iter().any(|f| f.path == "long.txt")));
+    select_file(&mut tab, Side::Unstaged, "long.txt");
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt")));
+    let actions = tab.line_actions().unwrap();
+    assert_eq!(actions.disabled, None);
+
+    // Stage the first hunk as a whole.
+    tab.apply_lines(PatchMode::Stage, PatchTarget::Hunk(0));
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.staged.iter().any(|f| f.path == "long.txt")));
+    assert!(tab.status.unstaged.iter().any(|f| f.path == "long.txt"), "second hunk stays unstaged");
+
+    // In the remaining diff, select just the added line and stage it.
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt") && !doc_rows(t).iter().any(|(_, x)| x == "line two")));
+    let rows = doc_rows(&tab);
+    let added = rows.iter().position(|(k, x)| *k == RowKind::Added && x == "extra after 28").unwrap();
+    tab.select_diff_rows([added].into(), Some(added));
+    tab.apply_lines(PatchMode::Stage, PatchTarget::Selection);
+    assert!(poll_until(&mut tab, |t| idle(t) && !t.status.unstaged.iter().any(|f| f.path == "long.txt")));
+
+    // Unstage one line from the staged diff.
+    select_file(&mut tab, Side::Staged, "long.txt");
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt")
+        && t.changes_selected.as_ref().is_some_and(|(s, _)| *s == Side::Staged)));
+    let rows = doc_rows(&tab);
+    let added = rows.iter().position(|(k, x)| *k == RowKind::Added && x == "extra after 28").unwrap();
+    tab.select_diff_rows([added].into(), Some(added));
+    tab.apply_lines(PatchMode::Unstage, PatchTarget::Selection);
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.unstaged.iter().any(|f| f.path == "long.txt")));
+    let staged = std::process::Command::new("git").current_dir(repo.path()).args(["show", ":long.txt"]).output().unwrap();
+    let staged = String::from_utf8(staged.stdout).unwrap();
+    assert!(staged.contains("line two\n") && !staged.contains("extra after 28"), "{staged}");
+}
+
+#[test]
+fn discard_lines_needs_confirmation_and_respects_gating() {
+    use tine::diff_model::RowKind;
+    use tine::repo::PatchTarget;
+    use tine_core::patch::PatchMode;
+
+    let repo = two_hunk_repo();
+    let ctx = egui::Context::default();
+    let mut tab = RepoTab::open(repo.path(), &ctx).unwrap();
+    tab.view = View::LocalChanges;
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.unstaged.iter().any(|f| f.path == "long.txt")));
+
+    // Untracked files can only be handled as a whole.
+    select_file(&mut tab, Side::Unstaged, "新規ファイル.txt");
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "新規ファイル.txt")));
+    assert!(tab.line_actions().unwrap().disabled.is_some());
+
+    select_file(&mut tab, Side::Unstaged, "long.txt");
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt")));
+    // "Ignore whitespace" changes what is shown, so line actions are off.
+    let mut opts = tab.diff_opts;
+    opts.ignore_whitespace = true;
+    tab.set_diff_options(opts);
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt")));
+    assert!(tab.line_actions().unwrap().disabled.unwrap().contains("Ignore whitespace"));
+    opts.ignore_whitespace = false;
+    tab.set_diff_options(opts);
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt")));
+
+    let rows = doc_rows(&tab);
+    let added = rows.iter().position(|(k, x)| *k == RowKind::Added && x == "extra after 28").unwrap();
+    tab.select_diff_rows([added].into(), Some(added));
+    tab.apply_lines(PatchMode::Discard, PatchTarget::Selection);
+    assert!(tab.pending_line_discard.is_some(), "discard waits for confirmation");
+    assert!(!tab.busy());
+    tab.confirm_line_discard();
+    assert!(poll_until(&mut tab, |t| idle(t) && !std::fs::read_to_string(repo.path().join("long.txt")).unwrap().contains("extra after 28")));
+    let now = std::fs::read_to_string(repo.path().join("long.txt")).unwrap();
+    assert!(now.contains("line two\n"), "the other change stays");
+}
+
+#[test]
+fn hunk_button_acts_only_on_its_own_selection() {
+    use tine::diff_model::RowKind;
+    use tine::repo::PatchTarget;
+    use tine_core::patch::PatchMode;
+
+    let repo = two_hunk_repo();
+    let ctx = egui::Context::default();
+    let mut tab = RepoTab::open(repo.path(), &ctx).unwrap();
+    tab.view = View::LocalChanges;
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.unstaged.iter().any(|f| f.path == "long.txt")));
+    select_file(&mut tab, Side::Unstaged, "long.txt");
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt")));
+    let rows = doc_rows(&tab);
+    let in_first = rows.iter().position(|(k, x)| *k == RowKind::Added && x == "line two").unwrap();
+    let in_second = rows.iter().position(|(k, x)| *k == RowKind::Added && x == "extra after 28").unwrap();
+    tab.select_diff_rows([in_first, in_second].into(), Some(in_first));
+
+    // The second hunk's "Discard Lines (1)" button.
+    tab.apply_lines(PatchMode::Discard, PatchTarget::SelectedIn(1));
+    assert_eq!(tab.pending_line_discard.as_ref().unwrap().lines.len(), 1);
+    tab.confirm_line_discard();
+    assert!(poll_until(&mut tab, |t| idle(t)
+        && !std::fs::read_to_string(repo.path().join("long.txt")).unwrap().contains("extra after 28")));
+    let now = std::fs::read_to_string(repo.path().join("long.txt")).unwrap();
+    assert!(now.contains("line two\n"), "the first hunk's selected line must be untouched: {now}");
+}
+
+#[test]
+fn line_actions_are_disabled_for_unsupported_files() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = sample_repo();
+    let d = repo.path();
+    let mut t = 1_960_000_000;
+    std::fs::write(d.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+    std::fs::write(d.join("script.sh"), "echo hi\n").unwrap();
+    git(d, &["add", "bin.dat", "script.sh"], &mut t);
+    git(d, &["commit", "-qm", "binary and script"], &mut t);
+    std::fs::write(d.join("bin.dat"), [0u8, 9, 9, 9]).unwrap();
+    std::fs::set_permissions(d.join("script.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(d.join("script.sh"), "echo hello\n").unwrap();
+    git(d, &["mv", "main.rs", "moved.rs"], &mut t);
+
+    let ctx = egui::Context::default();
+    let mut tab = RepoTab::open(d, &ctx).unwrap();
+    tab.view = View::LocalChanges;
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.staged.iter().any(|f| f.path == "moved.rs")));
+    for (side, path, why) in [
+        (Side::Unstaged, "bin.dat", "Binary"),
+        (Side::Unstaged, "script.sh", "mode change"),
+        (Side::Staged, "moved.rs", "Only modified"),
+        (Side::Unstaged, "新規ファイル.txt", "Only modified"),
+    ] {
+        select_file(&mut tab, side, path);
+        assert!(poll_until(&mut tab, |t| diff_ready(t, path)), "{path}");
+        let reason = tab.line_actions().unwrap().disabled.unwrap_or_else(|| panic!("{path} should be disabled"));
+        assert!(reason.contains(why), "{path}: {reason}");
+    }
+}
+
+#[test]
+fn line_actions_are_disabled_for_conflicts() {
+    let repo = conflicted_repo();
+    let ctx = egui::Context::default();
+    let mut tab = RepoTab::open(repo.path(), &ctx).unwrap();
+    tab.view = View::LocalChanges;
+    assert!(poll_until(&mut tab, |t| idle(t) && !t.status.conflicted.is_empty()));
+    select_file(&mut tab, Side::Unstaged, "README.md");
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "README.md")));
+    assert!(tab.line_actions().unwrap().disabled.is_some());
+}
+
+#[test]
+fn line_actions_wait_for_the_refreshed_diff() {
+    use tine::repo::PatchTarget;
+    use tine_core::patch::PatchMode;
+    let repo = two_hunk_repo();
+    let ctx = egui::Context::default();
+    let mut tab = RepoTab::open(repo.path(), &ctx).unwrap();
+    tab.view = View::LocalChanges;
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.unstaged.iter().any(|f| f.path == "long.txt")));
+    select_file(&mut tab, Side::Unstaged, "long.txt");
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt")));
+    tab.apply_lines(PatchMode::Stage, PatchTarget::Hunk(0));
+    // As soon as the operation is done the old diff is marked outdated...
+    assert!(poll_until(&mut tab, |t| !t.busy()));
+    assert!(tab.changes_diff.stale);
+    assert_eq!(tab.line_actions().unwrap().disabled, Some("Updating the diff"));
+    // ...until the new one arrives.
+    assert!(poll_until(&mut tab, |t| diff_ready(t, "long.txt")));
+    assert_eq!(tab.line_actions().unwrap().disabled, None);
+}

@@ -126,3 +126,39 @@ fn many_lanes() {
         settle(h);
     });
 }
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn line_staging_view() {
+    let repo = sample_repo();
+    let d = repo.path();
+    let mut t = 1_950_000_000;
+    let body: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(d.join("long.txt"), &body).unwrap();
+    git(d, &["add", "long.txt"], &mut t);
+    git(d, &["commit", "-qm", "long file"], &mut t);
+    std::fs::write(d.join("long.txt"), body.replace("line 2\n", "line two\n").replace("line 28\n", "line 28\nextra after 28\nmore\n")).unwrap();
+    let path = d.to_path_buf();
+    shoot(
+        "line_staging",
+        [1360.0, 820.0],
+        |cc| {
+            let mut app = tine::app::TineApp::new(cc, vec![path.clone()]);
+            app.show_local_changes();
+            app
+        },
+        |h| {
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            let f = tab.list(tine::repo::Side::Unstaged).into_iter().find(|f| f.path == "long.txt").unwrap();
+            tab.click_change(tine::repo::Side::Unstaged, &f, false, false);
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            if let Some(Ok(doc)) = &tab.changes_diff.doc {
+                let row = doc.rows.iter().position(|r| r.text == "extra after 28").unwrap();
+                tab.select_diff_rows([row].into(), Some(row));
+            }
+            settle(h);
+        },
+    );
+}

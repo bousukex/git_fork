@@ -23,6 +23,15 @@ pub struct DiffRow {
     pub text: String,
     /// Index of the hunk this row belongs to.
     pub hunk: usize,
+    /// Index into the hunk's lines (`None` for the hunk header row).
+    pub line: Option<usize>,
+}
+
+impl DiffRow {
+    /// Added or deleted (the rows that can be staged individually).
+    pub fn is_change(&self) -> bool {
+        matches!(self.kind, RowKind::Added | RowKind::Deleted)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36,6 +45,8 @@ pub struct DiffDoc {
     pub deleted: usize,
     /// Digits needed for line numbers.
     pub number_width: usize,
+    /// The parsed diff, kept with its raw bytes for building partial patches.
+    pub source: FileDiff,
 }
 
 /// Terminal-style column width: East Asian wide/fullwidth characters take two.
@@ -78,6 +89,7 @@ impl DiffDoc {
     pub fn new(diff: FileDiff) -> Self {
         let (added, deleted) = diff.stats();
         let mut doc = DiffDoc {
+            source: diff.clone(),
             binary: diff.binary,
             header: diff.header.iter().map(|h| String::from_utf8_lossy(h).into_owned()).collect(),
             added,
@@ -92,8 +104,8 @@ impl DiffDoc {
                 hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines, section
             );
             doc.max_cols = doc.max_cols.max(text.chars().map(char_cols).sum());
-            doc.rows.push(DiffRow { kind: RowKind::Hunk, old_no: None, new_no: None, text, hunk: hi });
-            for line in &hunk.lines {
+            doc.rows.push(DiffRow { kind: RowKind::Hunk, old_no: None, new_no: None, text, hunk: hi, line: None });
+            for (li, line) in hunk.lines.iter().enumerate() {
                 let kind = match line.kind {
                     LineKind::Context => RowKind::Context,
                     LineKind::Added => RowKind::Added,
@@ -103,7 +115,7 @@ impl DiffDoc {
                 let (text, cols) = display_text(&line.content);
                 doc.max_cols = doc.max_cols.max(cols);
                 max_no = max_no.max(line.old_no.unwrap_or(0)).max(line.new_no.unwrap_or(0));
-                doc.rows.push(DiffRow { kind, old_no: line.old_no, new_no: line.new_no, text, hunk: hi });
+                doc.rows.push(DiffRow { kind, old_no: line.old_no, new_no: line.new_no, text, hunk: hi, line: Some(li) });
             }
         }
         doc.number_width = max_no.max(1).ilog10() as usize + 1;

@@ -121,6 +121,8 @@ pub enum OpKind {
     Unstage,
     Discard,
     Commit { message: String, amend: bool },
+    /// Hunk/line level stage, unstage or discard.
+    Patch(tine_core::patch::PatchMode),
 }
 
 impl OpKind {
@@ -131,6 +133,9 @@ impl OpKind {
             OpKind::Discard => "Discard",
             OpKind::Commit { amend: false, .. } => "Commit",
             OpKind::Commit { amend: true, .. } => "Amend",
+            OpKind::Patch(tine_core::patch::PatchMode::Stage) => "Stage lines",
+            OpKind::Patch(tine_core::patch::PatchMode::Unstage) => "Unstage lines",
+            OpKind::Patch(tine_core::patch::PatchMode::Discard) => "Discard lines",
         }
     }
 }

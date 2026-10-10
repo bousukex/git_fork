@@ -17,7 +17,11 @@ use tine_core::{
 };
 
 use bstr::BString;
-use tine_core::{model::RepoState, ops};
+use tine_core::{
+    model::{ChangeKind, RepoState},
+    ops,
+    patch::{self, PatchMode},
+};
 
 use crate::{
     diff_model::DiffDoc,
@@ -95,6 +99,13 @@ pub struct DiffPane {
     pub source: Option<DiffSource>,
     pub doc: Option<Result<Arc<DiffDoc>, String>>,
     seq: Gen,
+    /// Selected rows (indices into `DiffDoc::rows`) for line staging.
+    pub selected_rows: std::collections::BTreeSet<usize>,
+    /// Row a Shift+click range starts from.
+    pub anchor: Option<usize>,
+    /// The shown diff may be outdated (an operation finished or a reload is
+    /// on its way); line actions wait for the fresh diff.
+    pub stale: bool,
 }
 
 impl DiffPane {
@@ -115,6 +126,39 @@ pub struct CommitPane {
 
 /// How discard gets rid of untracked files (the trash, or a test stub).
 type UntrackedRemover = Arc<dyn Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync>;
+
+/// Whether hunk/line actions are available for the shown diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineActions {
+    pub side: Side,
+    /// Why the actions are disabled, if they are.
+    pub disabled: Option<&'static str>,
+}
+
+/// What a hunk/line action applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchTarget {
+    /// Every changed line of a hunk.
+    Hunk(usize),
+    /// All selected lines, in any hunk.
+    Selection,
+    /// Only the selected lines inside one hunk (what a hunk's button shows).
+    SelectedIn(usize),
+}
+
+/// Changed lines picked for a partial patch.
+struct PatchSelection {
+    file: ChangedFile,
+    doc: Arc<DiffDoc>,
+    lines: Vec<(usize, usize)>,
+}
+
+/// Lines waiting for the user to confirm a discard.
+pub struct LineDiscard {
+    pub file: ChangedFile,
+    pub diff: tine_core::model::FileDiff,
+    pub lines: Vec<(usize, usize)>,
+}
 
 /// Which list a local-changes file was picked from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +199,7 @@ pub struct RepoTab {
     pub changes_diff: DiffPane,
     /// Files waiting for the user to confirm a discard.
     pub pending_discard: Option<Vec<ChangedFile>>,
+    pub pending_line_discard: Option<LineDiscard>,
     pub amend: bool,
     /// Messages of successful commits, collected by the app for history.
     pub committed_messages: Vec<String>,
@@ -242,6 +287,7 @@ impl RepoTab {
             changes_multi: Default::default(),
             changes_next: None,
             pending_discard: None,
+            pending_line_discard: None,
             amend: false,
             committed_messages: Vec::new(),
             head_message_seq: 0,
@@ -379,6 +425,10 @@ impl RepoTab {
             }
             Msg::Diff(seq, r) if seq == self.changes_diff.seq => {
                 self.changes_diff.doc = Some(r.map(|d| Arc::new(DiffDoc::new(d))).map_err(|e| format!("{e:#}")));
+                // Rows shift whenever the diff is recomputed.
+                self.changes_diff.selected_rows.clear();
+                self.changes_diff.anchor = None;
+                self.changes_diff.stale = false;
             }
             Msg::Job(r) => match r {
                 Ok(line) => self.activity.push(line),
@@ -455,7 +505,7 @@ impl RepoTab {
             _ => None,
         };
         let source = DiffSource::Commit { id, parent };
-        self.commit_diff = DiffPane { file: Some(file.clone()), source: Some(source), doc: None, seq: self.gens.bump() };
+        self.commit_diff = DiffPane { file: Some(file.clone()), source: Some(source), doc: None, seq: self.gens.bump(), ..Default::default() };
         self.worker.diff(self.commit_diff.seq, source, file.clone(), self.diff_opts);
     }
 
@@ -479,7 +529,9 @@ impl RepoTab {
         // Keep showing the previous diff of the same file while reloading.
         let keep = self.changes_diff.file.as_ref() == Some(&file) && self.changes_diff.source == Some(source);
         let doc = if keep { self.changes_diff.doc.take() } else { None };
-        self.changes_diff = DiffPane { file: Some(file.clone()), source: Some(source), doc, seq: self.gens.bump() };
+        let stale = doc.is_some();
+        self.changes_diff =
+            DiffPane { file: Some(file.clone()), source: Some(source), doc, seq: self.gens.bump(), stale, ..Default::default() };
         self.worker.diff(self.changes_diff.seq, source, file, self.diff_opts);
     }
 
@@ -714,6 +766,92 @@ impl RepoTab {
         }
     }
 
+    /// Whether the local-changes diff supports hunk/line actions.
+    pub fn line_actions(&self) -> Option<LineActions> {
+        let (side, file) = self.changes_selected.as_ref()?;
+        let Some(Ok(doc)) = &self.changes_diff.doc else { return None };
+        let disabled = if doc.binary {
+            Some("Binary files are staged as a whole")
+        } else if file.is_submodule {
+            Some("Submodules are staged as a whole")
+        } else if file.kind != ChangeKind::Modified {
+            Some("Only modified files can be staged by hunk or line")
+        } else if doc.header.iter().any(|h| h.starts_with("old mode") || h.starts_with("new mode")) {
+            Some("Files with a mode change are staged as a whole")
+        } else if self.diff_opts.ignore_whitespace {
+            Some("Turn off \"Ignore whitespace\" to stage by hunk or line")
+        } else if self.busy() {
+            Some("Waiting for the current operation")
+        } else if self.changes_diff.stale {
+            Some("Updating the diff")
+        } else {
+            None
+        };
+        Some(LineActions { side: *side, disabled })
+    }
+
+    pub fn select_diff_rows(&mut self, rows: std::collections::BTreeSet<usize>, anchor: Option<usize>) {
+        self.changes_diff.selected_rows = rows;
+        self.changes_diff.anchor = anchor;
+    }
+
+    /// The changed lines `target` refers to, as `(hunk, line)` pairs.
+    fn patch_lines(&self, target: PatchTarget) -> Option<PatchSelection> {
+        let (_, file) = self.changes_selected.as_ref()?;
+        let Some(Ok(doc)) = &self.changes_diff.doc else { return None };
+        let lines: Vec<(usize, usize)> = doc
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| {
+                r.is_change()
+                    && match target {
+                        PatchTarget::Hunk(h) => r.hunk == h,
+                        PatchTarget::Selection => self.changes_diff.selected_rows.contains(i),
+                        PatchTarget::SelectedIn(h) => r.hunk == h && self.changes_diff.selected_rows.contains(i),
+                    }
+            })
+            .filter_map(|(_, r)| Some((r.hunk, r.line?)))
+            .collect();
+        (!lines.is_empty()).then(|| PatchSelection { file: file.clone(), doc: doc.clone(), lines })
+    }
+
+    /// Stages, unstages or (after confirmation) discards a hunk or the
+    /// selected lines of the shown local-changes diff.
+    pub fn apply_lines(&mut self, mode: PatchMode, target: PatchTarget) {
+        let Some(actions) = self.line_actions() else { return };
+        if actions.disabled.is_some() {
+            return;
+        }
+        let Some(PatchSelection { file, doc, lines }) = self.patch_lines(target) else { return };
+        if mode == PatchMode::Discard {
+            self.pending_line_discard = Some(LineDiscard { file, diff: doc.source.clone(), lines });
+            return;
+        }
+        self.run_patch(mode, file, doc.source.clone(), lines);
+    }
+
+    pub fn confirm_line_discard(&mut self) {
+        if let Some(d) = self.pending_line_discard.take() {
+            self.run_patch(PatchMode::Discard, d.file, d.diff, d.lines);
+        }
+    }
+
+    fn run_patch(&mut self, mode: PatchMode, file: ChangedFile, diff: tine_core::model::FileDiff, lines: Vec<(usize, usize)>) {
+        let n = lines.len();
+        let set: std::collections::HashSet<(usize, usize)> = lines.into_iter().collect();
+        let opts = self.diff_opts;
+        self.run_op(OpKind::Patch(mode), move |git| {
+            patch::apply(git, &file.path, &diff, opts, mode, |h, l| set.contains(&(h, l)))?;
+            let verb = match mode {
+                PatchMode::Stage => "Staged",
+                PatchMode::Unstage => "Unstaged",
+                PatchMode::Discard => "Discarded",
+            };
+            Ok(OpOutcome { summary: format!("{verb} {n} line(s) in {}", file.path), refs_changed: false })
+        });
+    }
+
     /// Key identifying this repository across tabs (see `worker::repo_key`).
     pub fn repo_key(&self) -> &std::path::Path {
         self.worker.repo_key()
@@ -730,6 +868,11 @@ impl RepoTab {
 
     fn on_op_done(&mut self, kind: OpKind, result: anyhow::Result<OpOutcome>) {
         self.ops_in_flight = self.ops_in_flight.saturating_sub(1);
+        // Whatever the operation did, the shown diff is outdated until the
+        // refresh below brings a new one.
+        if self.changes_diff.doc.is_some() {
+            self.changes_diff.stale = true;
+        }
         // A commit may have been created even if a later step failed.
         if matches!(kind, OpKind::Commit { .. }) {
             self.ops_moved_refs = true;

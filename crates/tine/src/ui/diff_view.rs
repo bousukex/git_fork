@@ -5,9 +5,13 @@ use egui::{Align2, FontId, Pos2, Rect, RichText, ScrollArea, Sense, vec2};
 use tine_core::{diff::DiffOptions, model::ChangeKind};
 
 use super::paint_text;
+use std::collections::BTreeSet;
+
+use tine_core::patch::PatchMode;
+
 use crate::{
     diff_model::{DiffDoc, RowKind},
-    repo::DiffPane,
+    repo::{DiffPane, LineActions, PatchTarget, Side},
     theme::Palette,
 };
 
@@ -47,13 +51,23 @@ fn placeholder(ui: &mut egui::Ui, text: &str) {
     ui.centered_and_justified(|ui| ui.label(RichText::new(text).color(p.text_weak)));
 }
 
-/// Shows `pane`; returns new diff options if the user changed them.
-pub fn show(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions) -> Option<DiffOptions> {
+/// Something the user did in the diff view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffEvent {
+    Options(DiffOptions),
+    /// New row selection and Shift+click anchor.
+    Select(BTreeSet<usize>, Option<usize>),
+    Apply(PatchMode, PatchTarget),
+}
+
+/// Shows `pane`. `actions` enables hunk/line staging (local changes only).
+pub fn show(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions, actions: Option<LineActions>) -> Vec<DiffEvent> {
+    let mut events = Vec::new();
     let Some(file) = &pane.file else {
         placeholder(ui, "Select a file to see its changes");
-        return None;
+        return events;
     };
-    let changed = header(ui, pane, opts);
+    events.extend(header(ui, pane, opts).map(DiffEvent::Options));
     match &pane.doc {
         None => {
             ui.centered_and_justified(|ui| ui.spinner());
@@ -75,12 +89,90 @@ pub fn show(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions) -> Option<Dif
             };
             placeholder(ui, &msg);
         }
-        Some(Ok(doc)) => rows(ui, doc),
+        Some(Ok(doc)) => rows(ui, doc, pane, actions, &mut events),
     }
-    changed
+    events
 }
 
-fn rows(ui: &mut egui::Ui, doc: &DiffDoc) {
+/// Selection after a press on `row` (only changed rows are selectable).
+fn select_on_press(doc: &DiffDoc, pane: &DiffPane, row: usize, ctrl: bool, shift: bool) -> (BTreeSet<usize>, Option<usize>) {
+    let mut sel = pane.selected_rows.clone();
+    match (ctrl, shift, pane.anchor) {
+        (_, true, Some(anchor)) => {
+            sel = range_of(doc, anchor, row);
+            (sel, Some(anchor))
+        }
+        (true, _, _) => {
+            if !sel.remove(&row) {
+                sel.insert(row);
+            }
+            (sel, Some(row))
+        }
+        _ => ([row].into(), Some(row)),
+    }
+}
+
+fn range_of(doc: &DiffDoc, a: usize, b: usize) -> BTreeSet<usize> {
+    (a.min(b)..=a.max(b)).filter(|&i| doc.rows.get(i).is_some_and(|r| r.is_change())).collect()
+}
+
+/// Buttons in a hunk header: act on the selected lines of this hunk if
+/// any, otherwise on the whole hunk.
+fn hunk_buttons(ui: &mut egui::Ui, row_rect: Rect, hunk: usize, selected_here: usize, actions: LineActions, events: &mut Vec<DiffEvent>) {
+    let (target, noun) = if selected_here > 0 {
+        // Exactly the lines counted on the button, never other hunks' selections.
+        (PatchTarget::SelectedIn(hunk), format!("Lines ({selected_here})"))
+    } else {
+        (PatchTarget::Hunk(hunk), "Hunk".to_owned())
+    };
+    let buttons: &[(PatchMode, &str)] = match actions.side {
+        Side::Unstaged => &[(PatchMode::Stage, "Stage"), (PatchMode::Discard, "Discard")],
+        Side::Staged => &[(PatchMode::Unstage, "Unstage")],
+    };
+    // Keep the buttons at the right edge of the visible area, not of the
+    // (horizontally scrollable) content. They are painted by hand so they
+    // take no layout space inside the virtualized rows.
+    let p = Palette::of(ui.ctx());
+    let enabled = actions.disabled.is_none();
+    let font = FontId::proportional(11.5);
+    let mut right = ui.clip_rect().right().min(row_rect.right()) - 4.0;
+    for (mode, verb) in buttons {
+        let label = format!("{verb} {noun}");
+        let text_color = if enabled { p.text } else { p.text_weak };
+        let galley = ui.painter().layout_no_wrap(label.clone(), font.clone(), text_color);
+        let w = galley.size().x + 14.0;
+        let rect = Rect::from_min_max(Pos2::new(right - w, row_rect.top() + 1.5), Pos2::new(right, row_rect.bottom() - 1.5));
+        let id = ui.id().with(("hunk-button", hunk, verb));
+        let resp = ui.interact(rect, id, if enabled { Sense::click() } else { Sense::hover() });
+        // Hand-drawn, so describe it for accessibility (and UI tests).
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &label));
+        let fill = if !enabled {
+            p.sidebar_bg
+        } else if resp.is_pointer_button_down_on() {
+            p.selection_bg
+        } else if resp.hovered() {
+            p.row_hover
+        } else {
+            p.bg
+        };
+        ui.painter().rect(rect, 3.0, fill, egui::Stroke::new(1.0, p.separator), egui::StrokeKind::Inside);
+        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, text_color);
+        let resp = match actions.disabled {
+            Some(why) => resp.on_hover_text(why),
+            None => resp.on_hover_text(match mode {
+                PatchMode::Stage => "Add these changes to the index",
+                PatchMode::Unstage => "Take these changes out of the index",
+                PatchMode::Discard => "Revert these changes in the working tree",
+            }),
+        };
+        if enabled && resp.clicked() {
+            events.push(DiffEvent::Apply(*mode, target));
+        }
+        right -= w + 4.0;
+    }
+}
+
+fn rows(ui: &mut egui::Ui, doc: &DiffDoc, pane: &DiffPane, actions: Option<LineActions>, events: &mut Vec<DiffEvent>) {
     let p = Palette::of(ui.ctx());
     let font = FontId::monospace(FONT_SIZE);
     let char_w = ui.painter().layout_no_wrap("0".into(), font.clone(), p.text).size().x;
@@ -88,20 +180,52 @@ fn rows(ui: &mut egui::Ui, doc: &DiffDoc) {
     let num_w = (doc.number_width as f32 + 1.0) * char_w;
     let gutter = num_w * 2.0 + 18.0;
     let content_w = gutter + (doc.max_cols as f32 + 4.0) * char_w;
+    let selectable = actions.is_some_and(|a| a.disabled.is_none());
+    // Row where a drag selection started (kept while the button is held).
+    let drag_id = ui.id().with("diff-drag");
+    let mut drag_anchor: Option<usize> = ui.data(|d| d.get_temp(drag_id));
+    let (pointer, primary_down) = ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
+    if !primary_down {
+        drag_anchor = None;
+    }
+    let selected_in_hunk = |h: usize| pane.selected_rows.iter().filter(|&&i| doc.rows[i].hunk == h).count();
 
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         ScrollArea::both().id_salt("diff").auto_shrink(false).show_rows(ui, row_h, doc.rows.len(), |ui, range| {
             let width = content_w.max(ui.available_width());
-            for row in &doc.rows[range] {
-                let (rect, _) = ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
+            for i in range {
+                let row = &doc.rows[i];
+                let sense = if selectable && row.is_change() { Sense::click_and_drag() } else { Sense::hover() };
+                let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), sense);
+
+                if selectable && row.is_change() {
+                    if resp.drag_started() || resp.clicked() {
+                        let m = ui.input(|i| i.modifiers);
+                        let (sel, anchor) = select_on_press(doc, pane, i, m.command, m.shift);
+                        if !m.command && !m.shift {
+                            drag_anchor = Some(i);
+                        }
+                        events.push(DiffEvent::Select(sel, anchor));
+                    } else if let (Some(a), Some(pos)) = (drag_anchor, pointer)
+                        && primary_down
+                        && rect.y_range().contains(pos.y)
+                        && a != i
+                    {
+                        events.push(DiffEvent::Select(range_of(doc, a, i), Some(a)));
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
                 if !ui.is_rect_visible(rect) {
                     continue;
                 }
+                let selected = pane.selected_rows.contains(&i);
                 let painter = ui.painter();
                 let (bg, marker) = match row.kind {
-                    RowKind::Added => (Some(p.diff_add_bg), "+"),
-                    RowKind::Deleted => (Some(p.diff_del_bg), "-"),
+                    RowKind::Added => (Some(if selected { p.diff_add_strong } else { p.diff_add_bg }), "+"),
+                    RowKind::Deleted => (Some(if selected { p.diff_del_strong } else { p.diff_del_bg }), "-"),
                     RowKind::Hunk => (Some(p.diff_hunk_bg), ""),
                     RowKind::Context | RowKind::NoNewline => (None, ""),
                 };
@@ -115,6 +239,11 @@ fn rows(ui: &mut egui::Ui, doc: &DiffDoc) {
                     _ => p.sidebar_bg,
                 };
                 painter.rect_filled(gutter_rect, 0.0, gutter_bg.gamma_multiply(if bg.is_some() { 0.6 } else { 1.0 }));
+                if selected {
+                    painter.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, row_h)), 0.0, p.accent);
+                } else if resp.hovered() && row.is_change() && selectable {
+                    painter.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, row_h)), 0.0, p.accent.gamma_multiply(0.4));
+                }
                 let num = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
                 let old_r = Rect::from_min_size(rect.min, vec2(num_w, row_h));
                 let new_r = Rect::from_min_size(Pos2::new(rect.left() + num_w + 4.0, rect.top()), vec2(num_w, row_h));
@@ -130,7 +259,14 @@ fn rows(ui: &mut egui::Ui, doc: &DiffDoc) {
                 let galley = painter.layout_no_wrap(row.text.clone(), font.clone(), color);
                 let pos = Pos2::new(rect.left() + gutter + 4.0, rect.center().y - galley.size().y / 2.0);
                 painter.galley(pos, galley, color);
+
+                if row.kind == RowKind::Hunk
+                    && let Some(actions) = actions
+                {
+                    hunk_buttons(ui, rect, row.hunk, selected_in_hunk(row.hunk), actions, events);
+                }
             }
         });
     });
+    ui.data_mut(|d| d.insert_temp(drag_id, drag_anchor));
 }
