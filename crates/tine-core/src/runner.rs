@@ -432,6 +432,56 @@ impl GitRunner {
         }
     }
 
+    /// Runs to completion and returns stdout — unless it grows past `limit`
+    /// bytes: then git is stopped as soon as that is known and `Ok(None)`
+    /// returned (no more than the limit and one read is ever held).
+    pub fn output_limited<I, S>(&self, args: I, limit: usize, cancel: &CancelToken) -> Result<Option<Vec<u8>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        self.check_cancelled()?;
+        let started = Instant::now();
+        let (mut child, done, stopped) = self.spawn_cancellable(&args, cancel)?;
+        let pid = child.id();
+        let stderr_thread = drain(child.stderr.take().expect("piped"));
+        let mut stdout = child.stdout.take().expect("piped");
+        let mut out = Vec::new();
+        let mut chunk = vec![0u8; 1 << 16];
+        let mut too_large = false;
+        let read_result = loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break Ok(()),
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => break Err(e),
+            }
+            if out.len() > limit {
+                too_large = true;
+                stop_group(pid);
+                break Ok(());
+            }
+        };
+        if read_result.is_err() {
+            stop_group(pid);
+        }
+        drop(stdout);
+        let status = child.wait()?;
+        done.store(true, Ordering::Relaxed);
+        let stderr = stderr_thread.join().unwrap_or_default();
+        let was_stopped = stopped.load(Ordering::Relaxed) || cancel.is_cancelled();
+        self.record(&args, &out, &stderr, status.code(), started, was_stopped || too_large);
+        if was_stopped {
+            return Err(Cancelled.into());
+        }
+        read_result?;
+        if too_large {
+            return Ok(None);
+        }
+        if status.success() { Ok(Some(out)) } else { Err(Self::error(&args, status.code(), &out, &stderr)) }
+    }
+
     /// Runs a long command (fetch, push, …) that reports progress on stderr.
     /// Each progress line (split at `\r` and `\n`) goes to `on_progress`.
     /// Returns stdout on success, [`Cancelled`] if `cancel` fired, or a

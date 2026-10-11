@@ -300,6 +300,8 @@ pub struct RepoTab {
     /// The rebase in progress was started by Tine (its messages apply).
     pub rebase_session: bool,
     rebase_finish_tried: Option<String>,
+    /// The session couldn't be read (reported once).
+    rebase_session_error: Option<String>,
     /// The last interactive rebase finished (it can be undone).
     pub rebase_done: Option<rebase::RebaseDone>,
     rebase_range_seq: Gen,
@@ -415,6 +417,7 @@ impl RepoTab {
             rebase_stop: None,
             rebase_session: false,
             rebase_finish_tried: None,
+            rebase_session_error: None,
             rebase_done: None,
             rebase_range_seq: 0,
             rebase_range_cancel: None,
@@ -481,6 +484,7 @@ impl RepoTab {
     pub fn refresh(&mut self) {
         // Tidying up after an interactive rebase is tried again.
         self.rebase_finish_tried = None;
+        self.rebase_session_error = None;
         self.request_refs(false);
         self.refresh_status();
         self.reload_history();
@@ -1472,11 +1476,7 @@ impl Drop for RepoTab {
             carried = carried.with(FollowUp::AutoStash(tine_core::autostash::AutoStash::Kept(oid)));
         }
         if let Some(sc) = self.stash_conflict.take() {
-            carried = carried.with(FollowUp::StashConflict {
-                oid: sc.oid,
-                was_clean_before: sc.was_clean_before,
-                created_untracked: sc.created_untracked,
-            });
+            carried = carried.with(FollowUp::StashConflict(sc));
         }
         if !carried.follow_ups.is_empty() {
             ops_registry::push_orphan(OrphanedResult { repo, origin, id: 0, kind: OpKind::Recovered, result: Ok(carried) });

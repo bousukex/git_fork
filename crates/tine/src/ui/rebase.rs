@@ -69,7 +69,7 @@ pub fn show(ctx: &egui::Context, d: &mut RebaseDialog, dirty: bool, busy: bool) 
         // modal sizes itself to its content.
         let below_id = egui::Id::new("interactive-rebase-below");
         let below = ui.data(|m| m.get_temp::<f32>(below_id)).unwrap_or_else(|| {
-            let lines = d.set_aside().len() + d.problems().len().min(3) + usize::from(dirty);
+            let lines = (d.set_aside().len() + d.problems().len()).min(4) + usize::from(dirty);
             60.0 + 24.0 * lines as f32
         });
         let list_h = (height - (ui.cursor().top() - top) - below).max(ROW_H * 3.0 + 8.0).round();
@@ -83,34 +83,45 @@ pub fn show(ctx: &egui::Context, d: &mut RebaseDialog, dirty: bool, busy: bool) 
         let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(right_rect).layout(egui::Layout::top_down(egui::Align::Min)));
         messages(&mut right_ui, d, list_h);
         ui.add_space(6.0);
-        // Messages written for groups the reordering broke up: kept (they
-        // apply again if the group comes back), to copy or discard.
+        let set_aside = d.set_aside();
+        let problems = d.problems();
         let mut discard = None;
-        for (anchor, message) in d.set_aside() {
-            ui.horizontal(|ui| {
-                let text = RichText::new(format!(
-                    "The combined message you wrote for {} is set aside: no group melds into it now.",
-                    anchor.short()
-                ))
-                .small()
-                .color(p.status_modified);
-                // One line (the whole of it on hover), the buttons beside it.
-                let w = (ui.available_width() - 130.0).max(60.0);
-                ui.allocate_ui(vec2(w, ui.spacing().interact_size.y), |ui| ui.add(egui::Label::new(text).truncate()));
-                if ui.small_button("Copy").on_hover_text(message.clone()).clicked() {
-                    ui.ctx().copy_text(message.clone());
+        if !set_aside.is_empty() || !problems.is_empty() {
+            // A few lines' worth (the rest scrolls): the buttons below stay
+            // on screen however many there are.
+            let max_h = (height * 0.2).clamp(44.0, 120.0);
+            let notices = egui::ScrollArea::vertical().id_salt("interactive-rebase-notices").max_height(max_h).auto_shrink([false, true]);
+            notices.show(ui, |ui| {
+                // Why it can't start, first.
+                for problem in &problems {
+                    ui.add(egui::Label::new(RichText::new(problem).small().color(p.status_deleted)).truncate());
                 }
-                if ui.small_button("Discard").clicked() {
-                    discard = Some(anchor);
+                // Messages written for groups the reordering broke up: kept
+                // (they apply again if the group comes back), to copy or
+                // discard.
+                for (anchor, message) in &set_aside {
+                    ui.horizontal(|ui| {
+                        let text = RichText::new(format!(
+                            "The combined message you wrote for {} is set aside: no group melds into it now.",
+                            anchor.short()
+                        ))
+                        .small()
+                        .color(p.status_modified);
+                        // One line (the whole of it on hover), the buttons beside it.
+                        let w = (ui.available_width() - 130.0).max(60.0);
+                        ui.allocate_ui(vec2(w, ui.spacing().interact_size.y), |ui| ui.add(egui::Label::new(text).truncate()));
+                        if ui.small_button("Copy").on_hover_text(message.clone()).clicked() {
+                            ui.ctx().copy_text(message.clone());
+                        }
+                        if ui.small_button("Discard").clicked() {
+                            discard = Some(*anchor);
+                        }
+                    });
                 }
             });
         }
         if let Some(a) = discard {
             d.discard_set_aside(a);
-        }
-        let problems = d.problems();
-        for problem in problems.iter().take(3) {
-            ui.add(egui::Label::new(RichText::new(problem).small().color(p.status_deleted)).truncate());
         }
         if dirty {
             ui.checkbox(&mut d.stash_first, "Stash my local changes first and re-apply them afterwards");

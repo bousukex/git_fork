@@ -220,7 +220,6 @@ impl RepoTab {
     /// it) and notices that a session is over (also outside Tine, or left
     /// behind by a rebase someone else started), tidying up after it.
     pub(super) fn check_rebase_session(&mut self) {
-        let session = interactive::read_session(&self.paths.git_dir).ok().flatten();
         let rebasing = self.status.state == RepoState::Rebasing;
         self.rebase_stop =
             (rebasing && self.status.conflicted.is_empty()).then(|| tine_core::integrate::stop_reason(&self.paths.git_dir));
@@ -231,7 +230,26 @@ impl RepoTab {
             self.last_edit_stop = stop;
             self.cancel_amend();
         }
-        let owned = session.as_ref().is_some_and(interactive::owns_current_rebase);
+        // A session (or its marker) that can't be read is reported — not
+        // taken for none, or for someone else's, and nothing is tidied away
+        // (F5 tries again).
+        let read = interactive::read_session(&self.paths.git_dir).and_then(|s| match s {
+            Some(s) => interactive::owns_current_rebase(&s).map(|owned| Some((s, owned))),
+            None => Ok(None),
+        });
+        let (session, owned) = match read {
+            Ok(Some((s, owned))) => (Some(s), owned),
+            Ok(None) => (None, false),
+            Err(e) => {
+                let e = format!("{e:#}");
+                if self.rebase_session_error.as_deref() != Some(e.as_str()) {
+                    self.error(format!("Can't read the interactive rebase Tine started (F5 tries again): {e}"));
+                    self.rebase_session_error = Some(e);
+                }
+                return;
+            }
+        };
+        self.rebase_session_error = None;
         self.rebase_session = rebasing && owned;
         if let Some(stash) = session.as_ref().and_then(|s| s.autostash).filter(|_| owned) {
             // Also after a restart while stopped.
@@ -247,7 +265,9 @@ impl RepoTab {
         let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::FinishRebase, move |git| {
             let mut out = OpOutcome::default();
-            if let Some(e) = interactive::finish_session(git, &git_dir)? {
+            // Ended outside Tine's commands: where it ended comes from the
+            // branch's reflog.
+            if let Some(e) = interactive::finish_session(git, &git_dir, false)? {
                 out = out.with(FollowUp::RebaseEnded(Box::new(e)));
             }
             Ok(out)
@@ -255,9 +275,7 @@ impl RepoTab {
     }
 
     pub(super) fn rebase_ended(&mut self, ended: Ended) {
-        let session = match &ended {
-            Ended::Rebased { session, .. } | Ended::Unchanged { session } | Ended::Stale { session } => session.clone(),
-        };
+        let session = ended.session().clone();
         let on = session.branch.as_deref().map(interactive::branch_name).unwrap_or("HEAD").to_owned();
         match ended {
             Ended::Rebased { session, head } => {

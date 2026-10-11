@@ -107,8 +107,14 @@ fn cont(d: &Path) -> anyhow::Result<Step> {
     sequencer::continue_op(&s, &git_dir(d), RepoState::Rebasing)
 }
 
+/// The session's end after Tine's own command ended the rebase.
 fn finish(d: &Path) -> Option<Ended> {
-    interactive::finish_session(&runner(d), &git_dir(d)).unwrap()
+    interactive::finish_session(&runner(d), &git_dir(d), true).unwrap()
+}
+
+/// The session's end noticed later (the rebase ended outside Tine).
+fn finish_outside(d: &Path) -> Option<Ended> {
+    interactive::finish_session(&runner(d), &git_dir(d), false).unwrap()
 }
 
 #[test]
@@ -414,7 +420,7 @@ fn abort_and_outside_endings_clear_the_session() {
     assert!(matches!(start(d, &r, &plan(&r, &[(2, Edit), (1, Pick)])).unwrap(), Step::Stopped(_)));
     let o = Command::new("git").current_dir(d).args(["rebase", "--continue"]).env("GIT_EDITOR", "true").output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert!(matches!(finish(d), Some(Ended::Rebased { .. })));
+    assert!(matches!(finish_outside(d), Some(Ended::Rebased { .. })), "the branch's reflog shows where it ended");
     assert!(!session(d));
 }
 
@@ -606,7 +612,7 @@ fn a_session_left_behind_isnt_used_for_someone_elses_rebase() {
     assert_eq!(status::repo_state(&git_dir(d)), RepoState::Rebasing);
     assert!(session(d));
     let s = interactive::read_session(&git_dir(d)).unwrap().unwrap();
-    assert!(!interactive::owns_current_rebase(&s));
+    assert!(!interactive::owns_current_rebase(&s).unwrap());
     // Continuing it doesn't involve Tine's editor.
     let plain = interactive::rebase_runner(&runner(d), &git_dir(d), &editor()).unwrap();
     assert!(plain.command(["version"]).get_envs().all(|(k, _)| k != "TINE_REBASE_DIR"));
@@ -627,7 +633,7 @@ fn the_end_is_judged_by_the_rebased_branch() {
     // Aborted outside, then another branch checked out.
     out(d, &["rebase", "--abort"]);
     out(d, &["checkout", "-q", "-b", "elsewhere", "HEAD~1"]);
-    assert!(matches!(finish(d), Some(Ended::Unchanged { .. })), "main is where it was");
+    assert!(matches!(finish_outside(d), Some(Ended::Unchanged { .. })), "main is where it was");
 }
 
 #[test]
@@ -732,4 +738,181 @@ fn merges_anywhere_in_the_range_are_found() {
     let Some(interactive::RangeProblem::Merges(ids)) = e.downcast_ref::<interactive::RangeProblem>() else { panic!("{e:#}") };
     assert!(ids.contains(&inner), "the merge off the first-parent line");
     assert!(ids.contains(&outer));
+}
+
+fn refusing_pre_commit(d: &Path) -> PathBuf {
+    let hook = d.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\necho 'not now' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    hook
+}
+
+#[test]
+fn a_reword_refused_after_moving_is_reworded_on_continue_once() {
+    use Action::*;
+    // c1 moved after c2: git makes c1 anew (no `amend` file this time)
+    // before a hook refuses its new message.
+    let (dir, base) = repo(2);
+    let d = dir.path();
+    let hook = refusing_pre_commit(d);
+    let r = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap();
+    let mut p = plan(&r, &[(2, Pick), (1, Reword)]);
+    p.messages.insert(MessageKey::Reword(c(&r, 1)), "c1 new".into());
+    let e = format!("{:#}", start(d, &r, &p).unwrap_err());
+    assert!(e.contains("not now"), "{e}");
+    assert!(!git_dir(d).join("rebase-merge/amend").exists());
+    assert_eq!(messages(d, base)[0], "c1\n\nbody 1", "made under the old message");
+    std::fs::remove_file(&hook).unwrap();
+    let s = interactive::rebase_runner(&runner(d), &git_dir(d), &editor()).unwrap();
+    assert!(interactive::finish_reword(&s, &git_dir(d)).unwrap());
+    assert!(!interactive::finish_reword(&s, &git_dir(d)).unwrap(), "once");
+    assert_eq!(cont(d).unwrap(), Step::Done);
+    assert_eq!(messages(d, base), ["c1 new", "c2\n\nbody 2"]);
+    assert!(clean(d));
+
+    // Amended by hand meanwhile (another message): that one stays.
+    let (dir, base) = repo(2);
+    let d = dir.path();
+    refusing_pre_commit(d);
+    let r = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap();
+    let mut p = plan(&r, &[(2, Pick), (1, Reword)]);
+    p.messages.insert(MessageKey::Reword(c(&r, 1)), "c1 new".into());
+    start(d, &r, &p).unwrap_err();
+    out(d, &["commit", "-q", "--amend", "--no-verify", "-m", "mine"]);
+    assert_eq!(cont(d).unwrap(), Step::Done);
+    assert_eq!(messages(d, base), ["mine", "c2\n\nbody 2"]);
+}
+
+#[test]
+fn a_command_git_puts_back_still_gets_its_message() {
+    use Action::*;
+    let (dir, base) = repo(2);
+    let d = dir.path();
+    let r = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap();
+    let mut p = plan(&r, &[(1, Edit), (2, Reword)]);
+    p.messages.insert(MessageKey::Reword(c(&r, 2)), "c2 new".into());
+    assert!(matches!(start(d, &r, &p).unwrap(), Step::Stopped(_)));
+    // An untracked file in the way: git puts the reword back (it stays in
+    // done as well).
+    std::fs::write(d.join("f2"), "in the way\n").unwrap();
+    let e = format!("{:#}", cont(d).unwrap_err());
+    assert!(e.contains("untracked"), "{e}");
+    let done = std::fs::read_to_string(git_dir(d).join("rebase-merge/done")).unwrap();
+    assert!(done.lines().last().unwrap().starts_with("reword"), "{done}");
+    std::fs::remove_file(d.join("f2")).unwrap();
+    assert_eq!(cont(d).unwrap(), Step::Done);
+    assert_eq!(messages(d, base), ["c2 new", "c1\n\nbody 1"]);
+}
+
+#[test]
+fn an_end_outside_tine_is_undoable_only_if_nothing_came_after() {
+    use Action::*;
+    let continue_outside = |d: &Path| {
+        let o = Command::new("git").current_dir(d).args(["rebase", "--continue"]).env("GIT_EDITOR", "true").output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    let commit_after = |d: &Path| {
+        std::fs::write(d.join("later"), "x\n").unwrap();
+        out(d, &["add", "-A"]);
+        out(d, &["commit", "-qm", "later"]);
+    };
+    // Finished on the command line, then a commit on top: where the rebase
+    // ended can't be told any more — no undo.
+    let (dir, base) = repo(2);
+    let d = dir.path();
+    let r = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap();
+    assert!(matches!(start(d, &r, &plan(&r, &[(2, Edit), (1, Pick)])).unwrap(), Step::Stopped(_)));
+    continue_outside(d);
+    commit_after(d);
+    assert!(matches!(finish_outside(d), Some(Ended::Stale { .. })));
+    assert!(!session(d));
+
+    // Aborted on the command line, then a commit: no undo either.
+    let (dir, base) = repo(2);
+    let d = dir.path();
+    let r = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap();
+    assert!(matches!(start(d, &r, &plan(&r, &[(2, Edit), (1, Pick)])).unwrap(), Step::Stopped(_)));
+    out(d, &["rebase", "--abort"]);
+    commit_after(d);
+    assert!(matches!(finish_outside(d), Some(Ended::Stale { .. })));
+
+    // Finished on the command line and nothing since: it can be undone.
+    let (dir, base) = repo(2);
+    let d = dir.path();
+    let r = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap();
+    assert!(matches!(start(d, &r, &plan(&r, &[(2, Edit), (1, Pick)])).unwrap(), Step::Stopped(_)));
+    continue_outside(d);
+    let Some(Ended::Rebased { head, .. }) = finish_outside(d) else { panic!("confirmed by the reflog") };
+    assert_eq!(head, oid(d, "HEAD"));
+}
+
+#[test]
+fn a_session_that_cant_be_read_is_kept() {
+    use Action::*;
+    let (dir, base) = repo(2);
+    let d = dir.path();
+    let r = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap();
+    assert!(matches!(start(d, &r, &plan(&r, &[(1, Edit), (2, Pick)])).unwrap(), Step::Stopped(_)));
+    // The marker can't be read: an error, not "someone else's rebase".
+    let marker = git_dir(d).join("rebase-merge/tine-session");
+    let id = std::fs::read_to_string(&marker).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    std::fs::create_dir(&marker).unwrap();
+    let s = interactive::read_session(&git_dir(d)).unwrap().unwrap();
+    assert!(interactive::owns_current_rebase(&s).is_err());
+    assert!(interactive::finish_session(&runner(d), &git_dir(d), false).is_err());
+    assert!(interactive::rebase_runner(&runner(d), &git_dir(d), &editor()).is_err());
+    assert!(session(d));
+    std::fs::remove_dir(&marker).unwrap();
+    std::fs::write(&marker, id).unwrap();
+    // A broken session file: kept as well.
+    let file = interactive::session_dir(&git_dir(d)).join("session");
+    let good = std::fs::read(&file).unwrap();
+    std::fs::write(&file, "head nonsense\n").unwrap();
+    assert!(interactive::finish_session(&runner(d), &git_dir(d), false).is_err());
+    assert!(session(d));
+    std::fs::write(&file, good).unwrap();
+    assert_eq!(cont(d).unwrap(), Step::Done);
+    assert!(matches!(finish(d), Some(Ended::Unchanged { .. })));
+}
+
+#[test]
+fn huge_messages_are_refused_without_reading_them_whole() {
+    let (dir, base) = repo(1);
+    let d = dir.path();
+    // One commit whose message alone is over the limit.
+    let big = d.join("big-message");
+    std::fs::write(&big, "x".repeat(interactive::MAX_MESSAGE_BYTES + 1024)).unwrap();
+    std::fs::write(d.join("f9"), "9\n").unwrap();
+    out(d, &["add", "f9"]);
+    out(d, &["commit", "-q", "--cleanup=verbatim", "-F", big.to_str().unwrap()]);
+    let e = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap_err();
+    assert!(matches!(e.downcast_ref::<interactive::RangeProblem>(), Some(interactive::RangeProblem::TooLarge)), "{e:#}");
+    // The read stops at the limit.
+    let cancel = CancelToken::default();
+    let head = oid(d, "HEAD").to_hex();
+    assert_eq!(runner(d).output_limited(["log", "-1", "--format=%B", &head], 1 << 20, &cancel).unwrap(), None);
+    let small = runner(d).output_limited(["log", "-1", "--format=%s", "HEAD~"], 1 << 20, &cancel).unwrap().unwrap();
+    assert_eq!(small, b"c1\n");
+}
+
+#[test]
+fn a_stash_gone_meanwhile_isnt_offered_again() {
+    use Action::*;
+    for drop_it in [false, true] {
+        let (dir, base) = repo(2);
+        let d = dir.path();
+        std::fs::write(d.join("f1"), "local\n").unwrap();
+        out(d, &["stash", "push", "-q"]);
+        let stash = oid(d, "refs/stash");
+        let r = interactive::load_range(&runner(d), Some(base), &CancelToken::default()).unwrap();
+        let p = plan(&r, &[(2, Edit), (1, Pick)]);
+        assert!(matches!(interactive::start(&runner(d), &git_dir(d), &r, &p, &editor(), Some(stash)).unwrap(), Step::Stopped(_)));
+        if drop_it {
+            out(d, &["stash", "drop", "-q"]);
+        }
+        out(d, &["rebase", "--abort"]);
+        let ended = finish_outside(d).unwrap();
+        assert_eq!(ended.session().autostash, (!drop_it).then_some(stash), "dropped: {drop_it}");
+    }
 }

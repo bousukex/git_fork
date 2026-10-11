@@ -125,10 +125,11 @@ pub fn load_range(git: &GitRunner, base: Option<Oid>, cancel: &CancelToken) -> R
         return Err(RangeProblem::Empty.into());
     }
     // Every commit of the range (not only the first-parent line).
-    let out = git.output(["log", "-z", "--reverse", "--format=%H%x1f%P%x1f%an%x1f%at%x1f%B", &spec])?;
-    if out.len() > MAX_MESSAGE_BYTES {
+    // Read up to the limit only (one huge message isn't held whole).
+    let args = ["log", "-z", "--reverse", "--format=%H%x1f%P%x1f%an%x1f%at%x1f%B", &spec];
+    let Some(out) = git.output_limited(args, MAX_MESSAGE_BYTES, cancel)? else {
         return Err(RangeProblem::TooLarge.into());
-    }
+    };
     let mut commits = Vec::with_capacity(count);
     let mut merges = Vec::new();
     for rec in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
@@ -377,6 +378,9 @@ pub struct Session {
     pub messages: Vec<MessageKey>,
     /// Local changes stashed before starting (re-applied once it ends).
     pub autostash: Option<Oid>,
+    /// The rebased branch's newest reflog entry when it started (`None`:
+    /// no reflog, or detached): the rebase's end is the entry right after.
+    pub reflog: Option<String>,
 }
 
 impl Session {
@@ -402,6 +406,9 @@ impl Session {
         if let Some(a) = self.autostash {
             s.push_str(&format!("autostash {}\n", a.to_hex()));
         }
+        if let Some(r) = &self.reflog {
+            s.push_str(&format!("reflog {r}\n"));
+        }
         for (id, a) in &self.items {
             s.push_str(&format!("item {} {}\n", a.word(), id.to_hex()));
         }
@@ -409,8 +416,8 @@ impl Session {
     }
 
     fn decode(text: &str, git_dir: &Path) -> Result<Session> {
-        let (mut id, mut head, mut branch, mut base, mut autostash, mut items, mut messages) =
-            (None, None, None, None, None, Vec::new(), Vec::new());
+        let (mut id, mut head, mut branch, mut base, mut autostash, mut reflog, mut items, mut messages) =
+            (None, None, None, None, None, None, Vec::new(), Vec::new());
         for line in text.lines() {
             let (key, value) = line.split_once(' ').unwrap_or((line, ""));
             match key {
@@ -419,6 +426,7 @@ impl Session {
                 "branch" => branch = Some(value.to_owned()),
                 "base" => base = Some(if value == "root" { None } else { Some(oid(value)?) }),
                 "autostash" => autostash = Some(oid(value)?),
+                "reflog" => reflog = Some(value.to_owned()),
                 "message" => {
                     let (kind, id) = value.split_once(' ').ok_or_else(|| anyhow!("bad session line {line:?}"))?;
                     messages.push(match kind {
@@ -443,6 +451,7 @@ impl Session {
             items,
             messages,
             autostash,
+            reflog,
         })
     }
 }
@@ -460,9 +469,21 @@ fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
 const MARKER: &str = "tine-session";
 
 /// The rebase in progress was started by `session` (not merely a session
-/// left behind by one that ended outside Tine).
-pub fn owns_current_rebase(session: &Session) -> bool {
-    std::fs::read_to_string(session.git_dir.join("rebase-merge").join(MARKER)).is_ok_and(|id| id.trim() == session.id)
+/// left behind by one that ended outside Tine). A marker that can't be
+/// read is an error, not "someone else's".
+pub fn owns_current_rebase(session: &Session) -> Result<bool> {
+    let path = session.git_dir.join("rebase-merge").join(MARKER);
+    match std::fs::read_to_string(&path) {
+        Ok(id) => Ok(id.trim() == session.id),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    }
+}
+
+/// The rebase in progress in this worktree is a session's of Tine's (`false`
+/// also when that can't be read).
+pub fn owns_rebase_in_progress(git_dir: &Path) -> bool {
+    matches!(read_session(git_dir), Ok(Some(s)) if owns_current_rebase(&s).unwrap_or(false))
 }
 
 /// The session of this worktree, if one is there.
@@ -486,24 +507,69 @@ pub fn clear_session(git_dir: &Path) -> Result<()> {
 /// How a session ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ended {
-    /// The branch (or detached HEAD) moved on from where it started: it is
-    /// at `head` now.
+    /// The branch (or detached HEAD) moved on from where it started: the
+    /// rebase left it at `head`.
     Rebased { session: Session, head: Oid },
     /// Back where it started (aborted, or nothing changed), or the branch
     /// is gone.
     Unchanged { session: Session },
-    /// Left behind: the rebase in progress isn't this session's.
+    /// Ended outside Tine, where it ended can't be told from what came
+    /// after (so nothing is offered to undo); or left behind: the rebase in
+    /// progress isn't this session's.
     Stale { session: Session },
+}
+
+impl Ended {
+    pub fn session(&self) -> &Session {
+        match self {
+            Ended::Rebased { session, .. } | Ended::Unchanged { session } | Ended::Stale { session } => session,
+        }
+    }
+
+    pub fn session_mut(&mut self) -> &mut Session {
+        match self {
+            Ended::Rebased { session, .. } | Ended::Unchanged { session } | Ended::Stale { session } => session,
+        }
+    }
+}
+
+/// The newest `n` entries of `refname`'s reflog, newest first, as (the
+/// entry, its new value, its message). Empty when there is none.
+fn reflog(git: &GitRunner, refname: &str, n: usize) -> Result<Vec<(String, Oid, String)>> {
+    let out = git.output(["log", "-g", &format!("-n{n}"), "--date=raw", "--format=%H %gd%x00%gs", refname, "--"])?;
+    let mut entries = Vec::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        let (entry, message) = line.split_once('\0').ok_or_else(|| anyhow!("unexpected reflog line {line:?}"))?;
+        let new = oid(entry.split(' ').next().unwrap_or_default())?;
+        entries.push((entry.to_owned(), new, message.to_owned()));
+    }
+    Ok(entries)
+}
+
+/// The branch's reflog shows the session's rebase ending at `tip`, and
+/// nothing since: git's "rebase (finish)" entry right after the one it
+/// started at.
+fn ended_at(git: &GitRunner, session: &Session, tip: Oid) -> bool {
+    let (Some(branch), Some(start)) = (&session.branch, &session.reflog) else { return false };
+    match reflog(git, branch, 2).as_deref() {
+        Ok([(_, new, message), (before, ..)]) => {
+            *new == tip && before == start && message.starts_with("rebase") && message.contains("(finish)")
+        }
+        _ => false,
+    }
 }
 
 /// If this worktree's session is over — its rebase ended (also outside
 /// Tine), or the rebase in progress is someone else's — removes it and
 /// says how it ended. Judged by the rebased branch's tip (not wherever
-/// HEAD is now). Anything that can't be read keeps the session (an error).
-pub fn finish_session(git: &GitRunner, git_dir: &Path) -> Result<Option<Ended>> {
-    let Some(session) = read_session(git_dir)? else { return Ok(None) };
+/// HEAD is now). `by_tine`: Tine's own command just ended it (the tip is
+/// where the rebase left it); otherwise that is taken only from the
+/// branch's reflog. Anything that can't be read keeps the session (an
+/// error).
+pub fn finish_session(git: &GitRunner, git_dir: &Path, by_tine: bool) -> Result<Option<Ended>> {
+    let Some(mut session) = read_session(git_dir)? else { return Ok(None) };
     if repo_state(git_dir) == RepoState::Rebasing {
-        if owns_current_rebase(&session) {
+        if owns_current_rebase(&session)? {
             return Ok(None);
         }
         clear_session(git_dir)?;
@@ -513,11 +579,19 @@ pub fn finish_session(git: &GitRunner, git_dir: &Path) -> Result<Option<Ended>> 
     // Exit code 1: the branch is gone.
     let tip = String::from_utf8_lossy(&git.output_with(["rev-parse", "-q", "--verify", &rev], &[1])?).trim().to_owned();
     let tip = if tip.is_empty() { None } else { Some(oid(&tip)?) };
-    clear_session(git_dir)?;
-    Ok(Some(match tip {
-        Some(head) if head != session.head => Ended::Rebased { session, head },
+    // A stash applied and dropped meanwhile isn't offered again.
+    if let Some(stash) = session.autostash
+        && crate::stash::index_of(git, stash)?.is_none()
+    {
+        session.autostash = None;
+    }
+    let ended = match tip {
+        Some(head) if head != session.head && (by_tine || ended_at(git, &session, head)) => Ended::Rebased { session, head },
+        Some(head) if head != session.head => Ended::Stale { session },
         _ => Ended::Unchanged { session },
-    }))
+    };
+    clear_session(git_dir)?;
+    Ok(Some(ended))
 }
 
 // --- Running --------------------------------------------------------------
@@ -567,7 +641,7 @@ fn with_editor(git: &GitRunner, session: &Session, editor: &Editor) -> GitRunner
 /// `git` as is.
 pub fn rebase_runner(git: &GitRunner, git_dir: &Path, editor: &Editor) -> Result<GitRunner> {
     match read_session(git_dir)? {
-        Some(s) if owns_current_rebase(&s) => Ok(with_editor(git, &s, editor)),
+        Some(s) if owns_current_rebase(&s)? => Ok(with_editor(git, &s, editor)),
         _ => Ok(git.clone()),
     }
 }
@@ -597,6 +671,9 @@ pub fn start(git: &GitRunner, git_dir: &Path, range: &Range, plan: &Plan, editor
     if let Some(p) = problems.first() {
         bail!("{p}");
     }
+    // Where the branch's reflog is now: its next entry is this rebase's end
+    // (none readable: an end outside Tine can't be undone, nothing worse).
+    let reflog = range.branch.as_deref().and_then(|b| reflog(git, b, 1).ok()?.into_iter().next()).map(|(entry, ..)| entry);
     // Nothing in progress: a session left behind is stale.
     clear_session(git_dir)?;
     let dir = session_dir(git_dir);
@@ -610,6 +687,7 @@ pub fn start(git: &GitRunner, git_dir: &Path, range: &Range, plan: &Plan, editor
         items: plan.items.clone(),
         messages: plan.needed_messages(),
         autostash,
+        reflog,
     };
     std::fs::write(dir.join("todo"), plan.todo(range))?;
     for key in &session.messages {
@@ -674,6 +752,13 @@ struct Command {
     id: String,
 }
 
+impl Command {
+    /// The same command (ids abbreviated alike or not).
+    fn same(&self, other: &Command) -> bool {
+        self.action == other.action && self.flag == other.flag && (self.id.starts_with(&other.id) || other.id.starts_with(&self.id))
+    }
+}
+
 fn commands_in(text: &str) -> Option<Vec<Command>> {
     let mut out = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
@@ -703,19 +788,28 @@ fn plan_position(session: &Session) -> Result<Option<(usize, Command)>> {
     };
     let (Some(done), Some(todo)) = (commands_in(&read("done")?), commands_in(&read("git-rebase-todo")?)) else { return Ok(None) };
     let kept = |c: &&Command| c.action != Action::Drop;
-    let git_order: Vec<&Command> = done.iter().filter(kept).chain(todo.iter().filter(kept)).collect();
+    let todo: Vec<&Command> = todo.iter().filter(kept).collect();
+    let tried: Vec<&Command> = done.iter().filter(kept).collect();
+    // A command git couldn't start (e.g. an untracked file in its way) goes
+    // back to the front of the todo and stays in done as well: such an
+    // attempt — followed by the same command — isn't one of its own.
+    let done: Vec<&Command> = tried
+        .iter()
+        .enumerate()
+        .filter(|&(i, c)| tried.get(i + 1).or(todo.first()).is_none_or(|next| !next.same(c)))
+        .map(|(_, c)| *c)
+        .collect();
     let plan: Vec<&(Oid, Action)> = session.items.iter().filter(|(_, a)| *a != Action::Drop).collect();
-    if git_order.len() != plan.len() {
+    if done.len() + todo.len() != plan.len() {
         return Ok(None);
     }
-    for (c, (id, a)) in git_order.iter().zip(&plan) {
+    for (c, (id, a)) in done.iter().chain(&todo).zip(&plan) {
         if c.flag.is_some() || c.action != *a || c.id.len() < 4 || !id.to_hex().starts_with(&c.id) {
             return Ok(None);
         }
     }
-    let Some(last) = done.iter().rfind(kept) else { return Ok(None) };
-    let at = done.iter().filter(kept).count() - 1;
-    Ok(Some((at, last.clone())))
+    let Some(last) = done.last() else { return Ok(None) };
+    Ok(Some((done.len() - 1, (*last).clone())))
 }
 
 /// The message file for the command git is at, if the plan has one for it
@@ -755,41 +849,51 @@ pub fn message_editor(file: &Path, dir: &Path, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The commit of the `reword` git is at, if the plan has a message for it.
+fn planned_reword(session: &Session) -> Result<Option<Oid>> {
+    let Some((at, cmd)) = plan_position(session)? else { return Ok(None) };
+    if cmd.action != Action::Reword || planned_message(session, &session_dir(&session.git_dir))?.is_none() {
+        return Ok(None);
+    }
+    let kept: Vec<Oid> = session.items.iter().filter(|(_, a)| *a != Action::Drop).map(|(id, _)| *id).collect();
+    Ok(kept.get(at).copied())
+}
+
 /// For keeping a commit that became empty at a `reword`: the message the
 /// plan has for it (a file to commit with), if Tine started this rebase.
 pub fn empty_reword_message(git_dir: &Path) -> Result<Option<PathBuf>> {
     let Some(session) = read_session(git_dir)? else { return Ok(None) };
-    if !owns_current_rebase(&session) {
+    if !owns_current_rebase(&session)? {
         return Ok(None);
     }
-    let Some((_, cmd)) = plan_position(&session)? else { return Ok(None) };
-    if cmd.action != Action::Reword || planned_message(&session, &session_dir(git_dir))?.is_none() {
-        return Ok(None);
-    }
-    let id = session.items.iter().map(|(i, _)| *i).find(|i| i.to_hex().starts_with(&cmd.id)).ok_or_else(|| anyhow!("unknown commit"))?;
-    Ok(Some(session_dir(git_dir).join("msg").join(MessageKey::Reword(id).file_name())))
+    Ok(planned_reword(&session)?.map(|id| session_dir(git_dir).join("msg").join(MessageKey::Reword(id).file_name())))
 }
 
 /// Before continuing: a `reword` that git committed under the old message
 /// but couldn't reword (a hook refused) is reworded now. git stops there and
 /// leaves the rewording to whoever continues (`rebase --continue` alone
-/// keeps the old message). Done only if Tine started this rebase, the plan
-/// has a message for the commit and HEAD is still the one git made;
-/// `git` is the rebase's runner (Tine as the editor, so the message goes
-/// through git's cleanup and hooks as it would have). `Ok(false)`: nothing
-/// to do.
+/// keeps the old message) — with an `amend` file when the commit stayed
+/// the same, without one when it was made anew. So it is recognised by
+/// HEAD: git made it with the commit's author, date and message (not so
+/// the commit before, when git stopped before making one, nor one amended
+/// with another message since). Done only if Tine started this rebase and
+/// the plan has a message for the commit; `git` is the rebase's runner
+/// (Tine as the editor, so the message goes through git's cleanup and hooks
+/// as it would have). `Ok(false)`: nothing to do.
 pub fn finish_reword(git: &GitRunner, git_dir: &Path) -> Result<bool> {
     let Some(session) = read_session(git_dir)? else { return Ok(false) };
-    if !owns_current_rebase(&session) {
+    if !owns_current_rebase(&session)? {
         return Ok(false);
     }
-    let Some((_, cmd)) = plan_position(&session)? else { return Ok(false) };
-    if cmd.action != Action::Reword || planned_message(&session, &session_dir(git_dir))?.is_none() {
+    let Some(id) = planned_reword(&session)? else { return Ok(false) };
+    if has_conflicts(git)? {
         return Ok(false);
     }
-    let made = std::fs::read_to_string(git_dir.join("rebase-merge/amend")).unwrap_or_default();
-    let (head, _) = head_now(git)?;
-    if Oid::from_hex(made.trim().as_bytes()) != Some(head) {
+    let info = |rev: &str| -> Result<String> {
+        let out = git.output(["log", "-1", "--date=raw", "--format=%an%x00%ae%x00%ad%x00%B", rev, "--"])?;
+        Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
+    };
+    if info("HEAD")? != info(&id.to_hex())? {
         return Ok(false);
     }
     git.output(["commit", "--amend", "--allow-empty"])?;
@@ -918,6 +1022,7 @@ mod tests {
             items: p.items.clone(),
             messages: vec![MessageKey::Reword(id(1)), MessageKey::Group(id(2))],
             autostash: Some(id(7)),
+            reflog: Some(format!("{} refs/heads/feature/x y@{{1800000000 +0900}}", id(8).to_hex())),
         };
         assert_eq!(Session::decode(&s.encode(), Path::new("/g")).unwrap(), s);
     }
@@ -937,6 +1042,7 @@ mod tests {
             items: vec![(id(1), Pick), (id(2), Drop), (id(3), Squash), (id(4), Reword)],
             messages: vec![],
             autostash: None,
+            reflog: None,
         };
         let write = |done: &str, todo: &str| {
             std::fs::write(rm.join("done"), done).unwrap();
@@ -948,8 +1054,16 @@ mod tests {
         assert_eq!(plan_position(&s).unwrap().map(|(at, c)| (at, c.action)), Some((1, Squash)));
         write(&format!("pick {}\ndrop {}\nsquash {}\n", h(1), h(2), h(3)), &format!("reword {}\n", h(4)));
         assert_eq!(plan_position(&s).unwrap().map(|(at, _)| at), Some(1));
-        // Edited outside Tine: a flag, another order, an exec, a missing line.
+        // Put back by git (it couldn't start it): in done and in the todo;
+        // then tried again (twice in done).
+        write(&format!("pick {}\nsquash {}\n", h(1), h(3)), &format!("squash {}\nreword {}\n", h(3), h(4)));
+        assert_eq!(plan_position(&s).unwrap().map(|(at, c)| (at, c.action)), Some((0, Pick)));
+        write(&format!("pick {}\nsquash {}\nsquash {}\n", h(1), &h(3)[..7], h(3)), &format!("reword {}\n", h(4)));
+        assert_eq!(plan_position(&s).unwrap().map(|(at, c)| (at, c.action)), Some((1, Squash)));
+        // Edited outside Tine: a flag, another order, an exec, a missing
+        // line, a command added again later.
         for (done, todo) in [
+            (format!("pick {}\nsquash {}\npick {}\n", h(1), h(3), h(1)), format!("reword {}\n", h(4))),
             (format!("pick {}\nfixup -c {}\n", h(1), h(3)), format!("reword {}\n", h(4))),
             (format!("pick {}\nreword {}\n", h(1), h(4)), format!("squash {}\n", h(3))),
             (format!("pick {}\nexec make\nsquash {}\n", h(1), h(3)), format!("reword {}\n", h(4))),

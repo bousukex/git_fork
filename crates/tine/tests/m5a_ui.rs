@@ -458,9 +458,15 @@ fn a_late_range_replaces_no_other_dialog() {
     let d = repo.path();
     let (mut tab, gates) = gated_tab(d, Gates { rebase_range: Gate::closed(), ..Default::default() });
     assert!(poll_until(&mut tab, idle));
+    let running = tab.worker_mut().running_jobs();
     let arrive = |tab: &mut RepoTab, gates: &common::gated::Gates, i: usize| {
         gates.rebase_range.release(i);
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Over once its result (if it sends one) is on its way to the tab.
+        let start = std::time::Instant::now();
+        while running.count("rebase-range") > 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         tab.poll();
     };
     // Something else came up meanwhile and is showing: a dialog…
@@ -557,4 +563,167 @@ fn a_rebase_finished_on_the_command_line_is_noticed_on_refresh() {
     assert!(poll_until(&mut tab, |t| idle(t) && t.rebase_done.is_some()));
     assert!(!tine_core::interactive::session_dir(&tab.paths.git_dir).exists());
     assert_eq!(subjects(d), ["c2", "c1", "base"]);
+}
+
+#[test]
+fn stashed_changes_wait_until_really_applied() {
+    use tine_core::interactive::Action;
+    tine::askpass::set_program(env!("CARGO_BIN_EXE_tine"));
+    // Done at once: the changes are back and nothing is left waiting.
+    let repo = repo();
+    let d = repo.path();
+    std::fs::write(d.join("f1"), "local change\n").unwrap();
+    let mut tab = open_tab(d);
+    rebase_with(&mut tab, d, |dlg| dlg.set_action(2, Action::Squash));
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.state == RepoState::Clean && t.rebase_done.is_some()));
+    assert_eq!(tab.pending_autostash, None);
+    assert_eq!(std::fs::read_to_string(d.join("f1")).unwrap(), "local change\n");
+    assert_eq!(out(d, &["stash", "list"]), "");
+
+    // Done at once, but re-applying conflicts (the file is gone): the
+    // stash is being applied, not waiting as well.
+    let repo = self::repo();
+    let d = repo.path();
+    std::fs::write(d.join("f2"), "local change\n").unwrap();
+    let mut tab = open_tab(d);
+    rebase_with(&mut tab, d, |dlg| dlg.set_action(1, Action::Drop));
+    assert!(poll_until(&mut tab, |t| idle(t) && t.stash_conflict.is_some() && t.rebase_done.is_some()));
+    assert_eq!(tab.pending_autostash, None);
+    assert!(tab.stash_conflict.as_ref().unwrap().autostash);
+
+    // Stopped: the changes wait in their stash. Applying them conflicts:
+    // no longer waiting; undoing that apply makes them wait again.
+    let repo = self::repo();
+    let d = repo.path();
+    std::fs::write(d.join("f1"), "local change\n").unwrap();
+    let mut tab = open_tab(d);
+    rebase_with(&mut tab, d, |dlg| {
+        dlg.set_action(1, Action::Edit);
+        dlg.set_action(2, Action::Drop);
+    });
+    assert!(poll_until(&mut tab, |t| idle(t) && t.edit_stop().is_some()));
+    let stash = tab.pending_autostash.expect("kept while stopped");
+    tab.continue_op();
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.state == RepoState::Clean && t.rebase_done.is_some()));
+    assert_eq!(tab.pending_autostash, Some(stash));
+    std::fs::write(d.join("f1"), "other\n").unwrap();
+    out(d, &["commit", "-qam", "other"]);
+    tab.refresh();
+    assert!(poll_until(&mut tab, |t| idle(t) && !t.status.has_tracked_changes()));
+    tab.apply_pending_autostash();
+    assert!(poll_until(&mut tab, |t| idle(t) && t.stash_conflict.is_some()));
+    assert_eq!(tab.pending_autostash, None, "applied (with conflicts)");
+    tab.undo_stash_apply();
+    assert!(poll_until(&mut tab, |t| idle(t) && t.stash_conflict.is_none()));
+    assert_eq!(tab.pending_autostash, Some(stash), "waiting again");
+    tab.apply_pending_autostash();
+    assert!(poll_until(&mut tab, |t| idle(t) && t.stash_conflict.is_some()));
+    std::fs::write(d.join("f1"), "resolved\n").unwrap();
+    out(d, &["add", "f1"]);
+    tab.refresh();
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.conflicted.is_empty()));
+    tab.finish_stash_conflict(true);
+    assert!(poll_until(&mut tab, |t| idle(t) && t.stash_conflict.is_none()));
+    assert_eq!(tab.pending_autostash, None);
+    assert_eq!(out(d, &["stash", "list"]), "");
+}
+
+#[test]
+fn a_rebase_finished_outside_with_commits_since_offers_no_undo() {
+    tine::askpass::set_program(env!("CARGO_BIN_EXE_tine"));
+    let repo = repo();
+    let d = repo.path();
+    let mut tab = open_tab(d);
+    rebase_with(&mut tab, d, |dlg| {
+        dlg.set_action(1, tine_core::interactive::Action::Edit);
+        dlg.set_action(2, tine_core::interactive::Action::Drop);
+    });
+    assert!(poll_until(&mut tab, |t| idle(t) && t.edit_stop().is_some()));
+    // Finished on the command line, then a commit there before Tine looks.
+    let o = Command::new("git").current_dir(d).args(["rebase", "--continue"]).env("GIT_EDITOR", "true").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("later"), "x\n").unwrap();
+    out(d, &["add", "-A"]);
+    out(d, &["commit", "-qm", "later"]);
+    tab.refresh();
+    let session = tine_core::interactive::session_dir(&tab.paths.git_dir);
+    assert!(poll_until(&mut tab, |t| idle(t) && !session.exists()));
+    assert!(tab.rebase_done.is_none() && !tab.can_undo_rebase(), "\"later\" isn't undone with it");
+    assert!(tab.activity.iter().any(|a| a.contains("ended elsewhere")), "{:?}", tab.activity);
+}
+
+#[test]
+fn a_session_that_cant_be_read_is_reported_and_kept() {
+    tine::askpass::set_program(env!("CARGO_BIN_EXE_tine"));
+    let repo = repo();
+    let d = repo.path();
+    let mut tab = open_tab(d);
+    rebase_with(&mut tab, d, |dlg| {
+        dlg.set_action(1, tine_core::interactive::Action::Edit);
+        dlg.set_action(2, tine_core::interactive::Action::Drop);
+    });
+    assert!(poll_until(&mut tab, |t| idle(t) && t.edit_stop().is_some() && t.rebase_session));
+    let file = tine_core::interactive::session_dir(&tab.paths.git_dir).join("session");
+    let good = std::fs::read(&file).unwrap();
+    std::fs::write(&file, "head nonsense\n").unwrap();
+    tab.refresh();
+    let reported = |t: &RepoTab| t.errors.iter().filter(|e| e.contains("Can't read the interactive rebase")).count();
+    assert!(poll_until(&mut tab, |t| idle(t) && reported(t) == 1), "{:?}", tab.errors);
+    // Reported once (not at every status refresh); nothing tidied away.
+    std::fs::write(d.join("noticed"), "x\n").unwrap();
+    tab.refresh_status();
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.unstaged.iter().any(|f| f.path == "noticed")));
+    assert_eq!(reported(&tab), 1);
+    assert!(file.exists());
+    assert_eq!(tab.status.state, RepoState::Rebasing);
+    std::fs::write(&file, good).unwrap();
+    tab.refresh();
+    assert!(poll_until(&mut tab, |t| idle(t) && t.rebase_session));
+    tab.continue_op();
+    assert!(poll_until(&mut tab, |t| idle(t) && t.status.state == RepoState::Clean && t.rebase_done.is_some()));
+    assert_eq!(subjects(d), ["c2", "c1", "base"]);
+}
+
+#[test]
+fn the_buttons_stay_on_a_small_screen_whatever_is_listed() {
+    use tine_core::interactive::Action;
+    // Forty commits after "base".
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut t = 1_800_000_000;
+    git(d, &["init", "-q", "-b", "main"], &mut t);
+    git(d, &["config", "user.name", "T"], &mut t);
+    git(d, &["config", "user.email", "t@example.com"], &mut t);
+    for i in 0..=40 {
+        std::fs::write(d.join(format!("f{i}")), format!("{i}\n")).unwrap();
+        git(d, &["add", "-A"], &mut t);
+        git(d, &["commit", "-qm", &if i == 0 { "base".to_owned() } else { format!("c{i}") }], &mut t);
+    }
+    tine::askpass::set_program(env!("CARGO_BIN_EXE_tine"));
+    let paths = vec![d.to_path_buf()];
+    let mut h = Harness::builder().with_size([720.0, 480.0]).build_eframe(move |cc| TineApp::new(cc, paths));
+    settle(&mut h);
+    h.state_mut().active_tab_mut().unwrap().open_interactive_rebase(Some(oid(d, "HEAD~40")));
+    settle(&mut h);
+    if let Some(Dialog::InteractiveRebase(dlg)) = &mut h.state_mut().active_tab_mut().unwrap().dialog {
+        // Twenty combined messages written, then their groups broken up
+        // (set aside), and a plan that can't run.
+        for anchor in (0..40).step_by(2) {
+            dlg.set_action(anchor + 1, Action::Squash);
+            let id = dlg.plan.items[anchor].0;
+            dlg.set_group_message(id, format!("together {anchor}"));
+            dlg.set_action(anchor + 1, Action::Pick);
+        }
+        dlg.set_action(0, Action::Fixup);
+        assert_eq!(dlg.set_aside().len(), 20);
+        assert!(!dlg.problems().is_empty());
+    } else {
+        panic!("the dialog is open");
+    }
+    settle(&mut h);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+    for label in ["Interactive Rebase", "Reset", "Cancel", "Start Rebase"] {
+        let r = h.get_by_label(label).rect();
+        assert!(screen.contains_rect(r), "{label} at {r:?}");
+    }
 }

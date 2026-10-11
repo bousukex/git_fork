@@ -662,12 +662,15 @@ fn interactive_rebase_dialog_small() {
             settle(h);
             if let Some(tine::repo::dialog::Dialog::InteractiveRebase(d)) = &mut h.state_mut().active_tab_mut().unwrap().dialog {
                 use tine_core::interactive::Action;
-                // A combined message written, then the group broken up: set
-                // aside. The oldest squashed into nothing: can't run.
-                d.set_action(2, Action::Squash);
-                let anchor = d.plan.items[1].0;
-                d.set_group_message(anchor, "設定の読み込みと typo の修正".into());
-                d.set_action(2, Action::Pick);
+                // Combined messages written, then their groups broken up:
+                // set aside (more than fit: they scroll). The oldest
+                // squashed into nothing: can't run.
+                for anchor in [0, 1, 2, 3] {
+                    d.set_action(anchor + 1, Action::Squash);
+                    let id = d.plan.items[anchor].0;
+                    d.set_group_message(id, "設定の読み込みと typo の修正".into());
+                    d.set_action(anchor + 1, Action::Pick);
+                }
                 d.set_action(0, Action::Squash);
                 d.selected = Some(4);
             }

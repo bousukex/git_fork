@@ -59,11 +59,14 @@ pub enum FollowUp {
     /// Where auto-stashed local changes ended up.
     AutoStash(tine_core::autostash::AutoStash),
     /// Applying a stash conflicted; the stash was kept.
-    StashConflict { oid: tine_core::model::Oid, was_clean_before: bool, created_untracked: Vec<bstr::BString> },
+    StashConflict(crate::repo::StashConflict),
     /// A stash conflict was finished or undone.
     ClearStashConflict,
     /// The auto-stashed changes were applied.
     ClearPendingAutostash(tine_core::model::Oid),
+    /// The auto-stashed changes are back to waiting in their stash (their
+    /// apply was undone).
+    PendingAutostash(tine_core::model::Oid),
     /// Resolved conflicts of unknown origin were finished.
     ClearGenericConflict,
     /// An interactive rebase stopped at an `edit` (show the commit box).

@@ -44,6 +44,9 @@ pub struct StashConflict {
     pub was_clean_before: bool,
     /// Untracked files the apply created (the only ones undo removes).
     pub created_untracked: Vec<BString>,
+    /// The stash holds local changes set aside for an operation: undoing
+    /// the apply leaves them waiting to be applied again.
+    pub autostash: bool,
 }
 
 /// Turns a step result into an outcome; conflicts and empty steps become
@@ -72,11 +75,33 @@ fn rebase_runner(git: &GitRunner, git_dir: &std::path::Path, state: RepoState) -
     tine_core::interactive::rebase_runner(git, git_dir, &editor)
 }
 
+/// How a command that may end an interactive rebase relates to it.
+#[derive(Clone, Copy)]
+struct RebaseEnd {
+    /// The rebase was Tine's own when the command ran (so the branch is
+    /// where the command left it).
+    by_tine: bool,
+    /// The command already dealt with the stash taken for the rebase.
+    stash_handled: bool,
+}
+
+impl RebaseEnd {
+    /// A command continuing (or ending) the rebase in progress.
+    fn of_rebase_in_progress(git_dir: &std::path::Path) -> Self {
+        RebaseEnd { by_tine: tine_core::interactive::owns_rebase_in_progress(git_dir), stash_handled: false }
+    }
+}
+
 /// Adds the end of an interactive rebase (if it just ended) to `out`.
-fn with_rebase_end(git: &GitRunner, git_dir: &std::path::Path, out: OpOutcome) -> OpOutcome {
+fn with_rebase_end(git: &GitRunner, git_dir: &std::path::Path, out: OpOutcome, how: RebaseEnd) -> OpOutcome {
     // Even after a cancel: it only reads where the branch is and tidies up.
-    match tine_core::interactive::finish_session(&git.uncancellable(), git_dir) {
-        Ok(Some(e)) => out.with(FollowUp::RebaseEnded(Box::new(e))),
+    match tine_core::interactive::finish_session(&git.uncancellable(), git_dir, how.by_tine) {
+        Ok(Some(mut e)) => {
+            if how.stash_handled {
+                e.session_mut().autostash = None;
+            }
+            out.with(FollowUp::RebaseEnded(Box::new(e)))
+        }
         Ok(None) => out,
         // Kept for another try (status refreshes, F5).
         Err(e) => out.with(FollowUp::RebaseEndFailed(format!("{e:#}"))),
@@ -461,11 +486,14 @@ impl RepoTab {
                     }
                 })
             };
+            // Only Tine's own interactive rebase ends a session here.
+            let by_tine = matches!(action, Integration::InteractiveRebase { .. });
             if !stash_first {
-                return run(None).map(|out| with_rebase_end(git, &git_dir, out));
+                return run(None).map(|out| with_rebase_end(git, &git_dir, out, RebaseEnd { by_tine, stash_handled: false }));
             }
             let (result, report) = autostash::run_with_stash(git, &git_dir, &action.describe(), false, run);
-            let result = result.map(|out| with_rebase_end(git, &git_dir, out));
+            // The stash is re-applied (or kept, as reported) by now.
+            let result = result.map(|out| with_rebase_end(git, &git_dir, out, RebaseEnd { by_tine, stash_handled: true }));
             match result {
                 Ok(out) => Ok(if report.stash().is_some() { out.with(FollowUp::AutoStash(report)) } else { out }),
                 Err(e) => match report.describe() {
@@ -560,13 +588,20 @@ impl RepoTab {
             integrate::ensure_ready(git, &git_dir, true)?;
             let applied = if pop { stash::pop(git, oid)? } else { stash::apply(git, oid)? };
             if applied.conflicts {
-                return Ok(OpOutcome::new(format!("Applying stash {} conflicted", oid.short()))
-                    .moving_refs()
-                    .with(FollowUp::StashConflict {
+                // Applied (with conflicts): no longer waiting — unless the
+                // apply is undone.
+                let mut out = OpOutcome::new(format!("Applying stash {} conflicted", oid.short())).moving_refs().with(
+                    FollowUp::StashConflict(StashConflict {
                         oid,
                         was_clean_before: applied.was_clean_before,
                         created_untracked: applied.created_untracked,
-                    }));
+                        autostash: pending,
+                    }),
+                );
+                if pending {
+                    out = out.with(FollowUp::ClearPendingAutostash(oid));
+                }
+                return Ok(out);
             }
             let verb = if pop && applied.complete() { "Popped" } else { "Applied" };
             let note = if applied.index_restored {
@@ -652,8 +687,10 @@ impl RepoTab {
         let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::UndoStashApply, move |git| {
             stash::undo_apply(git, &git_dir, &sc.created_untracked)?;
-            Ok(OpOutcome::new(format!("Undid applying stash {} (the stash is kept)", sc.oid.short()))
-                .with(FollowUp::ClearStashConflict))
+            let out = OpOutcome::new(format!("Undid applying stash {} (the stash is kept)", sc.oid.short()))
+                .with(FollowUp::ClearStashConflict);
+            // Changes set aside for an operation wait in their stash again.
+            Ok(if sc.autostash { out.with(FollowUp::PendingAutostash(sc.oid)) } else { out })
         });
     }
 
@@ -701,12 +738,13 @@ impl RepoTab {
         }
         let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::Continue, move |git| {
+            let how = RebaseEnd::of_rebase_in_progress(&git_dir);
             let runner = rebase_runner(git, &git_dir, state)?;
             if state == RepoState::Rebasing {
                 tine_core::interactive::finish_reword(&runner, &git_dir)?;
             }
             let step = sequencer::continue_op(&runner, &git_dir, state)?;
-            Ok(with_rebase_end(git, &git_dir, step_outcome(step, format!("{state:?} continued"), "Continue", state)))
+            Ok(with_rebase_end(git, &git_dir, step_outcome(step, format!("{state:?} continued"), "Continue", state), how))
         });
     }
 
@@ -722,8 +760,9 @@ impl RepoTab {
         }
         let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::Abort, move |git| {
+            let how = RebaseEnd::of_rebase_in_progress(&git_dir);
             sequencer::abort(git, state)?;
-            Ok(with_rebase_end(git, &git_dir, OpOutcome::new(format!("Aborted {state:?}")).moving_refs()))
+            Ok(with_rebase_end(git, &git_dir, OpOutcome::new(format!("Aborted {state:?}")).moving_refs(), how))
         });
     }
 
@@ -736,9 +775,10 @@ impl RepoTab {
         }
         let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::Skip, move |git| {
+            let how = RebaseEnd::of_rebase_in_progress(&git_dir);
             let runner = rebase_runner(git, &git_dir, state)?;
             let step = sequencer::skip(&runner, &git_dir, state)?;
-            Ok(with_rebase_end(git, &git_dir, step_outcome(step, "Skipped the current commit".into(), "Skip", state)))
+            Ok(with_rebase_end(git, &git_dir, step_outcome(step, "Skipped the current commit".into(), "Skip", state), how))
         });
     }
 
@@ -806,6 +846,7 @@ impl RepoTab {
                             oid: *oid,
                             was_clean_before: true,
                             created_untracked: created_untracked.clone(),
+                            autostash: true,
                         });
                         self.view = View::LocalChanges;
                     }
@@ -819,8 +860,8 @@ impl RepoTab {
                     }
                 }
             }
-            FollowUp::StashConflict { oid, was_clean_before, created_untracked } => {
-                self.stash_conflict = Some(StashConflict { oid, was_clean_before, created_untracked });
+            FollowUp::StashConflict(sc) => {
+                self.stash_conflict = Some(sc);
                 self.view = View::LocalChanges;
             }
             FollowUp::ClearStashConflict => self.stash_conflict = None,
@@ -829,6 +870,7 @@ impl RepoTab {
                     self.pending_autostash = None;
                 }
             }
+            FollowUp::PendingAutostash(oid) => self.pending_autostash = Some(oid),
             FollowUp::ClearGenericConflict => self.generic_conflict = None,
             FollowUp::EditStop => self.view = View::LocalChanges,
             FollowUp::RebaseEnded(ended) => self.rebase_ended(*ended),
