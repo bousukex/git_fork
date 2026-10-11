@@ -8,6 +8,7 @@ pub mod diff_view;
 pub mod graph_paint;
 pub mod history;
 pub mod menus;
+pub mod merge;
 pub mod output;
 pub mod quick_launch;
 pub mod rebase;

@@ -127,6 +127,17 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
         }
         return;
     }
+    if let Dialog::EditMergeResult { editor, text, original } = &mut dialog {
+        match super::merge::edit_result(ctx, text, original) {
+            super::merge::EditOutcome::Keep => tab.dialog = Some(dialog),
+            super::merge::EditOutcome::Cancel => {}
+            super::merge::EditOutcome::Apply => {
+                let editor = *editor;
+                tab.apply_merge_edit(editor, text);
+            }
+        }
+        return;
+    }
     let p = Palette::of(ctx);
     let mut act: Option<Act> = None;
     let mut cancel = false;
@@ -137,7 +148,18 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
     let modal = egui::Modal::new(egui::Id::new("repo-dialog")).show(ctx, |ui| {
         ui.set_width(460.0);
         match &mut dialog {
-            Dialog::InteractiveRebase(_) => unreachable!("shown above"),
+            Dialog::InteractiveRebase(_) | Dialog::EditMergeResult { .. } => unreachable!("shown above"),
+            Dialog::LeaveMerge { then } => {
+                let path = tab.merge.as_ref().map(|m| m.path.to_string()).unwrap_or_default();
+                ui.heading("Discard the merge editor's changes?");
+                ui.label(format!("The changes to {path} in the merge editor aren't saved; they are lost."));
+                let (ok, no) = buttons(ui, "Discard Changes", true, true);
+                if ok {
+                    let then = then.clone();
+                    act = Some(Box::new(move |t| t.leave_merge(then)));
+                }
+                cancel = no;
+            }
             Dialog::CreateBranch { start, start_label, name, checkout } => {
                 ui.heading("Create Branch");
                 hint(ui, &format!("Starting at {start_label}"));

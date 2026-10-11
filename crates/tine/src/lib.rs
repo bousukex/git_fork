@@ -6,6 +6,7 @@ pub mod fonts;
 /// Fuzzy matching lives in the core (the bench measures it too).
 pub use tine_core::fuzzy;
 pub mod input;
+pub mod merge_model;
 pub mod ops_registry;
 pub mod probe;
 pub mod repo;

@@ -496,3 +496,119 @@ fn interactive_rebase_of_a_thousand_commits() {
         .collect();
     println!("dialog frames while scrolling 1000 commits: {}", stats(times));
 }
+
+/// The merge editor on a 100,000-line file with 100 conflicts: in the
+/// app (warm: one opening first, not counted), from asking to the first
+/// frame showing it, and the frames while scrolling and moving with F7;
+/// the process's peak memory by then (the app alone); then the parts on
+/// their own (git merge-file and the split, the display text, the rows).
+#[test]
+#[ignore = "timing; run with --ignored --nocapture"]
+fn merge_editor_on_a_large_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    git_out(d, &["init", "-q", "-b", "main"]);
+    git_out(d, &["config", "user.name", "T"]);
+    git_out(d, &["config", "user.email", "t@x"]);
+    let file = |side: &str| -> String {
+        (0..100_000).map(|i| if i % 1000 == 500 { format!("{side} {i}\n") } else { format!("line {i} of the file\n") }).collect()
+    };
+    let commit = |content: String, msg: &str| {
+        std::fs::write(d.join("big.txt"), content).unwrap();
+        git_out(d, &["add", "-A"]);
+        git_out(d, &["commit", "-qm", msg]);
+    };
+    commit(file("base"), "base");
+    git_out(d, &["checkout", "-q", "-b", "topic"]);
+    commit(file("topic"), "topic");
+    git_out(d, &["checkout", "-q", "main"]);
+    commit(file("main"), "main");
+    let o = std::process::Command::new("git").current_dir(d).args(["merge", "topic"]).env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap();
+    assert!(!o.status.success());
+
+    let paths = vec![d.to_path_buf()];
+    let mut h = Harness::builder().with_size([1360.0, 860.0]).build_eframe(move |cc| {
+        let mut app = tine::app::TineApp::new(cc, paths);
+        app.show_local_changes();
+        app
+    });
+    let start = Instant::now();
+    while !h.state().is_idle() {
+        assert!(start.elapsed() < Duration::from_secs(30));
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // (request → the frame that takes it in and draws it, that frame)
+    let open = |h: &mut Harness<'_, tine::app::TineApp>| -> (Duration, Duration) {
+        let tab = h.state_mut().active_tab_mut().unwrap();
+        tab.merge = None;
+        let t = Instant::now();
+        tab.open_merge_editor("big.txt".into());
+        loop {
+            let f = Instant::now();
+            h.step();
+            if h.state_mut().active_tab_mut().unwrap().merge.as_ref().is_some_and(|m| m.session().is_some()) {
+                return (t.elapsed(), f.elapsed());
+            }
+            assert!(t.elapsed() < Duration::from_secs(30));
+        }
+    };
+    open(&mut h);
+    let shown: Vec<(Duration, Duration)> = (0..5).map(|_| open(&mut h)).collect();
+    assert_eq!(h.state_mut().active_tab_mut().unwrap().merge.as_ref().unwrap().session().unwrap().conflict_count(), 100);
+    println!("request → first frame showing it: {}", stats(shown.iter().map(|s| s.0).collect()));
+    println!("that frame: {}", stats(shown.iter().map(|s| s.1).collect()));
+    h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(900.0, 500.0)));
+    h.step();
+    let times: Vec<Duration> = (0..300)
+        .map(|i| {
+            h.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Page,
+                delta: egui::vec2(0.0, if i < 150 { -3.0 } else { 3.0 }),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let t = Instant::now();
+            h.step();
+            t.elapsed()
+        })
+        .collect();
+    println!("frames while scrolling: {}", stats(times));
+    let times: Vec<Duration> = (0..100)
+        .map(|_| {
+            let t = Instant::now();
+            h.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::F7,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.step();
+            t.elapsed()
+        })
+        .collect();
+    println!("frames moving with F7: {}", stats(times));
+    println!("  the app: {}", peak_rss());
+    drop(h);
+
+    let git = tine_core::GitRunner::new(d);
+    let cancel = tine_core::CancelToken::default();
+    let open = || tine_core::merge_file::open(&git, &d.join(".git"), b"big.txt", &cancel).unwrap();
+    open();
+    let times: Vec<Duration> = (0..5)
+        .map(|_| {
+            let t = Instant::now();
+            open();
+            t.elapsed()
+        })
+        .collect();
+    println!("opening (stages, attributes, merge-file, split): {}", stats(times));
+    let opened = open();
+    let t = Instant::now();
+    let text = tine::merge_model::MergeText::new(&opened.merge, 4);
+    println!("display text: {:.2?}", t.elapsed());
+    let t = Instant::now();
+    let s = tine::merge_model::MergeSession::new(opened, std::sync::Arc::new(text), 4);
+    println!("rows ({}): {:.2?}", s.rows.len(), t.elapsed());
+}

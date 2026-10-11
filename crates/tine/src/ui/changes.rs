@@ -26,6 +26,7 @@ enum ListEvent {
     Discard(Vec<ChangedFile>),
     Resolve(Vec<bstr::BString>, Resolution),
     MergeTool(bstr::BString),
+    MergeEditor(bstr::BString),
     FileHistory(bstr::BString),
     Blame(bstr::BString),
 }
@@ -86,7 +87,9 @@ fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab
                 if resp.clicked() || resp.secondary_clicked() {
                     ui.memory_mut(|m| m.request_focus(focus_id));
                 }
-                if resp.double_clicked() {
+                if resp.double_clicked() && f.kind == ChangeKind::Conflicted {
+                    events.push(ListEvent::MergeEditor(f.path.clone()));
+                } else if resp.double_clicked() {
                     events.push(ListEvent::Toggle(f.clone()));
                 } else if resp.clicked() {
                     let m = ui.input(|i| i.modifiers);
@@ -180,6 +183,10 @@ fn conflict_menu(ui: &mut egui::Ui, tab: &RepoTab, f: &ChangedFile, side: Side, 
     }
     ui.separator();
     entry(ui, format!("Mark as Resolved{suffix}"), true, Resolution::MarkResolved);
+    if paths.len() == 1 && ui.button("Resolve in Merge Editor…").clicked() {
+        events.push(ListEvent::MergeEditor(f.path.clone()));
+        ui.close();
+    }
     if paths.len() == 1 && ui.add_enabled(!busy, egui::Button::new("Open in Merge Tool")).clicked() {
         events.push(ListEvent::MergeTool(f.path.clone()));
         ui.close();
@@ -190,6 +197,36 @@ fn conflict_menu(ui: &mut egui::Ui, tab: &RepoTab, f: &ChangedFile, side: Side, 
         ui.ctx().copy_text(f.path.to_str_lossy().into_owned());
         ui.close();
     }
+}
+
+/// Above a conflicted file's diff: the way into the merge editor (and a
+/// note when it has unsaved changes for another file).
+fn conflict_bar(ui: &mut egui::Ui, tab: &RepoTab, events: &mut Vec<ListEvent>) {
+    let p = Palette::of(ui.ctx());
+    let selected = tab.changes_selected.as_ref().map(|(_, f)| f).filter(|f| f.kind == ChangeKind::Conflicted);
+    let elsewhere = tab.merge.as_ref().filter(|m| m.dirty()).map(|m| m.path.clone());
+    if selected.is_none() && elsewhere.is_none() {
+        return;
+    }
+    egui::Frame::NONE.fill(p.diff_hunk_bg).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if let Some(path) = elsewhere {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("The merge editor has unsaved changes to {}", path.to_str_lossy())).small().color(p.status_modified));
+                if ui.small_button("Show").clicked() {
+                    events.push(ListEvent::MergeEditor(path.clone()));
+                }
+            });
+        }
+        if let Some(f) = selected {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Conflicted").small().strong());
+                if ui.button("Resolve in Merge Editor").clicked() {
+                    events.push(ListEvent::MergeEditor(f.path.clone()));
+                }
+            });
+        }
+    });
 }
 
 /// List caption with Stage/Unstage buttons for the selection and for all.
@@ -451,9 +488,13 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(p.bg)).show(ui, |ui| {
         if !tab.status_loaded {
             ui.centered_and_justified(|ui| ui.spinner());
+        } else if tab.merge_shown() {
+            super::merge::show(ui, tab);
         } else if tab.status.change_count() == 0 {
+            conflict_bar(ui, tab, &mut events);
             ui.centered_and_justified(|ui| ui.label(RichText::new("No local changes").color(p.text_weak)));
         } else {
+            conflict_bar(ui, tab, &mut events);
             let actions = tab.line_actions();
             for e in super::diff_view::show(ui, ("changes-diff", &tab.paths.workdir), &tab.changes_diff, tab.diff_opts, actions) {
                 match e {
@@ -486,6 +527,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
             ListEvent::Discard(files) => tab.request_discard(files),
             ListEvent::Resolve(paths, how) => tab.resolve(paths, how),
             ListEvent::MergeTool(path) => tab.open_mergetool(path),
+            ListEvent::MergeEditor(path) => tab.open_merge_editor(path),
             ListEvent::FileHistory(path) => tab.file_history_of_local(path),
             ListEvent::Blame(path) => tab.blame_of_local(path),
         }

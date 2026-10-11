@@ -112,4 +112,9 @@ pub enum Dialog {
     },
     /// Deleting `full_ref` (e.g. `refs/heads/x`) on `remote`.
     DeleteRemoteRef { remote: String, full_ref: String },
+    /// Giving up the merge editor's unsaved changes, then `then`.
+    LeaveMerge { then: super::merge::MergeLeave },
+    /// Editing the merge editor's result as text (`editor`: which opening
+    /// of the editor it is for).
+    EditMergeResult { editor: crate::worker::Gen, text: String, original: String },
 }

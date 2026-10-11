@@ -440,6 +440,16 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.output_limited_with(args, limit, cancel, &[])
+    }
+
+    /// [`Self::output_limited`] with exit codes besides 0 that are not
+    /// failures.
+    pub fn output_limited_with<I, S>(&self, args: I, limit: usize, cancel: &CancelToken, ok_codes: &[i32]) -> Result<Option<Vec<u8>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         self.check_cancelled()?;
         let started = Instant::now();
@@ -479,7 +489,11 @@ impl GitRunner {
         if too_large {
             return Ok(None);
         }
-        if status.success() { Ok(Some(out)) } else { Err(Self::error(&args, status.code(), &out, &stderr)) }
+        if status.success() || status.code().is_some_and(|c| ok_codes.contains(&c)) {
+            Ok(Some(out))
+        } else {
+            Err(Self::error(&args, status.code(), &out, &stderr))
+        }
     }
 
     /// Runs a long command (fetch, push, …) that reports progress on stderr.

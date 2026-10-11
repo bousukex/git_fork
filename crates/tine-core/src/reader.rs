@@ -105,6 +105,9 @@ pub trait RepoReader: Send + Sync {
     /// The commits an interactive rebase from `base` (the root with
     /// `None`) would take ([`crate::interactive::load_range`]).
     fn rebase_range(&self, base: Option<Oid>, cancel: &CancelToken) -> Result<crate::interactive::Range>;
+    /// A conflicted file opened for the merge editor
+    /// ([`crate::merge_file::open`]).
+    fn merge_open(&self, path: &[u8], cancel: &CancelToken) -> Result<crate::merge_file::Opened>;
 }
 
 #[derive(Debug, Clone)]
@@ -208,5 +211,9 @@ impl RepoReader for CliReader {
 
     fn rebase_range(&self, base: Option<Oid>, cancel: &CancelToken) -> Result<crate::interactive::Range> {
         crate::interactive::load_range(&self.git, base, cancel)
+    }
+
+    fn merge_open(&self, path: &[u8], cancel: &CancelToken) -> Result<crate::merge_file::Opened> {
+        crate::merge_file::open(&self.git, &self.paths.git_dir, path, cancel)
     }
 }

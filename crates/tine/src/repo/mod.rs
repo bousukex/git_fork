@@ -3,6 +3,7 @@
 mod actions;
 pub mod browse;
 pub mod dialog;
+pub mod merge;
 pub mod rebase;
 pub mod remote;
 pub mod search;
@@ -304,6 +305,11 @@ pub struct RepoTab {
     rebase_session_error: Option<String>,
     /// The last interactive rebase finished (it can be undone).
     pub rebase_done: Option<rebase::RebaseDone>,
+    /// A conflicted file in the merge editor.
+    pub merge: Option<merge::MergeEditor>,
+    /// The tab asked to close once its unsaved changes were given up (the
+    /// app closes it).
+    pub close_requested: bool,
     rebase_range_seq: Gen,
     rebase_range_cancel: Option<CancelToken>,
     /// The edit stop the commit box was last set up for.
@@ -419,6 +425,8 @@ impl RepoTab {
             rebase_finish_tried: None,
             rebase_session_error: None,
             rebase_done: None,
+            merge: None,
+            close_requested: false,
             rebase_range_seq: 0,
             rebase_range_cancel: None,
             last_edit_stop: None,
@@ -638,6 +646,7 @@ impl RepoTab {
                     self.status_loaded = true;
                     self.rebase_progress = tine_core::status::rebase_progress(&self.paths.git_dir);
                     self.check_rebase_session();
+                    self.check_merge_editor();
                     self.sync_commit_box_with_state();
                     if self.status.state == RepoState::Clean
                         && self.stash_conflict.is_none()
@@ -673,6 +682,8 @@ impl RepoTab {
             Msg::Blame(seq, r) => self.on_blame(seq, r),
             Msg::BlameHighlighted(seq, doc) => self.on_blame_highlighted(seq, doc),
             Msg::RebaseRange(seq, r) if seq == self.rebase_range_seq && seq != 0 => self.on_rebase_range(r),
+            Msg::MergeOpened(seq, r) => self.on_merge_opened(seq, r),
+            Msg::MergeHighlighted(seq, text, spans) => self.on_merge_highlighted(seq, text, spans),
             Msg::Files(seq, r) if seq == self.files_seq => {
                 self.files_seq = 0;
                 self.files_cancel = None;
@@ -943,6 +954,7 @@ impl RepoTab {
     /// Updates the selection for a click on `file` in the `side` list
     /// (Ctrl toggles, Shift selects a range from the focused file).
     pub fn click_change(&mut self, side: Side, file: &ChangedFile, ctrl: bool, shift: bool) {
+        self.merge_file_selected(&file.path);
         let same_side = self.changes_selected.as_ref().is_some_and(|(s, _)| *s == side);
         if !same_side {
             self.changes_multi.clear();
@@ -1289,6 +1301,12 @@ impl RepoTab {
     }
 
     fn on_op_done(&mut self, id: OpId, kind: OpKind, result: anyhow::Result<OpOutcome>) {
+        // A save that didn't go through (one that did comes as a follow-up).
+        if let OpKind::SaveMerge { editor, .. } = &kind
+            && result.is_err()
+        {
+            self.merge_save_done(*editor, None);
+        }
         // Whatever the operation did, the shown diff is outdated until the
         // refresh below brings a new one.
         if self.changes_diff.doc.is_some() {
@@ -1436,6 +1454,7 @@ impl RepoTab {
         self.doc_opts = opts;
         self.reload_diffs(true);
         self.rebuild_blames();
+        self.merge_doc_options_changed();
     }
 
     pub fn head_commit(&self) -> Option<Oid> {

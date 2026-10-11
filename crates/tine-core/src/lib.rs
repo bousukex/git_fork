@@ -13,6 +13,7 @@ pub mod integrate;
 pub mod interactive;
 pub mod log;
 pub mod maintenance;
+pub mod merge_file;
 pub mod model;
 pub mod ops;
 pub mod patch;

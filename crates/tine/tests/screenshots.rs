@@ -681,6 +681,58 @@ fn interactive_rebase_dialog_small() {
 
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
+fn merge_editor() {
+    let _serial = serial();
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path().to_path_buf();
+    let mut t = 1_760_000_000;
+    git(&path, &["init", "-q", "-b", "main"], &mut t);
+    git(&path, &["config", "user.name", "山田 太郎"], &mut t);
+    git(&path, &["config", "user.email", "taro@example.com"], &mut t);
+    let file = |greeting: &str, limit: &str| {
+        format!(
+            "/// 設定を読み込む。\npub fn load(path: &str) -> Config {{\n    let text = std::fs::read_to_string(path).unwrap();\n    {greeting}\n    Config::parse(&text)\n}}\n\npub fn limit() -> usize {{\n    {limit}\n}}\n"
+        )
+    };
+    std::fs::write(path.join("config.rs"), file("log::info!(\"loading\");", "100")).unwrap();
+    git(&path, &["add", "-A"], &mut t);
+    git(&path, &["commit", "-qm", "設定ファイルを読み込む"], &mut t);
+    git(&path, &["checkout", "-q", "-b", "topic"], &mut t);
+    std::fs::write(path.join("config.rs"), file("log::debug!(\"loading {path}\");", "250 // 上限を上げる")).unwrap();
+    git(&path, &["commit", "-qam", "ログを詳しくする"], &mut t);
+    git(&path, &["checkout", "-q", "main"], &mut t);
+    std::fs::write(path.join("config.rs"), file("eprintln!(\"読み込み中: {path}\");", "64")).unwrap();
+    git(&path, &["commit", "-qam", "標準エラーに出す"], &mut t);
+    let o = std::process::Command::new("git").current_dir(&path).args(["merge", "topic"]).env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap();
+    assert!(!o.status.success());
+    shoot(
+        "merge_editor",
+        [1360.0, 760.0],
+        |cc| {
+            let mut app = tine::app::TineApp::new(cc, vec![path.clone()]);
+            app.show_local_changes();
+            app
+        },
+        |h| {
+            settle(h);
+            h.state_mut().active_tab_mut().unwrap().open_merge_editor("config.rs".into());
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            if let Some(s) = tab.merge.as_mut().and_then(|m| m.session_mut()) {
+                // The first resolved, the second open with its base shown.
+                s.choose(0, tine_core::merge_file::Choice::Theirs);
+                if s.conflict_count() > 1 {
+                    s.toggle_base(1);
+                    s.current = Some(1);
+                }
+            }
+            settle(h);
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
 fn interactive_rebase_edit_stop() {
     let _serial = serial();
     tine::askpass::set_program(env!("CARGO_BIN_EXE_tine"));

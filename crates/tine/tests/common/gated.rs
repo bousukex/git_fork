@@ -95,9 +95,11 @@ pub struct Gates {
     pub files: Gate,
     pub diff: Gate,
     pub rebase_range: Gate,
+    pub merge_open: Gate,
     /// Calls that ended stopped (git never ran, or was stopped).
     pub stopped_diffs: AtomicUsize,
     pub stopped_blames: AtomicUsize,
+    pub stopped_merges: AtomicUsize,
 }
 
 fn count_stop<T>(r: anyhow::Result<T>, counter: &AtomicUsize) -> anyhow::Result<T> {
@@ -170,6 +172,10 @@ impl RepoReader for Gated {
     fn rebase_range(&self, base: Option<Oid>, cancel: &CancelToken) -> anyhow::Result<tine_core::interactive::Range> {
         self.gates.rebase_range.wait();
         self.inner.rebase_range(base, cancel)
+    }
+    fn merge_open(&self, path: &[u8], cancel: &CancelToken) -> anyhow::Result<tine_core::merge_file::Opened> {
+        self.gates.merge_open.wait();
+        count_stop(self.inner.merge_open(path, cancel), &self.gates.stopped_merges)
     }
 }
 

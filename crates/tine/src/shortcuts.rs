@@ -119,6 +119,8 @@ pub enum Scope {
     CommitBox,
     /// The topmost overlay (search bar).
     Overlay,
+    /// The merge editor.
+    MergeEditor,
 }
 
 impl Scope {
@@ -127,7 +129,8 @@ impl Scope {
             Scope::FileList => "File list",
             Scope::SearchBar => "Search bar",
             Scope::CommitBox => "Commit message",
-            Scope::Overlay => "Search, File History, Blame",
+            Scope::Overlay => "Search, File History, Blame, Merge Editor",
+            Scope::MergeEditor => "Merge editor",
         }
     }
 }
@@ -144,6 +147,8 @@ pub const LOCAL_KEYS: &[(Scope, Modifiers, Key, &str)] = &[
     (Scope::SearchBar, Modifiers::SHIFT, Key::F3, "Previous match"),
     (Scope::CommitBox, CTRL, Key::Enter, "Commit"),
     (Scope::Overlay, NONE, Key::Escape, "Close"),
+    (Scope::MergeEditor, NONE, Key::F7, "Next conflict"),
+    (Scope::MergeEditor, Modifiers::SHIFT, Key::F7, "Previous conflict"),
 ];
 
 /// Human-readable keys, e.g. "Ctrl+Shift+P".

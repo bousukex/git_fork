@@ -49,6 +49,11 @@ pub struct TineApp {
     /// to a tab when that work tree is opened again.
     held_orphans: Vec<crate::ops_registry::OrphanedResult>,
     quick: Option<QuickLaunch>,
+    /// Closing the window waits for this answer: unsaved merge editor
+    /// changes (one line per tab).
+    quit_asked: Option<Vec<String>>,
+    /// The answer was "quit anyway".
+    quit_confirmed: bool,
     /// The settings dialog is open.
     settings_open: bool,
     settings_ui: ui::settings::SettingsUi,
@@ -134,6 +139,8 @@ impl TineApp {
             notices: Vec::new(),
             held_orphans: Vec::new(),
             quick: None,
+            quit_asked: None,
+            quit_confirmed: false,
             settings_open: false,
             settings_ui: Default::default(),
             opening: Vec::new(),
@@ -272,11 +279,80 @@ impl TineApp {
         });
     }
 
+    /// Unsaved merge editor changes, by tab.
+    fn unsaved_merges(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .filter(|t| t.merge_dirty())
+            .map(|t| format!("{}: {}", t.title, t.merge.as_ref().map(|m| m.path.to_string()).unwrap_or_default()))
+            .collect()
+    }
+
+    /// The window is to close: not before unsaved merge editor changes
+    /// (in any tab) were given up.
+    fn on_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) || self.quit_confirmed {
+            return;
+        }
+        let unsaved = self.unsaved_merges();
+        if !unsaved.is_empty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.quit_asked = Some(unsaved);
+        }
+    }
+
+    /// Asking whether to quit with unsaved changes.
+    pub fn quit_asked(&self) -> bool {
+        self.quit_asked.is_some()
+    }
+
+    fn quit_dialog(&mut self, ctx: &egui::Context) {
+        let Some(unsaved) = &self.quit_asked else { return };
+        let p = Palette::of(ctx);
+        let mut answer = None;
+        egui::Modal::new(egui::Id::new("quit-unsaved")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading("Quit and lose unsaved merge changes?");
+            ui.label("The merge editor has changes that aren't saved:");
+            for line in unsaved {
+                ui.label(RichText::new(line).color(p.text_weak));
+            }
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let quit = egui::Button::new(RichText::new("Quit Anyway").color(egui::Color32::WHITE)).fill(p.status_deleted);
+                if ui.add(quit).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        match answer {
+            Some(true) => {
+                self.quit_asked = None;
+                self.quit_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(false) => self.quit_asked = None,
+            None => {}
+        }
+    }
+
     /// Closes tab `i`, keeping the same repository active when possible.
     pub fn close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
         }
+        // Unsaved merge editor changes are asked about first (in that tab).
+        if !self.tabs[i].request_close() {
+            self.active = i;
+            return;
+        }
+        self.close_tab_now(i);
+    }
+
+    fn close_tab_now(&mut self, i: usize) {
         self.tabs.remove(i);
         if i < self.active {
             self.active -= 1;
@@ -338,14 +414,16 @@ impl TineApp {
     /// one modal shows at a time (a prompt hides the others meanwhile).
     fn decide_layer(&mut self, ctx: &egui::Context) {
         let tab_modal = self.tabs.get(self.active).filter(|t| t.modal_open()).map(RepoTab::modal_token);
-        if tab_modal.is_some() {
+        if tab_modal.is_some() || self.quit_asked.is_some() {
             self.settings_open = false;
         }
-        if tab_modal.is_some() || self.settings_open {
+        if tab_modal.is_some() || self.settings_open || self.quit_asked.is_some() {
             self.quick = None;
         }
         let (layer, token) = if let Some(p) = crate::askpass::pending() {
             (input::Layer::Prompt, p.id)
+        } else if self.quit_asked.is_some() {
+            (input::Layer::Dialog, QUIT_TOKEN)
         } else if let Some(token) = tab_modal {
             (input::Layer::Dialog, token)
         } else if self.settings_open {
@@ -366,16 +444,19 @@ impl TineApp {
         if let Some(cmd) = shortcuts::take(ctx, !self.tabs.is_empty()) {
             self.run_command(cmd);
         }
-        // Esc closes the topmost overlay: a browse view, else the search bar.
+        // Esc closes the topmost overlay: a browse view, else the search
+        // bar, else the merge editor.
         if !ctx.text_edit_focused()
             && let Some(t) = self.tabs.get_mut(self.active)
-            && (!t.browse.is_empty() || t.search.open)
+            && (!t.browse.is_empty() || t.search.open || (t.view == View::LocalChanges && t.merge_shown()))
             && input::take_key(ctx, Modifiers::NONE, Key::Escape)
         {
-            if t.browse.is_empty() {
+            if !t.browse.is_empty() {
+                t.close_browse();
+            } else if t.search.open {
                 t.close_search();
             } else {
-                t.close_browse();
+                t.request_close_merge();
             }
         }
     }
@@ -722,6 +803,9 @@ fn error_banner(ui: &mut egui::Ui, tab: &mut RepoTab) {
     }
 }
 
+/// The input owner token of the quit question.
+const QUIT_TOKEN: u64 = u64::MAX;
+
 impl eframe::App for TineApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -751,6 +835,7 @@ impl eframe::App for TineApp {
                 self.state.messages.push(m);
             }
         }
+        self.on_close_request(&ctx);
         // Operations whose tab was closed: the work tree that started them
         // takes them over (its stash conflict, stashed changes…); other
         // worktrees of the repository just refresh. Without a tab for that
@@ -881,6 +966,11 @@ impl eframe::App for TineApp {
             }
             self.quick_launch_frame(&ctx);
         }
+        // A tab whose unsaved changes were given up so it could close.
+        if let Some(i) = self.tabs.iter().position(|t| t.close_requested) {
+            self.close_tab_now(i);
+        }
+        self.quit_dialog(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

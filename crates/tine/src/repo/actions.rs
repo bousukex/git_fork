@@ -876,6 +876,7 @@ impl RepoTab {
             FollowUp::RebaseEnded(ended) => self.rebase_ended(*ended),
             FollowUp::RebaseEndFailed(e) => self.error(format!("Couldn't tidy up after the interactive rebase (press F5 to try again): {e}")),
             FollowUp::RebaseUndone => self.rebase_done = None,
+            FollowUp::MergeSaved(saved) => self.merge_save_done(saved.editor, Some(*saved)),
         }
     }
 

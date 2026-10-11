@@ -77,6 +77,30 @@ pub enum FollowUp {
     RebaseEndFailed(String),
     /// The finished interactive rebase was undone.
     RebaseUndone,
+    /// The merge editor's result was written.
+    MergeSaved(Box<MergeSaved>),
+}
+
+/// A merge editor save that went through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeSaved {
+    /// Which opening of the editor it was saved from.
+    pub editor: Gen,
+    pub path: bstr::BString,
+    /// The editor's change counter when it was saved.
+    pub edit_gen: u64,
+    /// The file as written.
+    pub work: tine_core::merge_file::WorkFile,
+    /// With "mark resolved": whether that worked too.
+    pub staged: Option<Result<(), String>>,
+}
+
+/// A conflicted file opened for the merge editor (plain text to show).
+pub struct MergeOpened {
+    pub opened: tine_core::merge_file::Opened,
+    pub text: Arc<crate::merge_model::MergeText>,
+    /// What `text` was made with.
+    pub doc: DocOptions,
 }
 
 /// An operation needs the user's decision before it can go on; the UI
@@ -140,6 +164,11 @@ pub enum Msg {
     RebaseRange(Gen, anyhow::Result<tine_core::interactive::Range>),
     /// The paths in a commit (HEAD), for "is this file committed?".
     HeadPaths(Gen, Oid, anyhow::Result<Arc<std::collections::HashSet<bstr::BString>>>),
+    /// A conflicted file opened for the merge editor (plain; colors may
+    /// follow).
+    MergeOpened(Gen, anyhow::Result<Box<MergeOpened>>),
+    /// Syntax colors for the merge editor's text `.1`.
+    MergeHighlighted(Gen, Arc<crate::merge_model::MergeText>, Arc<crate::merge_model::MergeSpans>),
 }
 
 /// The repository's tracked files, prepared for Quick Launch matching.
@@ -190,6 +219,9 @@ pub enum OpKind {
     InteractiveRebase,
     /// Noticing that an interactive rebase ended (also outside Tine).
     FinishRebase,
+    /// Saving the merge editor's result (and marking it resolved);
+    /// `editor`: which opening of the editor it is for.
+    SaveMerge { resolved: bool, editor: Gen },
 }
 
 impl OpKind {
@@ -234,6 +266,8 @@ impl OpKind {
             OpKind::DeleteRemoteRef(_) => "Delete on remote",
             OpKind::InteractiveRebase => "Interactive rebase",
             OpKind::FinishRebase => "Finish interactive rebase",
+            OpKind::SaveMerge { resolved: false, .. } => "Save",
+            OpKind::SaveMerge { resolved: true, .. } => "Save and mark resolved",
         }
     }
 }
@@ -556,11 +590,48 @@ impl Worker {
         }
     }
 
+    /// Opens a conflicted file for the merge editor: its plain text first,
+    /// syntax colors after (if wanted).
+    pub fn merge_open(&self, seq: Gen, path: bstr::BString, doc: DocOptions, cancel: CancelToken) {
+        let ctx = self.ctx.clone();
+        let started = self.spawn("merge-open", move |r, tx| {
+            let result = r.merge_open(&path, &cancel).map(|opened| {
+                let text = Arc::new(crate::merge_model::MergeText::new(&opened.merge, doc.tab_width));
+                Box::new(MergeOpened { opened, text, doc })
+            });
+            if cancel.is_cancelled() {
+                return;
+            }
+            let text = result.as_ref().ok().filter(|_| doc.highlight).map(|o| o.text.clone());
+            let _ = tx.send(Msg::MergeOpened(seq, result));
+            if let Some(text) = text {
+                ctx.request_repaint();
+                send_merge_colors(tx, seq, text, &path, &cancel);
+            }
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::MergeOpened(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// Syntax colors for the merge editor's text (after it changed).
+    pub fn merge_highlight(&self, seq: Gen, text: Arc<crate::merge_model::MergeText>, path: bstr::BString, cancel: CancelToken) {
+        let _ = self.spawn("merge-highlight", move |_, tx| send_merge_colors(tx, seq, text, &path, &cancel));
+    }
+
     /// Runs a maintenance or write job; its result arrives as [`Msg::Job`].
     pub fn job(&self, name: &str, f: impl FnOnce() -> anyhow::Result<String> + Send + 'static) {
         let _ = self.spawn(name, move |_, tx| {
             let _ = tx.send(Msg::Job(f()));
         });
+    }
+}
+
+fn send_merge_colors(tx: &Sender<Msg>, seq: Gen, text: Arc<crate::merge_model::MergeText>, path: &[u8], cancel: &CancelToken) {
+    if let Some(spans) = text.highlight(path, cancel)
+        && !cancel.is_cancelled()
+    {
+        let _ = tx.send(Msg::MergeHighlighted(seq, text, Arc::new(spans)));
     }
 }
 
