@@ -49,9 +49,13 @@ pub fn abort(git: &GitRunner, state: RepoState) -> Result<()> {
 }
 
 /// Records an empty commit for a cherry-pick whose changes are already
-/// present (the alternative to skipping it).
-pub fn commit_empty(git: &GitRunner) -> Result<()> {
-    git.output(["commit", "--allow-empty", "--no-edit"])?;
+/// present (the alternative to skipping it), with git's message or, for a
+/// reworded commit of an interactive rebase, the one in `message`.
+pub fn commit_empty(git: &GitRunner, message: Option<&Path>) -> Result<()> {
+    match message {
+        Some(m) => git.output([std::ffi::OsStr::new("commit"), "--allow-empty".as_ref(), "-F".as_ref(), m.as_os_str()])?,
+        None => git.output(["commit", "--allow-empty", "--no-edit"])?,
+    };
     Ok(())
 }
 

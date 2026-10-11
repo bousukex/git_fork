@@ -51,10 +51,35 @@ pub struct StashConflict {
 fn step_outcome(step: Step, done: String, what: &str, state: RepoState) -> OpOutcome {
     match step {
         Step::Done => OpOutcome::new(done).moving_refs(),
+        Step::Stopped(tine_core::integrate::StopReason::Edit(id)) => {
+            OpOutcome::new(format!("{what} stopped at {} to edit it", id.short())).moving_refs().with(FollowUp::EditStop)
+        }
+        Step::Stopped(_) => OpOutcome::new(format!("{what} stopped; continue when ready")).moving_refs(),
         Step::Conflicts => OpOutcome::new(format!("{what} stopped with conflicts")).moving_refs().with(FollowUp::Conflicts),
         Step::Empty => {
             OpOutcome::new(format!("{what}: the change is already present")).moving_refs().with(FollowUp::Empty(state))
         }
+    }
+}
+
+/// The runner for continuing or skipping: with Tine as git's editor if Tine
+/// started the rebase in progress (its messages then apply).
+fn rebase_runner(git: &GitRunner, git_dir: &std::path::Path, state: RepoState) -> anyhow::Result<GitRunner> {
+    if state != RepoState::Rebasing {
+        return Ok(git.clone());
+    }
+    let editor = tine_core::interactive::Editor { program: crate::askpass::program()? };
+    tine_core::interactive::rebase_runner(git, git_dir, &editor)
+}
+
+/// Adds the end of an interactive rebase (if it just ended) to `out`.
+fn with_rebase_end(git: &GitRunner, git_dir: &std::path::Path, out: OpOutcome) -> OpOutcome {
+    // Even after a cancel: it only reads where the branch is and tidies up.
+    match tine_core::interactive::finish_session(&git.uncancellable(), git_dir) {
+        Ok(Some(e)) => out.with(FollowUp::RebaseEnded(Box::new(e))),
+        Ok(None) => out,
+        // Kept for another try (status refreshes, F5).
+        Err(e) => out.with(FollowUp::RebaseEndFailed(format!("{e:#}"))),
     }
 }
 
@@ -388,12 +413,13 @@ impl RepoTab {
             Integration::CherryPick { commit } => OpKind::CherryPick(commit.clone()),
             Integration::Revert { commit } => OpKind::Revert(commit.clone()),
             Integration::Pull { remote, branch, .. } => OpKind::Pull(format!("{remote}/{branch}")),
+            Integration::InteractiveRebase { .. } => OpKind::InteractiveRebase,
         };
         self.run_op_ctx(kind, move |ctx, git| {
             if let Err(e) = integrate::ensure_ready(git, &git_dir, stash_first) {
                 return Err(if e.is::<DirtyWorkTree>() { NeedsDecision::LocalChanges(action).into() } else { e });
             }
-            let run = || -> anyhow::Result<OpOutcome> {
+            let run = |stash: Option<tine_core::model::Oid>| -> anyhow::Result<OpOutcome> {
                 Ok(match &action {
                     Integration::Merge { target, mode } => {
                         let step = integrate::merge(git, &git_dir, target, *mode)?;
@@ -410,6 +436,14 @@ impl RepoTab {
                     Integration::Revert { commit } => {
                         let step = integrate::revert(git, &git_dir, commit)?;
                         step_outcome(step, format!("Reverted {commit}"), "Revert", RepoState::Reverting)
+                    }
+                    Integration::InteractiveRebase { range, plan } => {
+                        let editor = tine_core::interactive::Editor { program: crate::askpass::program()? };
+                        // The stash is recorded with the session before git runs.
+                        let step = tine_core::interactive::start(git, &git_dir, range, plan, &editor, stash)?;
+                        let kept = plan.items.iter().filter(|(_, a)| *a != tine_core::interactive::Action::Drop).count();
+                        let done = format!("Rebased {current} interactively ({kept} commits)");
+                        step_outcome(step, done, "Interactive rebase", RepoState::Rebasing)
                     }
                     Integration::Pull { remote, branch, rebase } => {
                         let net = ctx.network(git.clone())?;
@@ -428,9 +462,10 @@ impl RepoTab {
                 })
             };
             if !stash_first {
-                return run();
+                return run(None).map(|out| with_rebase_end(git, &git_dir, out));
             }
-            let (result, report) = autostash::run(git, &git_dir, &action.describe(), false, run);
+            let (result, report) = autostash::run_with_stash(git, &git_dir, &action.describe(), false, run);
+            let result = result.map(|out| with_rebase_end(git, &git_dir, out));
             match result {
                 Ok(out) => Ok(if report.stash().is_some() { out.with(FollowUp::AutoStash(report)) } else { out }),
                 Err(e) => match report.describe() {
@@ -444,6 +479,12 @@ impl RepoTab {
     // --- Reset --------------------------------------------------------------
 
     pub fn request_reset(&mut self, target: Oid, label: &str) {
+        self.request_reset_mode(target, label, ResetMode::Mixed, None);
+    }
+
+    /// The reset dialog with `mode` chosen; with `guard`, only while HEAD is
+    /// still where (and on what) the guard says.
+    pub fn request_reset_mode(&mut self, target: Oid, label: &str, mode: ResetMode, guard: Option<super::dialog::ResetGuard>) {
         if !self.allowed(Needs::CleanState) {
             return;
         }
@@ -454,12 +495,12 @@ impl RepoTab {
                 return;
             }
         };
-        self.show_dialog(Dialog::Reset { target, label: label.into(), mode: ResetMode::Mixed, lost, changed: false });
+        self.show_dialog(Dialog::Reset { target, label: label.into(), mode, lost, changed: false, guard });
     }
 
     /// Resets the current branch. A hard reset first re-checks that it would
     /// discard exactly what the user confirmed (`confirmed_lost`).
-    pub fn reset(&mut self, target: Oid, mode: ResetMode, confirmed_lost: Vec<String>) {
+    pub fn reset(&mut self, target: Oid, mode: ResetMode, confirmed_lost: Vec<String>, guard: Option<super::dialog::ResetGuard>) {
         if !self.allowed(Needs::CleanState) {
             return;
         }
@@ -467,14 +508,21 @@ impl RepoTab {
         let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::Reset(target.short()), move |git| {
             integrate::ensure_ready(git, &git_dir, true)?;
+            if let Some(g) = &guard {
+                let (head, on) = tine_core::interactive::head_now(git)?;
+                if head != g.head || on != g.branch {
+                    anyhow::bail!("the branch moved since the rebase finished; nothing was reset");
+                }
+            }
             if mode == ResetMode::Hard {
                 let lost = integrate::hard_reset_losses(git, &target.to_hex())?;
                 if lost != confirmed_lost {
-                    return Err(NeedsDecision::ResetLossesChanged { target, lost }.into());
+                    return Err(NeedsDecision::ResetLossesChanged { target, lost, guard }.into());
                 }
             }
             integrate::reset(git, &target.to_hex(), mode)?;
-            Ok(OpOutcome::new(format!("Reset {branch} to {} ({mode:?})", target.short())).moving_refs())
+            let out = OpOutcome::new(format!("Reset {branch} to {} ({mode:?})", target.short())).moving_refs();
+            Ok(if guard.is_some() { out.with(FollowUp::RebaseUndone) } else { out })
         });
     }
 
@@ -653,8 +701,12 @@ impl RepoTab {
         }
         let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::Continue, move |git| {
-            let step = sequencer::continue_op(git, &git_dir, state)?;
-            Ok(step_outcome(step, format!("{state:?} continued"), "Continue", state))
+            let runner = rebase_runner(git, &git_dir, state)?;
+            if state == RepoState::Rebasing {
+                tine_core::interactive::finish_reword(&runner, &git_dir)?;
+            }
+            let step = sequencer::continue_op(&runner, &git_dir, state)?;
+            Ok(with_rebase_end(git, &git_dir, step_outcome(step, format!("{state:?} continued"), "Continue", state)))
         });
     }
 
@@ -668,9 +720,10 @@ impl RepoTab {
         if self.block_reason(Needs::Idle).is_some() {
             return;
         }
+        let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::Abort, move |git| {
             sequencer::abort(git, state)?;
-            Ok(OpOutcome::new(format!("Aborted {state:?}")).moving_refs())
+            Ok(with_rebase_end(git, &git_dir, OpOutcome::new(format!("Aborted {state:?}")).moving_refs()))
         });
     }
 
@@ -683,8 +736,9 @@ impl RepoTab {
         }
         let git_dir = self.paths.git_dir.clone();
         self.run_op(OpKind::Skip, move |git| {
-            let step = sequencer::skip(git, &git_dir, state)?;
-            Ok(step_outcome(step, "Skipped the current commit".into(), "Skip", state))
+            let runner = rebase_runner(git, &git_dir, state)?;
+            let step = sequencer::skip(&runner, &git_dir, state)?;
+            Ok(with_rebase_end(git, &git_dir, step_outcome(step, "Skipped the current commit".into(), "Skip", state)))
         });
     }
 
@@ -693,8 +747,11 @@ impl RepoTab {
         if self.block_reason(Needs::Idle).is_some() {
             return;
         }
+        let (git_dir, state) = (self.paths.git_dir.clone(), self.status.state);
         self.run_op(OpKind::Continue, move |git| {
-            sequencer::commit_empty(git)?;
+            // A reworded commit that became empty keeps its new message.
+            let message = if state == RepoState::Rebasing { tine_core::interactive::empty_reword_message(&git_dir)? } else { None };
+            sequencer::commit_empty(git, message.as_deref())?;
             Ok(OpOutcome::new("Recorded an empty commit").moving_refs())
         });
     }
@@ -773,6 +830,10 @@ impl RepoTab {
                 }
             }
             FollowUp::ClearGenericConflict => self.generic_conflict = None,
+            FollowUp::EditStop => self.view = View::LocalChanges,
+            FollowUp::RebaseEnded(ended) => self.rebase_ended(*ended),
+            FollowUp::RebaseEndFailed(e) => self.error(format!("Couldn't tidy up after the interactive rebase (press F5 to try again): {e}")),
+            FollowUp::RebaseUndone => self.rebase_done = None,
         }
     }
 
@@ -782,7 +843,8 @@ impl RepoTab {
             NeedsDecision::ForceDeleteBranch(name) => Dialog::DeleteBranch { name, force: true },
             NeedsDecision::StashAndSwitch(target) => Dialog::StashAndSwitch { target },
             NeedsDecision::LocalChanges(action) => Dialog::DirtyTree { action },
-            NeedsDecision::ResetLossesChanged { target, lost } => Dialog::Reset {
+            NeedsDecision::ResetLossesChanged { target, lost, guard } => Dialog::Reset {
+                guard,
                 target,
                 label: target.short(),
                 mode: ResetMode::Hard,

@@ -102,6 +102,9 @@ pub trait RepoReader: Send + Sync {
     fn tracked_files(&self, cancel: &CancelToken) -> Result<Vec<bstr::BString>>;
     /// Every file path in commit `rev`.
     fn paths_at(&self, rev: Oid, cancel: &CancelToken) -> Result<Vec<bstr::BString>>;
+    /// The commits an interactive rebase from `base` (the root with
+    /// `None`) would take ([`crate::interactive::load_range`]).
+    fn rebase_range(&self, base: Option<Oid>, cancel: &CancelToken) -> Result<crate::interactive::Range>;
 }
 
 #[derive(Debug, Clone)]
@@ -201,5 +204,9 @@ impl RepoReader for CliReader {
         let git = self.git.clone().with_cancel(cancel.clone());
         let out = git.output(["ls-tree", "-r", "-z", "--name-only", &rev.to_hex()])?;
         Ok(out.split(|&b| b == 0).filter(|p| !p.is_empty()).map(bstr::BString::from).collect())
+    }
+
+    fn rebase_range(&self, base: Option<Oid>, cancel: &CancelToken) -> Result<crate::interactive::Range> {
+        crate::interactive::load_range(&self.git, base, cancel)
     }
 }

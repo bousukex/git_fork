@@ -419,3 +419,80 @@ fn colored_diff_in_the_app() {
     println!("  frames while scrolling it: {}", stats(times));
     println!("  {}", peak_rss());
 }
+
+/// Interactive rebase of 1,000 commits: reading them (with the published
+/// check) and the dialog's frames while scrolling through them.
+#[test]
+#[ignore = "timing; run with --ignored --nocapture"]
+fn interactive_rebase_of_a_thousand_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    git_out(d, &["init", "-q", "-b", "main"]);
+    let mut script = String::new();
+    for i in 0..=1000 {
+        script.push_str(&format!(
+            "commit refs/heads/main\ncommitter T <t@x> {} +0000\ndata <<END\ncommit {i}\n\nbody of {i}\nEND\nM 644 inline f{i}\ndata 2\n{}\n\n",
+            1_800_000_000 + i,
+            i % 10
+        ));
+    }
+    let mut child = std::process::Command::new("git").current_dir(d).args(["fast-import", "--quiet"]).stdin(std::process::Stdio::piped()).spawn().unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), script.as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success());
+    git_out(d, &["reset", "-q", "--hard", "main"]);
+    // The older half is on the remote (as last fetched): the published
+    // check has something to find.
+    git_out(d, &["update-ref", "refs/remotes/origin/main", "HEAD~500"]);
+    let base = tine_core::model::Oid::from_hex(git_out(d, &["rev-parse", "HEAD~1000"]).trim().as_bytes()).unwrap();
+    let git = tine_core::GitRunner::new(d);
+    let load = || tine_core::interactive::load_range(&git, Some(base), &tine_core::CancelToken::default()).unwrap();
+    // Warm (the object files read once).
+    load();
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let t = Instant::now();
+        let r = load();
+        times.push(t.elapsed());
+        assert_eq!(r.commits.len(), 1000);
+        assert_eq!(r.commits.iter().filter(|c| c.published).count(), 500);
+    }
+    println!("reading 1000 commits (500 published) for an interactive rebase: {}", stats(times));
+
+    let mut h = Harness::builder().with_size([1360.0, 860.0]).build_eframe(|cc| tine::app::TineApp::new(cc, vec![d.into()]));
+    let start = Instant::now();
+    while !h.state().is_idle() {
+        assert!(start.elapsed() < Duration::from_secs(30));
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let t = Instant::now();
+    h.state_mut().active_tab_mut().unwrap().open_interactive_rebase(Some(base));
+    let mut first = None;
+    while first.is_none() {
+        let f = Instant::now();
+        h.step();
+        if matches!(h.state_mut().active_tab_mut().unwrap().dialog, Some(tine::repo::dialog::Dialog::InteractiveRebase(_))) {
+            h.step();
+            first = Some((t.elapsed(), f.elapsed()));
+        }
+        assert!(t.elapsed() < Duration::from_secs(30));
+    }
+    let (open, _) = first.unwrap();
+    println!("request → dialog shown: {open:.2?}");
+    h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(400.0, 400.0)));
+    h.step();
+    let times: Vec<Duration> = (0..200)
+        .map(|i| {
+            h.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, if i < 100 { -6.0 } else { 6.0 }),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let t = Instant::now();
+            h.step();
+            t.elapsed()
+        })
+        .collect();
+    println!("dialog frames while scrolling 1000 commits: {}", stats(times));
+}

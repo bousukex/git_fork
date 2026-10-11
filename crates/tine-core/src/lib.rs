@@ -10,6 +10,7 @@ pub mod fuzzy;
 pub mod highlight;
 pub mod graph;
 pub mod integrate;
+pub mod interactive;
 pub mod log;
 pub mod maintenance;
 pub mod model;

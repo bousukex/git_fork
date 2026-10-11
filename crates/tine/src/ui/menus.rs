@@ -33,6 +33,9 @@ pub enum RefAction {
     PushTag(String, String),
     /// Delete (remote, full ref) on the remote.
     DeleteRemote(String, String),
+    /// Interactive rebase of the commits after this one (`None`: from the
+    /// root, including it).
+    InteractiveRebase(Option<Oid>),
 }
 
 pub fn apply(tab: &mut RepoTab, a: RefAction) {
@@ -46,6 +49,7 @@ pub fn apply(tab: &mut RepoTab, a: RefAction) {
         RefAction::Rebase(t, l) => tab.request_rebase(&t, &l),
         RefAction::CherryPick(c) => tab.request_cherry_pick(&c),
         RefAction::Revert(c) => tab.request_revert(&c),
+        RefAction::InteractiveRebase(base) => tab.open_interactive_rebase(base),
         RefAction::Reset(o, l) => tab.request_reset(o, &l),
         RefAction::Rename(b) => tab.request_rename_branch(&b),
         RefAction::DeleteBranch(b) => tab.request_delete_branch(&b),
@@ -145,6 +149,14 @@ pub fn commit_menu(ui: &mut egui::Ui, tab: &RepoTab, c: &CommitSummary, out: &mu
         && item(ui, format!("Reset '{cur}' to Here…"), clean)
     {
         *out = Some(RefAction::Reset(c.id, label.clone()));
+    }
+    // The commits after this one (it has to be in HEAD's history; that is
+    // checked when the dialog opens).
+    if tab.head_commit() != Some(c.id) && item(ui, "Interactive Rebase from Here…", clean) {
+        *out = Some(RefAction::InteractiveRebase(Some(c.id)));
+    }
+    if c.parents.is_empty() && item(ui, "Interactive Rebase Including the Root…", clean) {
+        *out = Some(RefAction::InteractiveRebase(None));
     }
     ui.separator();
     if ui.button("Copy Commit Hash").clicked() {

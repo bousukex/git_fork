@@ -3,6 +3,11 @@ use std::path::PathBuf;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // Started by git as the editor of an interactive rebase (no window).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(code) = tine_core::interactive::run_editor(&args) {
+        std::process::exit(code);
+    }
     // Started by git or ssh to ask for credentials: answer through the app.
     if let Some(code) = tine::askpass::run_client() {
         std::process::exit(code);

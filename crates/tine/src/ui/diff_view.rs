@@ -215,7 +215,8 @@ fn rows(ui: &mut egui::Ui, doc: &DiffDoc, pane: &DiffPane, actions: Option<LineA
     let selectable = actions.is_some_and(|a| a.disabled.is_none());
     // Row where a drag selection started (kept while the button is held).
     let drag_id = ui.id().with("diff-drag");
-    let mut drag_anchor: Option<usize> = ui.data(|d| d.get_temp(drag_id));
+    // Stored as Option<usize>: read it as that type.
+    let mut drag_anchor: Option<usize> = ui.data(|d| d.get_temp::<Option<usize>>(drag_id)).flatten();
     let (pointer, primary_down) = ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
     if !primary_down {
         drag_anchor = None;
@@ -230,6 +231,15 @@ fn rows(ui: &mut egui::Ui, doc: &DiffDoc, pane: &DiffPane, actions: Option<LineA
                 let row = &doc.rows[i];
                 let sense = if selectable && row.is_change() { Sense::click_and_drag() } else { Sense::hover() };
                 let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), sense);
+                if selectable && row.is_change() {
+                    // For assistive technology (and UI tests).
+                    let (what, no) = match row.kind {
+                        RowKind::Added => ("added", row.new_no),
+                        _ => ("deleted", row.old_no),
+                    };
+                    let label = format!("{what} line {}", no.unwrap_or(0));
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, pane.selected_rows.contains(&i), &label));
+                }
 
                 if selectable && row.is_change() {
                     if resp.drag_started() || resp.clicked() {

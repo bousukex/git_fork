@@ -114,6 +114,19 @@ type Act = Box<dyn FnOnce(&mut RepoTab)>;
 /// Shows the tab's pending dialog, if any.
 pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
     let Some(mut dialog) = tab.dialog.take() else { return };
+    if let Dialog::InteractiveRebase(d) = &mut dialog {
+        let (dirty, busy) = (tab.status.has_tracked_changes(), tab.busy());
+        match super::rebase::show(ctx, d, dirty, busy) {
+            super::rebase::Outcome::Keep => tab.dialog = Some(dialog),
+            super::rebase::Outcome::Close => {}
+            super::rebase::Outcome::Start => {
+                if let Dialog::InteractiveRebase(d) = dialog {
+                    tab.start_interactive_rebase(*d);
+                }
+            }
+        }
+        return;
+    }
     let p = Palette::of(ctx);
     let mut act: Option<Act> = None;
     let mut cancel = false;
@@ -124,6 +137,7 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
     let modal = egui::Modal::new(egui::Id::new("repo-dialog")).show(ctx, |ui| {
         ui.set_width(460.0);
         match &mut dialog {
+            Dialog::InteractiveRebase(_) => unreachable!("shown above"),
             Dialog::CreateBranch { start, start_label, name, checkout } => {
                 ui.heading("Create Branch");
                 hint(ui, &format!("Starting at {start_label}"));
@@ -315,7 +329,7 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
                 }
                 cancel = no;
             }
-            Dialog::Reset { target, label, mode, lost, changed } => {
+            Dialog::Reset { target, label, mode, lost, changed, guard } => {
                 ui.heading(format!("Reset {current} to {label}"));
                 if *changed {
                     ui.label(
@@ -338,8 +352,8 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
                 hint(ui, "Commits after the target stay reachable from other refs or the reflog.");
                 let (ok, no) = buttons(ui, "Reset", *mode == ResetMode::Hard, true);
                 if ok {
-                    let (tg, m, l) = (*target, *mode, lost.clone());
-                    act = Some(Box::new(move |t| t.reset(tg, m, l)));
+                    let (tg, m, l, g) = (*target, *mode, lost.clone(), guard.clone());
+                    act = Some(Box::new(move |t| t.reset(tg, m, l, g)));
                 }
                 cancel = no;
             }

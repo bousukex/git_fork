@@ -250,7 +250,7 @@ fn reset_dialog_lists_what_hard_reset_loses() {
         d => panic!("{d:?}"),
     }
     tab.dialog = None;
-    tab.reset(base, tine_core::integrate::ResetMode::Soft, Vec::new());
+    tab.reset(base, tine_core::integrate::ResetMode::Soft, Vec::new(), None);
     assert!(poll_until(&mut tab, |t| idle(t) && t.head_commit() == Some(base)));
     assert_eq!(read(d, "g.txt"), "unsaved work\n", "soft keeps the work tree");
 }

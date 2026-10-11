@@ -105,10 +105,20 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     f(&mut s)
 }
 
-/// The executable git runs as askpass (tests point it at the built `tine`).
+/// The executable git runs as askpass and as the editor of an interactive
+/// rebase (tests point it at the built `tine`).
 pub fn set_program(path: impl Into<PathBuf>) {
     let path = path.into();
     with(|s| s.program = Some(path));
+}
+
+/// The `tine` executable git runs as a helper.
+pub fn program() -> anyhow::Result<PathBuf> {
+    use anyhow::Context as _;
+    match with(|s| s.program.clone()) {
+        Some(p) => Ok(p),
+        None => std::env::current_exe().context("can't find the tine executable"),
+    }
 }
 
 static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();

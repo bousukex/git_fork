@@ -10,6 +10,7 @@ pub mod history;
 pub mod menus;
 pub mod output;
 pub mod quick_launch;
+pub mod rebase;
 pub mod settings;
 pub mod sidebar;
 

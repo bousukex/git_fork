@@ -6,6 +6,15 @@ use tine_core::{
     model::{Oid, RepoState},
 };
 
+/// A reset that only makes sense while HEAD is still at `head` on `branch`
+/// (undoing an interactive rebase).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetGuard {
+    /// Full ref (`None`: detached HEAD).
+    pub branch: Option<String>,
+    pub head: Oid,
+}
+
 /// What a checkout switches to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutTarget {
@@ -37,6 +46,7 @@ pub enum Integration {
     Revert { commit: String },
     /// Pull `branch` (its name on the remote) from `remote`.
     Pull { remote: String, branch: String, rebase: bool },
+    InteractiveRebase { range: Box<tine_core::interactive::Range>, plan: Box<tine_core::interactive::Plan> },
 }
 
 impl Integration {
@@ -47,12 +57,15 @@ impl Integration {
             Integration::CherryPick { commit } => format!("cherry-pick {commit}"),
             Integration::Revert { commit } => format!("revert {commit}"),
             Integration::Pull { remote, branch, .. } => format!("pull {remote}/{branch}"),
+            Integration::InteractiveRebase { .. } => "rebase interactively".into(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
+    /// Planning an interactive rebase.
+    InteractiveRebase(Box<super::rebase::RebaseDialog>),
     CreateBranch { start: String, start_label: String, name: String, checkout: bool },
     RenameBranch { old: String, new: String },
     /// `force`: the branch has unmerged commits.
@@ -72,7 +85,7 @@ pub enum Dialog {
     DirtyTree { action: Integration },
     /// `lost`: what a hard reset destroys, as confirmed by the user; the
     /// reset re-checks it right before running.
-    Reset { target: Oid, label: String, mode: ResetMode, lost: Vec<String>, changed: bool },
+    Reset { target: Oid, label: String, mode: ResetMode, lost: Vec<String>, changed: bool, guard: Option<ResetGuard> },
     Stash { message: String, include_untracked: bool, keep_index: bool },
     DropStash { oid: Oid, label: String },
     Abort { state: RepoState },

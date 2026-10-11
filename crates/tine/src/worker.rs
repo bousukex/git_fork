@@ -66,6 +66,14 @@ pub enum FollowUp {
     ClearPendingAutostash(tine_core::model::Oid),
     /// Resolved conflicts of unknown origin were finished.
     ClearGenericConflict,
+    /// An interactive rebase stopped at an `edit` (show the commit box).
+    EditStop,
+    /// An interactive rebase started by Tine has ended.
+    RebaseEnded(Box<tine_core::interactive::Ended>),
+    /// Telling whether it ended failed (the session is kept).
+    RebaseEndFailed(String),
+    /// The finished interactive rebase was undone.
+    RebaseUndone,
 }
 
 /// An operation needs the user's decision before it can go on; the UI
@@ -80,7 +88,7 @@ pub enum NeedsDecision {
     /// whether to stash them first.
     LocalChanges(crate::repo::dialog::Integration),
     /// What a hard reset would destroy changed since it was confirmed.
-    ResetLossesChanged { target: tine_core::model::Oid, lost: Vec<String> },
+    ResetLossesChanged { target: tine_core::model::Oid, lost: Vec<String>, guard: Option<crate::repo::dialog::ResetGuard> },
 }
 
 impl std::fmt::Display for NeedsDecision {
@@ -125,6 +133,8 @@ pub enum Msg {
     /// The same blame with syntax highlighting.
     BlameHighlighted(Gen, Arc<BlameDoc>),
     Files(Gen, anyhow::Result<Arc<FileIndex>>),
+    /// The commits an interactive rebase from `base` would take.
+    RebaseRange(Gen, anyhow::Result<tine_core::interactive::Range>),
     /// The paths in a commit (HEAD), for "is this file committed?".
     HeadPaths(Gen, Oid, anyhow::Result<Arc<std::collections::HashSet<bstr::BString>>>),
 }
@@ -174,6 +184,9 @@ pub enum OpKind {
     Pull(String),
     Push(String),
     DeleteRemoteRef(String),
+    InteractiveRebase,
+    /// Noticing that an interactive rebase ended (also outside Tine).
+    FinishRebase,
 }
 
 impl OpKind {
@@ -216,6 +229,8 @@ impl OpKind {
             OpKind::Pull(_) => "Pull",
             OpKind::Push(_) => "Push",
             OpKind::DeleteRemoteRef(_) => "Delete on remote",
+            OpKind::InteractiveRebase => "Interactive rebase",
+            OpKind::FinishRebase => "Finish interactive rebase",
         }
     }
 }
@@ -475,6 +490,19 @@ impl Worker {
         });
         if let Err(e) = started {
             let _ = self.tx.send(Msg::Files(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// Reads what an interactive rebase from `base` would take.
+    pub fn rebase_range(&self, seq: Gen, base: Option<Oid>, cancel: CancelToken) {
+        let started = self.spawn("rebase-range", move |r, tx| {
+            let result = r.rebase_range(base, &cancel);
+            if !cancel.is_cancelled() {
+                let _ = tx.send(Msg::RebaseRange(seq, result));
+            }
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::RebaseRange(seq, Err(anyhow::anyhow!(e))));
         }
     }
 

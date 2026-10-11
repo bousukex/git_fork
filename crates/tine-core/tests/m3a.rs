@@ -257,7 +257,7 @@ fn cherry_pick_that_becomes_empty() {
     // Or keep it as an empty commit.
     let before = repo.git(["rev-list", "--count", "HEAD"]);
     assert_eq!(integrate::cherry_pick(&git, &git_dir(&repo), &picked).unwrap(), Step::Empty);
-    sequencer::commit_empty(&git).unwrap();
+    sequencer::commit_empty(&git, None).unwrap();
     assert_eq!(repo.git(["rev-list", "--count", "HEAD"]), (before.parse::<u32>().unwrap() + 1).to_string());
 }
 

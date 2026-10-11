@@ -21,6 +21,30 @@ pub enum Step {
     Conflicts,
     /// A cherry-pick/revert/rebase step would produce an empty commit.
     Empty,
+    /// Ended fine but the operation goes on later (an interactive rebase
+    /// stopped at an `edit`, a `break`…).
+    Stopped(StopReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// At an `edit` of this commit: amend it (or add commits), then continue.
+    Edit(crate::model::Oid),
+    Other,
+}
+
+/// Why an operation still in progress (without conflicts) stopped. Only
+/// an `edit` counts as one (git also leaves an `amend` file when a squash
+/// or fixup needs the user, which isn't).
+pub fn stop_reason(git_dir: &Path) -> StopReason {
+    if crate::interactive::last_command(git_dir) != Some(crate::interactive::Action::Edit) {
+        return StopReason::Other;
+    }
+    let amend = std::fs::read_to_string(git_dir.join("rebase-merge/amend")).unwrap_or_default();
+    match crate::model::Oid::from_hex(amend.trim().as_bytes()) {
+        Some(id) => StopReason::Edit(id),
+        None => StopReason::Other,
+    }
 }
 
 /// Runs a command that stops with exit code 1 when it hits conflicts. A
@@ -39,7 +63,14 @@ pub(crate) fn run_step_with(
     command: impl FnOnce() -> Result<Vec<u8>>,
 ) -> Result<Step> {
     match command() {
-        Ok(_) => Ok(if status::has_conflicts(git)? { Step::Conflicts } else { Step::Done }),
+        Ok(_) => Ok(if status::has_conflicts(git)? {
+            Step::Conflicts
+        } else if repo_state(git_dir) == expect {
+            // Succeeded, yet still going (it stopped to let the user act).
+            Step::Stopped(stop_reason(git_dir))
+        } else {
+            Step::Done
+        }),
         Err(e) => {
             if e.downcast_ref::<crate::Cancelled>().is_some() {
                 return Err(e);

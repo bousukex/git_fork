@@ -3,6 +3,7 @@
 mod actions;
 pub mod browse;
 pub mod dialog;
+pub mod rebase;
 pub mod remote;
 pub mod search;
 
@@ -294,6 +295,17 @@ pub struct RepoTab {
     pub pending_autostash: Option<Oid>,
     /// (current, total) while a rebase is in progress.
     pub rebase_progress: Option<(usize, usize)>,
+    /// Why a rebase in progress stopped (without conflicts).
+    pub rebase_stop: Option<tine_core::integrate::StopReason>,
+    /// The rebase in progress was started by Tine (its messages apply).
+    pub rebase_session: bool,
+    rebase_finish_tried: Option<String>,
+    /// The last interactive rebase finished (it can be undone).
+    pub rebase_done: Option<rebase::RebaseDone>,
+    rebase_range_seq: Gen,
+    rebase_range_cancel: Option<CancelToken>,
+    /// The edit stop the commit box was last set up for.
+    last_edit_stop: Option<Oid>,
     /// Operation to expand (and scroll to) in the Output panel.
     pub output_focus: Option<OpId>,
     /// Some finished operation may have moved refs.
@@ -400,6 +412,13 @@ impl RepoTab {
             stash_conflict: None,
             pending_autostash: None,
             rebase_progress: None,
+            rebase_stop: None,
+            rebase_session: false,
+            rebase_finish_tried: None,
+            rebase_done: None,
+            rebase_range_seq: 0,
+            rebase_range_cancel: None,
+            last_edit_stop: None,
             output_focus: None,
             ops_moved_refs: false,
             search: search::Search::default(),
@@ -460,6 +479,8 @@ impl RepoTab {
 
     /// Reloads refs, status and history.
     pub fn refresh(&mut self) {
+        // Tidying up after an interactive rebase is tried again.
+        self.rebase_finish_tried = None;
         self.request_refs(false);
         self.refresh_status();
         self.reload_history();
@@ -540,8 +561,26 @@ impl RepoTab {
 
     /// Opens a dialog (replacing any other).
     pub fn show_dialog(&mut self, d: dialog::Dialog) {
+        // Commits being read for a rebase dialog no longer get one.
+        if !matches!(d, dialog::Dialog::InteractiveRebase(_)) {
+            self.stop_rebase_range();
+        }
         self.dialog = Some(d);
         self.modal_shown();
+    }
+
+    /// Turns Amend off, discarding the commit message it loaded (back to
+    /// what was being written before).
+    fn cancel_amend(&mut self) {
+        if !self.amend {
+            return;
+        }
+        self.amend = false;
+        // Ignore a HEAD message still on its way.
+        self.head_message_seq = self.gens.bump();
+        let (subject, body) = self.amend_draft.take().unwrap_or_default();
+        self.commit_subject = subject;
+        self.commit_body = body;
     }
 
     fn modal_shown(&mut self) {
@@ -594,6 +633,7 @@ impl RepoTab {
                     self.status = st;
                     self.status_loaded = true;
                     self.rebase_progress = tine_core::status::rebase_progress(&self.paths.git_dir);
+                    self.check_rebase_session();
                     self.sync_commit_box_with_state();
                     if self.status.state == RepoState::Clean
                         && self.stash_conflict.is_none()
@@ -628,6 +668,7 @@ impl RepoTab {
             Msg::FileHistoryDone(seq, r) => self.on_file_history_done(seq, r),
             Msg::Blame(seq, r) => self.on_blame(seq, r),
             Msg::BlameHighlighted(seq, doc) => self.on_blame_highlighted(seq, doc),
+            Msg::RebaseRange(seq, r) if seq == self.rebase_range_seq && seq != 0 => self.on_rebase_range(r),
             Msg::Files(seq, r) if seq == self.files_seq => {
                 self.files_seq = 0;
                 self.files_cancel = None;
@@ -1062,6 +1103,12 @@ impl RepoTab {
         let state_ok = match self.status.state {
             RepoState::Clean => self.amend || !self.status.staged.is_empty(),
             RepoState::Merging => !self.amend,
+            // Stopped at an `edit`: amend that commit, or add new ones.
+            RepoState::Rebasing => match self.edit_stop() {
+                Some(id) if self.amend => self.head_commit() == Some(id),
+                Some(_) => !self.status.staged.is_empty(),
+                None => false,
+            },
             _ => false,
         };
         !self.busy() && !self.commit_subject.trim().is_empty() && self.status.conflicted.is_empty() && state_ok
@@ -1075,7 +1122,20 @@ impl RepoTab {
         let amend = self.amend;
         let merging = self.status.state == RepoState::Merging;
         let kind = OpKind::Commit { message: message.clone(), amend };
+        // At an edit stop: only if git is still there, with HEAD as shown.
+        let guard = (self.status.state == RepoState::Rebasing).then(|| (self.edit_stop(), self.head_commit()));
+        let git_dir = self.paths.git_dir.clone();
         self.run_op(kind, move |git| {
+            if let Some((stop, head)) = guard {
+                let now = match tine_core::integrate::stop_reason(&git_dir) {
+                    tine_core::integrate::StopReason::Edit(id) => Some(id),
+                    _ => None,
+                };
+                let head_now = tine_core::interactive::head_now(git).ok().map(|(h, _)| h);
+                if stop.is_none() || now != stop || head_now != head {
+                    anyhow::bail!("the rebase moved on since; nothing was committed");
+                }
+            }
             let opts = ops::CommitOptions { amend, allow_empty: merging };
             // Amending only the message must work with nothing staged.
             let opts = if amend { ops::CommitOptions { allow_empty: true, ..opts } } else { opts };
@@ -1088,7 +1148,7 @@ impl RepoTab {
     /// Toggles amend. Turning it on sets the draft aside and loads HEAD's
     /// message for editing; turning it off brings the draft back.
     pub fn set_amend(&mut self, amend: bool) {
-        if amend == self.amend || (amend && self.status.state != RepoState::Clean) {
+        if amend == self.amend || (amend && self.status.state != RepoState::Clean && self.edit_stop().is_none()) {
             return;
         }
         self.amend = amend;
@@ -1323,8 +1383,12 @@ impl RepoTab {
             }
         } else if !in_progress && self.merge_msg_loaded {
             // Finished (the commit cleared the box) or aborted (the box still
-            // holds the operation's message): bring the draft back.
+            // holds the operation's message): bring the draft back — not in
+            // Amend (armed for an edit stop, it would rewrite HEAD).
             self.merge_msg_loaded = false;
+            self.amend = false;
+            self.amend_draft = None;
+            self.head_message_seq = self.gens.bump();
             self.commit_subject.clear();
             self.commit_body.clear();
             if let Some((subject, body)) = self.op_draft.take() {
@@ -1392,6 +1456,7 @@ impl Drop for RepoTab {
     fn drop(&mut self) {
         use crate::{ops_registry::OrphanedResult, worker::FollowUp};
         self.stop_browse();
+        self.stop_rebase_range();
         if let Some(c) = self.files_cancel.take() {
             c.cancel();
         }

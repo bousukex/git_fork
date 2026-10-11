@@ -107,21 +107,33 @@ pub fn run<T>(
     any_change: bool,
     op: impl FnOnce() -> Result<T>,
 ) -> (Result<T>, AutoStash) {
+    run_with_stash(git, git_dir, label, any_change, |_| op())
+}
+
+/// [`run`], telling `op` the stash it made (if any), e.g. to record it
+/// before starting something that may stop half-way.
+pub fn run_with_stash<T>(
+    git: &GitRunner,
+    git_dir: &Path,
+    label: &str,
+    any_change: bool,
+    op: impl FnOnce(Option<Oid>) -> Result<T>,
+) -> (Result<T>, AutoStash) {
     let dirty = if any_change { status::has_any_changes(git) } else { status::has_tracked_changes(git) };
     let dirty = match dirty {
         Ok(d) => d,
         Err(e) => return (Err(e), AutoStash::NotNeeded),
     };
     if !dirty {
-        return (op(), AutoStash::NotNeeded);
+        return (op(None), AutoStash::NotNeeded);
     }
     let start = head(git);
     let oid = match stash::push(git, &format!("tine: auto stash before {label}"), true, false) {
         Ok(Some(oid)) => oid,
-        Ok(None) => return (op(), AutoStash::NotNeeded),
+        Ok(None) => return (op(None), AutoStash::NotNeeded),
         Err(e) => return (Err(e), AutoStash::NotNeeded),
     };
-    let result = op();
+    let result = op(Some(oid));
     // Recovery must complete even if the user cancelled the operation.
     let git = git.uncancellable();
     let report = if repo_state(git_dir) != RepoState::Clean {

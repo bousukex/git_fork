@@ -277,10 +277,15 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
             .desired_width(f32::INFINITY),
     );
     let state = tab.status.state;
+    let edit_stop = tab.edit_stop();
     if matches!(state, RepoState::Rebasing | RepoState::CherryPicking | RepoState::Reverting) {
         // These continue with the original commit message.
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Continuing keeps the commit's original message").small().color(p.text_weak));
+            let note = match edit_stop {
+                Some(_) => "Amend, or commit new changes",
+                None => "Continuing keeps the commit's original message",
+            };
+            ui.label(RichText::new(note).small().color(p.text_weak));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let what = match state {
                     RepoState::Rebasing => "Continue Rebase",
@@ -291,17 +296,20 @@ fn commit_box(ui: &mut egui::Ui, tab: &mut RepoTab, history: &[String]) {
                 let resp = ui
                     .add_enabled(can, egui::Button::new(RichText::new(what).strong()))
                     .on_disabled_hover_text("Resolve the conflicts first");
-                if resp.clicked() || (ctrl_enter && can) {
+                // During an edit stop Ctrl+Enter commits (below) instead.
+                if resp.clicked() || (ctrl_enter && can && edit_stop.is_none()) {
                     tab.continue_op();
                 }
             });
         });
-        return;
+        if edit_stop.is_none() {
+            return;
+        }
     }
     ui.horizontal(|ui| {
         let mut amend = tab.amend;
         if ui
-            .add_enabled(!tab.busy() && state == RepoState::Clean, egui::Checkbox::new(&mut amend, "Amend"))
+            .add_enabled(!tab.busy() && (state == RepoState::Clean || edit_stop.is_some()), egui::Checkbox::new(&mut amend, "Amend"))
             .on_hover_text("Replace the last commit (message and staged changes)")
             .changed()
         {

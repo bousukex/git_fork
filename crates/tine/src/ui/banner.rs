@@ -45,9 +45,16 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             RepoState::Reverting => "Revert in progress".into(),
             _ => unreachable!(),
         };
+        let note = match tab.edit_stop() {
+            Some(id) => format!("— stopped at {} to edit: amend it or add commits, then Continue", id.short()),
+            None if state == RepoState::Rebasing && tab.rebase_stop.is_some() && conflicts == 0 => {
+                "— stopped; continue when ready".to_owned()
+            }
+            None => format!("— {}", conflicts_text(conflicts)),
+        };
         frame(ui, |ui| {
             ui.label(RichText::new(title).strong());
-            ui.label(RichText::new(format!("— {}", conflicts_text(conflicts))).color(p.text_weak));
+            ui.add(egui::Label::new(RichText::new(note).color(p.text_weak)).truncate());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(!busy, egui::Button::new("Abort…")).clicked() {
                     tab.request_abort();
@@ -72,6 +79,18 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                     }
                 }
             });
+        });
+    }
+
+    if state == RepoState::Rebasing && tab.rebase_session {
+        frame(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "Started in Tine: continue, skip or abort here (not with git on the command line), so the messages you wrote are used.",
+                )
+                .small()
+                .color(p.text_weak),
+            );
         });
     }
 
@@ -126,6 +145,26 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                     }
                 });
             }
+        });
+    }
+
+    if let Some(done) = tab.rebase_done.clone() {
+        frame(ui, |ui| {
+            let on = done.branch.as_deref().map(tine_core::interactive::branch_name).unwrap_or("HEAD").to_owned();
+            ui.label(format!("Rebased '{on}' interactively; it was at {} before.", done.previous.short()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Dismiss").clicked() {
+                    tab.rebase_done = None;
+                }
+                if ui
+                    .add_enabled(!busy && tab.can_undo_rebase(), egui::Button::new("Undo Rebase…"))
+                    .on_hover_text("Reset to where it was before (you see what a hard reset would discard first)")
+                    .on_disabled_hover_text("Only while the branch is still where the rebase left it")
+                    .clicked()
+                {
+                    tab.undo_rebase();
+                }
+            });
         });
     }
 

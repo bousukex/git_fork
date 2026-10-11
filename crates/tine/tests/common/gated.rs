@@ -35,11 +35,17 @@ impl Gate {
 
     fn wait(&self) {
         self.total.fetch_add(1, Ordering::Relaxed);
-        if !self.on.load(Ordering::Relaxed) {
-            return;
-        }
-        let (tx, rx) = bounded(1);
-        self.calls.lock().unwrap().push(Some(tx));
+        // Checked and queued under the lock `open` takes: a call can't slip
+        // in between its check and `open` releasing the queue.
+        let rx = {
+            let mut calls = self.calls.lock().unwrap();
+            if !self.on.load(Ordering::Relaxed) {
+                return;
+            }
+            let (tx, rx) = bounded(1);
+            calls.push(Some(tx));
+            rx
+        };
         // An error means the gate is gone (the test ended): go on.
         let _ = rx.recv();
     }
@@ -71,8 +77,9 @@ impl Gate {
 
     /// Lets every call through from now on.
     pub fn open(&self) {
+        let mut calls = self.calls.lock().unwrap();
         self.on.store(false, Ordering::Relaxed);
-        for tx in self.calls.lock().unwrap().iter_mut().filter_map(Option::take) {
+        for tx in calls.iter_mut().filter_map(Option::take) {
             let _ = tx.send(());
         }
     }
@@ -87,6 +94,7 @@ pub struct Gates {
     pub blame: Gate,
     pub files: Gate,
     pub diff: Gate,
+    pub rebase_range: Gate,
     /// Calls that ended stopped (git never ran, or was stopped).
     pub stopped_diffs: AtomicUsize,
     pub stopped_blames: AtomicUsize,
@@ -158,6 +166,10 @@ impl RepoReader for Gated {
     }
     fn paths_at(&self, rev: Oid, cancel: &CancelToken) -> anyhow::Result<Vec<BString>> {
         self.inner.paths_at(rev, cancel)
+    }
+    fn rebase_range(&self, base: Option<Oid>, cancel: &CancelToken) -> anyhow::Result<tine_core::interactive::Range> {
+        self.gates.rebase_range.wait();
+        self.inner.rebase_range(base, cancel)
     }
 }
 

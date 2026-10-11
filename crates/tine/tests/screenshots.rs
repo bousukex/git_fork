@@ -585,3 +585,135 @@ fn settings_git_and_tools() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn interactive_rebase_dialog() {
+    let _serial = serial();
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path().to_path_buf();
+    let mut t = 1_760_000_000;
+    git(&path, &["init", "-q", "-b", "main"], &mut t);
+    git(&path, &["config", "user.name", "山田 太郎"], &mut t);
+    git(&path, &["config", "user.email", "taro@example.com"], &mut t);
+    for (i, subject) in ["プロジェクトを作成", "設定ファイルを読み込む", "typo を修正", "ログ出力を追加", "WIP: 設定の検証", "README に使い方を書く"]
+        .iter()
+        .enumerate()
+    {
+        std::fs::write(path.join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+        git(&path, &["add", "-A"], &mut t);
+        git(&path, &["commit", "-qm", subject], &mut t);
+    }
+    shoot(
+        "interactive_rebase",
+        [1300.0, 820.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            let out = std::process::Command::new("git").current_dir(&path).args(["rev-parse", "HEAD~5"]).output().unwrap();
+            let base = tine_core::model::Oid::from_hex(String::from_utf8(out.stdout).unwrap().trim().as_bytes()).unwrap();
+            h.state_mut().active_tab_mut().unwrap().open_interactive_rebase(Some(base));
+            settle(h);
+            if let Some(tine::repo::dialog::Dialog::InteractiveRebase(d)) = &mut h.state_mut().active_tab_mut().unwrap().dialog {
+                // The typo fix melded into the commit before it; WIP
+                // squashed into the logging; the README reworded.
+                d.set_action(1, tine_core::interactive::Action::Fixup);
+                d.set_action(3, tine_core::interactive::Action::Squash);
+                d.set_action(4, tine_core::interactive::Action::Reword);
+                d.selected = Some(3);
+            }
+            h.run_steps(6);
+        },
+    );
+}
+
+/// The dialog in a small window with everything it can warn about:
+/// published commits, a plan that can't run, a message set aside, local
+/// changes to stash.
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn interactive_rebase_dialog_small() {
+    let _serial = serial();
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path().to_path_buf();
+    let mut t = 1_760_000_000;
+    git(&path, &["init", "-q", "-b", "main"], &mut t);
+    git(&path, &["config", "user.name", "山田 太郎"], &mut t);
+    git(&path, &["config", "user.email", "taro@example.com"], &mut t);
+    for (i, subject) in ["プロジェクトを作成", "設定ファイルを読み込む", "typo を修正", "ログ出力を追加", "WIP: 設定の検証", "README に使い方を書く"]
+        .iter()
+        .enumerate()
+    {
+        std::fs::write(path.join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+        git(&path, &["add", "-A"], &mut t);
+        git(&path, &["commit", "-qm", subject], &mut t);
+    }
+    git(&path, &["update-ref", "refs/remotes/origin/main", "HEAD~3"], &mut t);
+    std::fs::write(path.join("f0.txt"), "changed\n").unwrap();
+    shoot(
+        "interactive_rebase_small",
+        [720.0, 480.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            let out = std::process::Command::new("git").current_dir(&path).args(["rev-parse", "HEAD~5"]).output().unwrap();
+            let base = tine_core::model::Oid::from_hex(String::from_utf8(out.stdout).unwrap().trim().as_bytes()).unwrap();
+            h.state_mut().active_tab_mut().unwrap().open_interactive_rebase(Some(base));
+            settle(h);
+            if let Some(tine::repo::dialog::Dialog::InteractiveRebase(d)) = &mut h.state_mut().active_tab_mut().unwrap().dialog {
+                use tine_core::interactive::Action;
+                // A combined message written, then the group broken up: set
+                // aside. The oldest squashed into nothing: can't run.
+                d.set_action(2, Action::Squash);
+                let anchor = d.plan.items[1].0;
+                d.set_group_message(anchor, "設定の読み込みと typo の修正".into());
+                d.set_action(2, Action::Pick);
+                d.set_action(0, Action::Squash);
+                d.selected = Some(4);
+            }
+            h.run_steps(6);
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn interactive_rebase_edit_stop() {
+    let _serial = serial();
+    tine::askpass::set_program(env!("CARGO_BIN_EXE_tine"));
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path().to_path_buf();
+    let mut t = 1_760_000_000;
+    git(&path, &["init", "-q", "-b", "main"], &mut t);
+    git(&path, &["config", "user.name", "山田 太郎"], &mut t);
+    git(&path, &["config", "user.email", "taro@example.com"], &mut t);
+    for (i, subject) in ["プロジェクトを作成", "設定ファイルを読み込む", "ログ出力を追加"].iter().enumerate() {
+        std::fs::write(path.join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+        git(&path, &["add", "-A"], &mut t);
+        git(&path, &["commit", "-qm", subject], &mut t);
+    }
+    // Both themes run on this repository: the rebase starts once.
+    shoot(
+        "interactive_rebase_edit",
+        [1300.0, 760.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            if h.state_mut().active_tab_mut().unwrap().status.state == tine_core::model::RepoState::Clean {
+                let out = std::process::Command::new("git").current_dir(&path).args(["rev-parse", "HEAD~2"]).output().unwrap();
+                let base = tine_core::model::Oid::from_hex(String::from_utf8(out.stdout).unwrap().trim().as_bytes()).unwrap();
+                h.state_mut().active_tab_mut().unwrap().open_interactive_rebase(Some(base));
+                settle(h);
+                let tab = h.state_mut().active_tab_mut().unwrap();
+                if let Some(tine::repo::dialog::Dialog::InteractiveRebase(d)) = tab.dialog.take() {
+                    let mut d = *d;
+                    d.set_action(0, tine_core::interactive::Action::Edit);
+                    tab.start_interactive_rebase(d);
+                }
+                settle(h);
+            }
+            h.state_mut().active_tab_mut().unwrap().set_amend(true);
+            settle(h);
+        },
+    );
+}
