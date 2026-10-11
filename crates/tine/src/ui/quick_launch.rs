@@ -77,6 +77,7 @@ const COMMANDS: &[Command] = &[
     Command::ToggleOutput,
     Command::OpenRepository,
     Command::CloseTab,
+    Command::Settings,
 ];
 
 const MAX_SHOWN: usize = 50;

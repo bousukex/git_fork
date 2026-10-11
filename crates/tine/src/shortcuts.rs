@@ -23,6 +23,7 @@ pub enum Command {
     CloseTab,
     Refresh,
     ToggleOutput,
+    Settings,
     DebugOverlay,
 }
 
@@ -44,13 +45,22 @@ impl Command {
             Command::CloseTab => "Close Repository Tab",
             Command::Refresh => "Refresh",
             Command::ToggleOutput => "Show/Hide Output",
+            Command::Settings => "Settings…",
             Command::DebugOverlay => "Debug Overlay",
         }
     }
 
     /// Needs an open repository.
     pub fn needs_repo(self) -> bool {
-        !matches!(self, Command::QuickLaunch | Command::OpenRepository | Command::DebugOverlay | Command::NextTab | Command::PreviousTab)
+        !matches!(
+            self,
+            Command::QuickLaunch
+                | Command::OpenRepository
+                | Command::Settings
+                | Command::DebugOverlay
+                | Command::NextTab
+                | Command::PreviousTab
+        )
     }
 }
 
@@ -89,6 +99,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     sc(Command::CloseTab, CTRL, Key::W, false),
     sc(Command::Refresh, NONE, Key::F5, false),
     sc(Command::Refresh, CTRL, Key::R, false),
+    sc(Command::Settings, CTRL, Key::Comma, false),
     sc(Command::DebugOverlay, NONE, Key::F12, false),
 ];
 
@@ -104,6 +115,17 @@ pub enum Scope {
     CommitBox,
     /// The topmost overlay (search bar).
     Overlay,
+}
+
+impl Scope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::FileList => "File list",
+            Scope::SearchBar => "Search bar",
+            Scope::CommitBox => "Commit message",
+            Scope::Overlay => "Search, File History, Blame",
+        }
+    }
 }
 
 /// View-local keys, listed for the settings and checked against the global
@@ -122,17 +144,21 @@ pub const LOCAL_KEYS: &[(Scope, Modifiers, Key, &str)] = &[
 
 /// Human-readable keys, e.g. "Ctrl+Shift+P".
 pub fn key_text(s: &Shortcut) -> String {
+    keys_text(s.modifiers, s.key)
+}
+
+pub fn keys_text(modifiers: Modifiers, key: Key) -> String {
     let mut parts = Vec::new();
-    if s.modifiers.command || s.modifiers.ctrl {
+    if modifiers.command || modifiers.ctrl {
         parts.push("Ctrl".to_owned());
     }
-    if s.modifiers.alt {
+    if modifiers.alt {
         parts.push("Alt".to_owned());
     }
-    if s.modifiers.shift {
+    if modifiers.shift {
         parts.push("Shift".to_owned());
     }
-    parts.push(s.key.symbol_or_name().to_owned());
+    parts.push(key.symbol_or_name().to_owned());
     parts.join("+")
 }
 

@@ -442,3 +442,112 @@ fn file_history_and_blame() {
         );
     }
 }
+
+/// A Rust file with a few kinds of tokens, changed in the work tree.
+fn rust_change_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut t = 1_760_000_000;
+    git(d, &["init", "-q", "-b", "main"], &mut t);
+    git(d, &["config", "user.name", "山田 太郎"], &mut t);
+    git(d, &["config", "user.email", "taro@example.com"], &mut t);
+    let before = r#"use std::collections::HashMap;
+
+/// Counts words in `text`.
+pub struct Counter {
+    counts: HashMap<String, usize>,
+    limit: usize,
+}
+
+impl Counter {
+    pub fn new(limit: usize) -> Self {
+        Counter { counts: HashMap::new(), limit }
+    }
+
+    pub fn add(&mut self, text: &str) {
+        for word in text.split_whitespace() {
+            *self.counts.entry(word.to_owned()).or_insert(0) += 1;
+        }
+    }
+
+    pub fn top(&self) -> Vec<(&str, usize)> {
+        let mut all: Vec<_> = self.counts.iter().map(|(w, n)| (w.as_str(), *n)).collect();
+        all.sort_by(|a, b| b.1.cmp(&a.1));
+        all.truncate(self.limit);
+        all
+    }
+}
+"#;
+    std::fs::write(d.join("counter.rs"), before).unwrap();
+    git(d, &["add", "-A"], &mut t);
+    git(d, &["commit", "-q", "-m", "単語を数える"], &mut t);
+    let after = before
+        .replace("/// Counts words in `text`.", "/// Counts words in `text` (case-insensitive).")
+        .replace(
+            "            *self.counts.entry(word.to_owned()).or_insert(0) += 1;",
+            "            // 大文字と小文字を区別しない\n            let key = word.to_lowercase();\n            *self.counts.entry(key).or_insert(0) += 1;",
+        )
+        .replace("        all.sort_by(|a, b| b.1.cmp(&a.1));", "        all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));");
+    std::fs::write(d.join("counter.rs"), after).unwrap();
+    dir
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn highlighted_diff() {
+    let _serial = serial();
+    let repo = rust_change_repo();
+    let path = repo.path().to_path_buf();
+    // The default look, and a larger code font with wider tabs.
+    for (name, settings) in [
+        ("highlighted_diff", tine::settings::Settings::default()),
+        ("highlighted_diff_large", tine::settings::Settings { diff_font_size: 17.0, tab_width: 8, syntax_highlighting: true }),
+    ] {
+        shoot_highlighted_diff(name, &path, settings);
+    }
+}
+
+fn shoot_highlighted_diff(name: &str, path: &std::path::Path, settings: tine::settings::Settings) {
+    shoot(
+        name,
+        [1360.0, 760.0],
+        |cc| {
+            let mut app = tine::app::TineApp::new(cc, vec![path.to_path_buf()]);
+            app.set_settings(settings);
+            app.show_local_changes();
+            app
+        },
+        |h| {
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            let f = tab.list(tine::repo::Side::Unstaged).into_iter().find(|f| f.path == "counter.rs").unwrap();
+            tab.click_change(tine::repo::Side::Unstaged, &f, false, false);
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            let Some(Ok(doc)) = &tab.changes_diff.doc else { panic!("no diff") };
+            assert!(doc.rows.iter().any(|r| !r.spans.is_empty()), "colored");
+            // One selected line, to show selection over colors.
+            let row = doc.rows.iter().position(|r| r.text.contains("to_lowercase")).unwrap();
+            tab.select_diff_rows([row].into(), Some(row));
+            h.run_steps(2);
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn settings_dialog() {
+    let _serial = serial();
+    let repo = sample_repo();
+    let path = repo.path().to_path_buf();
+    shoot(
+        "settings",
+        [1200.0, 820.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            h.state_mut().run_command(tine::shortcuts::Command::Settings);
+            h.run_steps(6);
+        },
+    );
+}

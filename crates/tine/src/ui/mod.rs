@@ -10,13 +10,17 @@ pub mod history;
 pub mod menus;
 pub mod output;
 pub mod quick_launch;
+pub mod settings;
 pub mod sidebar;
 
 use std::sync::Arc;
 
 use bstr::{BString, ByteSlice};
-use egui::{Align2, Color32, FontId, Galley, Painter, Pos2, Rect, text::LayoutJob};
-use tine_core::model::ChangeKind;
+use egui::{
+    Align2, Color32, FontId, Galley, Painter, Pos2, Rect,
+    text::{LayoutJob, TextFormat},
+};
+use tine_core::{highlight::Span, model::ChangeKind};
 
 use crate::theme::Palette;
 
@@ -27,6 +31,29 @@ pub fn truncated(painter: &Painter, text: &str, font: FontId, color: Color32, ma
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     job.wrap.overflow_character = Some('…');
+    painter.layout_job(job)
+}
+
+/// Lays out one line of code, colored by its syntax `spans` (plain
+/// without any).
+pub fn code_galley(painter: &Painter, text: &str, spans: &[Span], font: FontId, color: Color32, p: &Palette) -> Arc<Galley> {
+    if spans.is_empty() {
+        return painter.layout_no_wrap(text.to_owned(), font, color);
+    }
+    let format = |color| TextFormat { font_id: font.clone(), color, ..Default::default() };
+    let mut job = LayoutJob::default();
+    let mut at = 0;
+    for s in spans {
+        let (start, end) = (s.start as usize, s.end as usize);
+        let (Some(before), Some(token)) = (text.get(at..start), text.get(start..end)) else {
+            // Spans of some other text: show it plain.
+            return painter.layout_no_wrap(text.to_owned(), font, color);
+        };
+        job.append(before, 0.0, format(color));
+        job.append(token, 0.0, format(p.syntax_color(s.token)));
+        at = end;
+    }
+    job.append(text.get(at..).unwrap_or_default(), 0.0, format(color));
     painter.layout_job(job)
 }
 

@@ -167,6 +167,10 @@ fn tracked_files_for_quick_launch() {
 
 use common::gated::{Gate, Gates, gated_tab};
 
+fn plain() -> tine::settings::DocOptions {
+    tine::settings::DocOptions { highlight: false, ..Default::default() }
+}
+
 fn wait_arrived(tab: &mut RepoTab, gate: &Gate, n: usize) {
     assert!(poll_until(tab, |_| gate.arrived() >= n), "{} of {n} calls arrived", gate.arrived());
 }
@@ -175,6 +179,8 @@ fn wait_arrived(tab: &mut RepoTab, gate: &Gate, n: usize) {
 fn an_older_blame_arriving_last_is_dropped() {
     let repo = sample_repo();
     let (mut tab, gates) = gated_tab(repo.path(), Gates { blame: Gate::closed(), ..Default::default() });
+    // Plain only: a colored copy would replace the doc compared below.
+    tab.set_doc_options(plain());
     tab.open_blame(None, "README.md".into(), None);
     wait_arrived(&mut tab, &gates.blame, 1);
     let first = blame_view(&tab).cancel_token();
@@ -248,6 +254,7 @@ fn file_listing_is_redone_after_changes_and_failures() {
 fn a_diff_for_old_options_is_dropped() {
     let repo = sample_repo();
     let (mut tab, gates) = gated_tab(repo.path(), Gates { diff: Gate::closed(), ..Default::default() });
+    tab.set_doc_options(plain());
     let head = tab.head_commit().unwrap();
     tab.open_file_history(head, "README.md".into(), None);
     assert!(poll_until(&mut tab, |t| !history_view(t).loading));

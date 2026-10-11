@@ -203,6 +203,8 @@ fn quick_launch_opens_a_recent_repository_in_the_background() {
     // b is a recent repository (opened once, then closed).
     h.state_mut().run_command(tine::shortcuts::Command::QuickLaunch);
     h.state_mut().quick_launch().unwrap();
+    // Keys of the frame in which it takes the keyboard aren't its own.
+    h.run_steps(1);
     h.key_press(Key::Escape);
     h.run_steps(1);
     let canon = b.path().canonicalize().unwrap();

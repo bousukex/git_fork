@@ -155,7 +155,29 @@ impl RepoTab {
         view.cancel = CancelToken::default();
         view.seq = self.gens.bump();
         view.doc = None;
-        self.worker.blame(view.seq, view.path.clone(), view.rev, view.ignore_whitespace, view.cancel.clone());
+        self.worker.blame(view.seq, view.path.clone(), view.rev, view.ignore_whitespace, self.doc_opts, view.cancel.clone());
+    }
+
+    /// Prepares the loaded blames again for new display options (no git
+    /// run; the current ones stay up meanwhile). One still loading starts
+    /// over.
+    pub(super) fn rebuild_blames(&mut self) {
+        let mut browse = std::mem::take(&mut self.browse);
+        for b in &mut browse {
+            let Browse::Blame(view) = b else { continue };
+            match &view.doc {
+                Some(Ok(doc)) => {
+                    let doc = doc.clone();
+                    view.cancel.cancel();
+                    view.cancel = CancelToken::default();
+                    view.seq = self.gens.bump();
+                    self.worker.rebuild_blame(view.seq, doc, view.path.clone(), self.doc_opts, view.cancel.clone());
+                }
+                None => self.request_blame(view),
+                Some(Err(_)) => {}
+            }
+        }
+        self.browse = browse;
     }
 
     /// Blames the top view again (whitespace option changed, or the work
@@ -218,9 +240,7 @@ impl RepoTab {
         let Some(entry) = v.entries.get(i) else { return };
         let file = change_of(entry);
         let source = DiffSource::Commit { id: entry.commit.id, parent: entry.commit.parents.first().copied() };
-        let seq = self.gens.bump();
-        self.browse_diff = DiffPane { file: Some(file.clone()), source: Some(source), seq, ..Default::default() };
-        self.worker.diff(seq, source, file, self.diff_opts);
+        self.browse_diff = self.load_diff(file, source);
     }
 
     /// File History from a file of a commit; a file the commit deleted is
@@ -347,6 +367,18 @@ impl RepoTab {
                     v.selected = Some(line.min(last));
                 }
                 v.doc = Some(result.map_err(|e| format!("{e:#}")));
+                return;
+            }
+        }
+    }
+
+    pub(super) fn on_blame_highlighted(&mut self, seq: Gen, doc: Arc<BlameDoc>) {
+        for b in &mut self.browse {
+            if let Browse::Blame(v) = b
+                && v.seq == seq
+                && matches!(v.doc, Some(Ok(_)))
+            {
+                v.doc = Some(Ok(doc));
                 return;
             }
         }

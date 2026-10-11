@@ -14,7 +14,7 @@ fn file(path: &str) -> ChangedFile {
 }
 
 fn diff(repo: &TestRepo, source: DiffSource, path: &str) -> FileDiff {
-    repo.reader().file_diff(source, &file(path), DiffOptions::default()).unwrap()
+    repo.reader().file_diff(source, &file(path), DiffOptions::default(), &tine_core::CancelToken::default()).unwrap()
 }
 
 /// (hunk, line) of the changed line whose content is `text`.

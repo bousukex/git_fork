@@ -6,6 +6,11 @@ use anyhow::Result;
 use tine_core::{CancelToken, CliReader, RepoReader, graph::Graph, log::LogOptions};
 
 /// Peak and current resident memory in MiB, from /proc.
+/// FNV-1a, to pin inputs.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3))
+}
+
 fn memory_mib() -> (f64, f64) {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let field = |name: &str| {
@@ -204,8 +209,57 @@ fn bench_blame(repo: &Path, path: &str, rev: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `highlight <file>…`: syntax highlighting of each file in one thread, and
+/// in parallel as one stream (as blame does), five runs each, with the
+/// peak memory. `TINE_BENCH_TWO_STREAMS=1` also parses it as two full
+/// streams — an upper bound for a diff (the app parses a diff's old side
+/// only up to its last deleted line; `tests/perf.rs` measures that path).
+fn bench_highlight(files: &[String]) -> Result<()> {
+    use tine_core::highlight::{Highlighter, syntax_for, syntaxes};
+    println!("{} threads", std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let t = Instant::now();
+    syntaxes();
+    println!("syntax definitions loaded in {:.1?}", t.elapsed());
+    let two_streams = std::env::var_os("TINE_BENCH_TWO_STREAMS").is_some();
+    for f in files {
+        let text = String::from_utf8_lossy(&std::fs::read(f)?).into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        let syntax = syntax_for(f.as_bytes(), lines.first().copied()).ok_or_else(|| anyhow::anyhow!("no syntax for {f}"))?;
+        let (mut single, mut one, mut two) = (Vec::new(), Vec::new(), Vec::new());
+        let mut spans = 0;
+        let cancel = CancelToken::default();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let mut h = Highlighter::new(syntax);
+            spans = lines.iter().map(|l| h.line(l).len()).sum::<usize>();
+            single.push(t.elapsed());
+            let t = Instant::now();
+            std::hint::black_box(tine_core::highlight::highlight_streams(syntax, std::slice::from_ref(&lines), &cancel, usize::MAX));
+            one.push(t.elapsed());
+            if two_streams {
+                let t = Instant::now();
+                std::hint::black_box(tine_core::highlight::highlight_streams(syntax, &[lines.clone(), lines.clone()], &cancel, usize::MAX));
+                two.push(t.elapsed());
+            }
+        }
+        println!("{f}: {} lines ({}), {spans} spans, fnv {:016x}", lines.len(), syntax.name, fnv(text.as_bytes()));
+        println!("  one thread           {}", percentiles(single));
+        println!("  parallel, 1 stream   {}", percentiles(one));
+        if two_streams {
+            println!("  parallel, 2 streams  {}", percentiles(two));
+        }
+    }
+    let (peak, rss) = memory_mib();
+    println!("memory: peak {peak:.0} MiB, now {rss:.0} MiB");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("highlight") {
+        anyhow::ensure!(args.len() >= 2, "usage: tine-bench highlight <file>…");
+        return bench_highlight(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("blame") {
         anyhow::ensure!(args.len() >= 3, "usage: tine-bench blame <repo> <path> [rev]");
         return bench_blame(Path::new(&args[1]), &args[2], args.get(3).map(String::as_str));

@@ -154,7 +154,7 @@ impl RepoTab {
             RemoteCheckout::SwitchExisting(local) => self.checkout_branch(&local),
             RemoteCheckout::CreateTracking(local) => self.create_tracking(&local, &remote.short_name),
             RemoteCheckout::NameTaken { local, upstream, suggestion } => {
-                self.dialog = Some(Dialog::RemoteNameTaken {
+                self.show_dialog(Dialog::RemoteNameTaken {
                     remote: remote.short_name.clone(),
                     local,
                     upstream,
@@ -170,7 +170,7 @@ impl RepoTab {
 
     pub fn request_detach(&mut self, target: &str, label: &str) {
         if self.allowed(Needs::CleanState) {
-            self.dialog = Some(Dialog::Detach { target: target.into(), label: label.into() });
+            self.show_dialog(Dialog::Detach { target: target.into(), label: label.into() });
         }
     }
 
@@ -205,7 +205,7 @@ impl RepoTab {
 
     pub fn open_create_branch(&mut self, start: &str, start_label: &str) {
         if self.allowed(Needs::Idle) {
-            self.dialog = Some(Dialog::CreateBranch {
+            self.show_dialog(Dialog::CreateBranch {
                 start: start.into(),
                 start_label: start_label.into(),
                 name: String::new(),
@@ -251,13 +251,13 @@ impl RepoTab {
 
     pub fn request_rename_branch(&mut self, name: &str) {
         if self.allowed(Needs::CleanState) {
-            self.dialog = Some(Dialog::RenameBranch { old: name.into(), new: name.into() });
+            self.show_dialog(Dialog::RenameBranch { old: name.into(), new: name.into() });
         }
     }
 
     pub fn request_delete_branch(&mut self, name: &str) {
         if self.allowed(Needs::CleanState) {
-            self.dialog = Some(Dialog::DeleteBranch { name: name.into(), force: false });
+            self.show_dialog(Dialog::DeleteBranch { name: name.into(), force: false });
         }
     }
 
@@ -287,7 +287,7 @@ impl RepoTab {
 
     pub fn open_create_tag(&mut self, target: &str, target_label: &str) {
         if self.allowed(Needs::Idle) {
-            self.dialog = Some(Dialog::CreateTag {
+            self.show_dialog(Dialog::CreateTag {
                 target: target.into(),
                 target_label: target_label.into(),
                 name: String::new(),
@@ -309,7 +309,7 @@ impl RepoTab {
 
     pub fn request_delete_tag(&mut self, name: &str) {
         if self.allowed(Needs::Idle) {
-            self.dialog = Some(Dialog::DeleteTag { name: name.into() });
+            self.show_dialog(Dialog::DeleteTag { name: name.into() });
         }
     }
 
@@ -330,7 +330,7 @@ impl RepoTab {
     /// same short name can't be picked by mistake; `label` is for display.
     pub fn request_merge(&mut self, target: &str, label: &str) {
         if self.allowed(Needs::CleanState) {
-            self.dialog = Some(Dialog::Merge {
+            self.show_dialog(Dialog::Merge {
                 target: target.into(),
                 label: label.into(),
                 mode: Default::default(),
@@ -341,7 +341,7 @@ impl RepoTab {
 
     pub fn request_rebase(&mut self, onto: &str, label: &str) {
         if self.allowed(Needs::CleanState) {
-            self.dialog = Some(Dialog::Rebase {
+            self.show_dialog(Dialog::Rebase {
                 onto: onto.into(),
                 label: label.into(),
                 stash_first: self.status.has_tracked_changes(),
@@ -363,7 +363,7 @@ impl RepoTab {
             return;
         }
         if self.status.has_tracked_changes() {
-            self.dialog = Some(Dialog::DirtyTree { action });
+            self.show_dialog(Dialog::DirtyTree { action });
         } else {
             self.integrate(action, false);
         }
@@ -454,7 +454,7 @@ impl RepoTab {
                 return;
             }
         };
-        self.dialog = Some(Dialog::Reset { target, label: label.into(), mode: ResetMode::Mixed, lost, changed: false });
+        self.show_dialog(Dialog::Reset { target, label: label.into(), mode: ResetMode::Mixed, lost, changed: false });
     }
 
     /// Resets the current branch. A hard reset first re-checks that it would
@@ -482,7 +482,7 @@ impl RepoTab {
 
     pub fn open_stash_dialog(&mut self) {
         if self.allowed(Needs::CleanState) {
-            self.dialog = Some(Dialog::Stash { message: String::new(), include_untracked: true, keep_index: false });
+            self.show_dialog(Dialog::Stash { message: String::new(), include_untracked: true, keep_index: false });
         }
     }
 
@@ -548,7 +548,7 @@ impl RepoTab {
     pub fn request_drop_stash(&mut self, oid: Oid, label: &str) {
         match self.stash_drop_block(oid) {
             Some(why) => self.error(why.into()),
-            None => self.dialog = Some(Dialog::DropStash { oid, label: label.into() }),
+            None => self.show_dialog(Dialog::DropStash { oid, label: label.into() }),
         }
     }
 
@@ -592,7 +592,7 @@ impl RepoTab {
             && sc.was_clean_before
             && self.block_reason(Needs::Idle).is_none()
         {
-            self.dialog = Some(Dialog::UndoStashApply { oid: sc.oid });
+            self.show_dialog(Dialog::UndoStashApply { oid: sc.oid });
         }
     }
 
@@ -660,7 +660,7 @@ impl RepoTab {
 
     pub fn request_abort(&mut self) {
         if self.block_reason(Needs::Idle).is_none() && self.status.state != RepoState::Clean {
-            self.dialog = Some(Dialog::Abort { state: self.status.state });
+            self.show_dialog(Dialog::Abort { state: self.status.state });
         }
     }
 
@@ -708,7 +708,7 @@ impl RepoTab {
         if how == Resolution::MarkResolved
             && paths.iter().any(|p| sequencer::has_conflict_markers(&self.paths.workdir, p))
         {
-            self.dialog = Some(Dialog::MarkResolved { paths });
+            self.show_dialog(Dialog::MarkResolved { paths });
             return;
         }
         self.resolve_confirmed(paths, how);
@@ -738,7 +738,7 @@ impl RepoTab {
     pub(super) fn handle_follow_up(&mut self, f: FollowUp) {
         match f {
             FollowUp::Conflicts => self.view = View::LocalChanges,
-            FollowUp::Empty(state) => self.dialog = Some(Dialog::EmptyStep { state }),
+            FollowUp::Empty(state) => self.show_dialog(Dialog::EmptyStep { state }),
             FollowUp::AutoStash(report) => {
                 match &report {
                     AutoStash::Kept(oid) | AutoStash::NotRestored { oid, .. } | AutoStash::RestoreFailed(oid, _) => {
@@ -778,7 +778,7 @@ impl RepoTab {
 
     /// Turns a request for a decision into the matching dialog.
     pub(super) fn handle_decision(&mut self, d: NeedsDecision) {
-        self.dialog = Some(match d {
+        self.show_dialog(match d {
             NeedsDecision::ForceDeleteBranch(name) => Dialog::DeleteBranch { name, force: true },
             NeedsDecision::StashAndSwitch(target) => Dialog::StashAndSwitch { target },
             NeedsDecision::LocalChanges(action) => Dialog::DirtyTree { action },

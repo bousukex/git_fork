@@ -37,6 +37,10 @@ pub struct Palette {
     pub status_untracked: Color32,
     pub status_conflict: Color32,
     pub lanes: [Color32; 10],
+    /// Code colors by token kind, in [`tine_core::highlight::Token`] order:
+    /// comment, string, keyword, number, type, function, constant,
+    /// punctuation.
+    pub syntax: [Color32; 8],
 }
 
 const fn hex(rgb: u32) -> Color32 {
@@ -86,6 +90,7 @@ impl Palette {
             hex(0x6D7F2B),
             hex(0x5C6BC0),
         ],
+        syntax: [hex(0x6E7781), hex(0x0A3069), hex(0xCF222E), hex(0x0550AE), hex(0x953800), hex(0x8250DF), hex(0x0550AE), hex(0x57606A)],
     };
 
     pub const DARK: Palette = Palette {
@@ -130,7 +135,22 @@ impl Palette {
             hex(0x9DB04A),
             hex(0x8794E0),
         ],
+        syntax: [hex(0x8B949E), hex(0xA5D6FF), hex(0xFF7B72), hex(0x79C0FF), hex(0xFFA657), hex(0xD2A8FF), hex(0x79C0FF), hex(0x9DA5B0)],
     };
+
+    pub fn syntax_color(&self, token: tine_core::highlight::Token) -> Color32 {
+        use tine_core::highlight::Token;
+        self.syntax[match token {
+            Token::Comment => 0,
+            Token::String => 1,
+            Token::Keyword => 2,
+            Token::Number => 3,
+            Token::Type => 4,
+            Token::Function => 5,
+            Token::Constant => 6,
+            Token::Punctuation => 7,
+        }]
+    }
 
     pub fn get(dark: bool) -> &'static Palette {
         if dark { &Self::DARK } else { &Self::LIGHT }
@@ -177,6 +197,11 @@ fn visuals(p: &Palette) -> Visuals {
         wv.corner_radius = radius;
         wv.bg_stroke = Stroke::new(1.0, p.separator);
         wv.fg_stroke = Stroke::new(1.0, p.text);
+    }
+    // Buttons fill with `weak_bg_fill`; slider rails and check boxes with
+    // `bg_fill`, which must stand out from a white window.
+    if !p.dark {
+        w.inactive.bg_fill = hex(0xE1E5EA);
     }
     w.hovered.bg_stroke = Stroke::new(1.0, p.accent.gamma_multiply(0.6));
     w.active.bg_stroke = Stroke::new(1.0, p.accent);

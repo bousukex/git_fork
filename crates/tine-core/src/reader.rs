@@ -78,7 +78,7 @@ pub trait RepoReader: Send + Sync {
     ) -> Result<()>;
     fn commit_details(&self, id: Oid) -> Result<CommitDetails>;
     fn commit_files(&self, id: Oid, parent: Option<Oid>) -> Result<Vec<ChangedFile>>;
-    fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions) -> Result<FileDiff>;
+    fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions, cancel: &CancelToken) -> Result<FileDiff>;
     /// Streams commits matching a search ([`crate::search::search`]).
     fn search(
         &self,
@@ -158,8 +158,13 @@ impl RepoReader for CliReader {
         diff::commit_files(&self.git, id, parent)
     }
 
-    fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions) -> Result<FileDiff> {
-        diff::file_diff(&self.git, source, file, opts)
+    fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions, cancel: &CancelToken) -> Result<FileDiff> {
+        // Also around the steps without git (a conflicted file is read).
+        let stopped = || -> Result<()> { if cancel.is_cancelled() { Err(crate::Cancelled.into()) } else { Ok(()) } };
+        stopped()?;
+        let diff = diff::file_diff(&self.git.clone().with_cancel(cancel.clone()), source, file, opts)?;
+        stopped()?;
+        Ok(diff)
     }
 
     fn search(

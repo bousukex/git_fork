@@ -6,6 +6,7 @@ pub mod branches;
 pub mod diff;
 pub mod file_history;
 pub mod fuzzy;
+pub mod highlight;
 pub mod graph;
 pub mod integrate;
 pub mod log;

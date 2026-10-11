@@ -3,7 +3,7 @@
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use bstr::BString;
@@ -24,14 +24,17 @@ use tine_core::{
 pub struct Gate {
     on: AtomicBool,
     calls: Mutex<Vec<Option<Sender<()>>>>,
+    /// Every call, held or not.
+    total: AtomicUsize,
 }
 
 impl Gate {
     pub fn closed() -> Self {
-        Gate { on: AtomicBool::new(true), calls: Mutex::default() }
+        Gate { on: AtomicBool::new(true), ..Default::default() }
     }
 
     fn wait(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
         if !self.on.load(Ordering::Relaxed) {
             return;
         }
@@ -44,6 +47,11 @@ impl Gate {
     /// Calls that have arrived so far.
     pub fn arrived(&self) -> usize {
         self.calls.lock().unwrap().len()
+    }
+
+    /// Calls so far, including those an open gate let through.
+    pub fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
     }
 
     /// Lets call `i` (in arrival order) through.
@@ -79,6 +87,16 @@ pub struct Gates {
     pub blame: Gate,
     pub files: Gate,
     pub diff: Gate,
+    /// Calls that ended stopped (git never ran, or was stopped).
+    pub stopped_diffs: AtomicUsize,
+    pub stopped_blames: AtomicUsize,
+}
+
+fn count_stop<T>(r: anyhow::Result<T>, counter: &AtomicUsize) -> anyhow::Result<T> {
+    if r.as_ref().err().is_some_and(|e| e.is::<tine_core::Cancelled>()) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    r
 }
 
 pub struct Gated {
@@ -106,9 +124,9 @@ impl RepoReader for Gated {
     fn commit_files(&self, id: Oid, parent: Option<Oid>) -> anyhow::Result<Vec<ChangedFile>> {
         self.inner.commit_files(id, parent)
     }
-    fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions) -> anyhow::Result<FileDiff> {
+    fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions, cancel: &CancelToken) -> anyhow::Result<FileDiff> {
         self.gates.diff.wait();
-        self.inner.file_diff(source, file, opts)
+        count_stop(self.inner.file_diff(source, file, opts, cancel), &self.gates.stopped_diffs)
     }
     fn search(
         &self,
@@ -132,7 +150,7 @@ impl RepoReader for Gated {
     }
     fn blame(&self, path: &[u8], rev: Option<Oid>, ignore_whitespace: bool, cancel: &CancelToken) -> anyhow::Result<Blame> {
         self.gates.blame.wait();
-        self.inner.blame(path, rev, ignore_whitespace, cancel)
+        count_stop(self.inner.blame(path, rev, ignore_whitespace, cancel), &self.gates.stopped_blames)
     }
     fn tracked_files(&self, cancel: &CancelToken) -> anyhow::Result<Vec<BString>> {
         self.gates.files.wait();

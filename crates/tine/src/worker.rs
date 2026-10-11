@@ -15,8 +15,10 @@ use tine_core::{
     CancelToken, RepoReader,
     diff::{DiffOptions, DiffSource},
     log::LogOptions,
-    model::{ChangedFile, CommitDetails, CommitSummary, FileDiff, Oid, RefsSnapshot, WorkingStatus},
+    model::{ChangedFile, CommitDetails, CommitSummary, Oid, RefsSnapshot, WorkingStatus},
 };
+
+use crate::{blame_model::BlameDoc, diff_model::DiffDoc, settings::DocOptions};
 
 pub type Gen = u64;
 
@@ -103,7 +105,10 @@ pub enum Msg {
     LogBatch(Gen, Vec<CommitSummary>),
     LogDone(Gen, anyhow::Result<()>),
     Details(Gen, anyhow::Result<(CommitDetails, Vec<ChangedFile>)>),
-    Diff(Gen, anyhow::Result<FileDiff>),
+    /// A diff, prepared for display (plain; colors may follow).
+    Diff(Gen, anyhow::Result<Arc<DiffDoc>>),
+    /// The same diff with syntax highlighting.
+    DiffHighlighted(Gen, Arc<DiffDoc>),
     /// A maintenance or write job finished; `Ok` carries a log line.
     Job(anyhow::Result<String>),
     /// Files changed on disk (from the watcher).
@@ -115,7 +120,10 @@ pub enum Msg {
     SearchDone(Gen, anyhow::Result<tine_core::search::SearchEnd>),
     FileHistoryBatch(Gen, Vec<tine_core::file_history::FileHistoryEntry>),
     FileHistoryDone(Gen, anyhow::Result<tine_core::search::SearchEnd>),
-    Blame(Gen, anyhow::Result<Arc<crate::blame_model::BlameDoc>>),
+    /// A blame, prepared for display (plain; colors may follow).
+    Blame(Gen, anyhow::Result<Arc<BlameDoc>>),
+    /// The same blame with syntax highlighting.
+    BlameHighlighted(Gen, Arc<BlameDoc>),
     Files(Gen, anyhow::Result<Arc<FileIndex>>),
     /// The paths in a commit (HEAD), for "is this file committed?".
     HeadPaths(Gen, Oid, anyhow::Result<Arc<std::collections::HashSet<bstr::BString>>>),
@@ -223,6 +231,33 @@ pub struct Worker {
     fail_spawns: bool,
     /// Key of the repository's shared write queue.
     repo: PathBuf,
+    running: Arc<RunningJobs>,
+}
+
+/// Background jobs still running, by name (tests check that stopped work
+/// really ends, not just that its token was set).
+#[derive(Debug, Default)]
+pub struct RunningJobs(std::sync::Mutex<std::collections::HashMap<String, usize>>);
+
+impl RunningJobs {
+    pub fn count(&self, name: &str) -> usize {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).get(name).copied().unwrap_or(0)
+    }
+
+    fn change(&self, name: &str, up: bool) {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(name.to_owned()).or_default();
+        *n = if up { *n + 1 } else { n.saturating_sub(1) };
+    }
+}
+
+/// Counts a job as running until dropped (also if the job panics).
+struct Running(Arc<RunningJobs>, String);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.change(&self.1, false);
+    }
 }
 
 impl Worker {
@@ -230,7 +265,13 @@ impl Worker {
         let (tx, rx) = unbounded();
         // Linked worktrees share refs, so they share one write queue.
         let repo = repo_key(&reader.paths().common_dir);
-        Self { reader, tx, rx, ctx, log_cancel: None, search_cancel: None, fail_spawns: false, repo }
+        Self { reader, tx, rx, ctx, log_cancel: None, search_cancel: None, fail_spawns: false, repo, running: Arc::default() }
+    }
+
+    /// The jobs of this worker still running (they outlive it).
+    #[doc(hidden)]
+    pub fn running_jobs(&self) -> Arc<RunningJobs> {
+        self.running.clone()
     }
 
     pub fn repo_key(&self) -> &Path {
@@ -286,16 +327,25 @@ impl Worker {
         self.fail_spawns = false;
     }
 
+    /// Delivers `msg` as if a job had sent it.
+    #[doc(hidden)]
+    pub fn send_for_test(&self, msg: Msg) {
+        let _ = self.tx.send(msg);
+    }
+
     /// Runs `job` on its own thread; reports (and returns) a failure to
     /// start it.
     fn spawn(&self, name: &str, job: impl FnOnce(&dyn RepoReader, &Sender<Msg>) + Send + 'static) -> Result<(), String> {
         let reader = self.reader.clone();
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
+        self.running.change(name, true);
+        let running = Running(self.running.clone(), name.to_owned());
         let spawned = if self.fail_spawns {
             Err(std::io::Error::other("refused by the test"))
         } else {
             std::thread::Builder::new().name(format!("tine-{name}")).spawn(move || {
+                let _running = running;
                 job(&*reader, &tx);
                 ctx.request_repaint();
             })
@@ -375,13 +425,33 @@ impl Worker {
     }
 
     /// Blames `path` at `rev` (the work tree without one) and prepares it
-    /// for display.
-    pub fn blame(&self, seq: Gen, path: bstr::BString, rev: Option<Oid>, ignore_whitespace: bool, cancel: CancelToken) {
+    /// for display: plain first, then with colors.
+    pub fn blame(
+        &self,
+        seq: Gen,
+        path: bstr::BString,
+        rev: Option<Oid>,
+        ignore_whitespace: bool,
+        opts: DocOptions,
+        cancel: CancelToken,
+    ) {
+        let ctx = self.ctx.clone();
         let started = self.spawn("blame", move |r, tx| {
-            let result = r
-                .blame(&path, rev, ignore_whitespace, &cancel)
-                .map(|b| Arc::new(crate::blame_model::BlameDoc::new(b)));
-            let _ = tx.send(Msg::Blame(seq, result));
+            let result = r.blame(&path, rev, ignore_whitespace, &cancel).and_then(|b| prepared(BlameDoc::build(b, opts, &cancel)));
+            send_blame(tx, &ctx, seq, result, &path, opts, &cancel);
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::Blame(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// Prepares a blame already loaded again (the display options changed),
+    /// without running git.
+    pub fn rebuild_blame(&self, seq: Gen, doc: Arc<BlameDoc>, path: bstr::BString, opts: DocOptions, cancel: CancelToken) {
+        let ctx = self.ctx.clone();
+        let started = self.spawn("blame", move |_, tx| {
+            let result = prepared(BlameDoc::build(doc.blame.clone(), opts, &cancel));
+            send_blame(tx, &ctx, seq, result, &path, opts, &cancel);
         });
         if let Err(e) = started {
             let _ = self.tx.send(Msg::Blame(seq, Err(anyhow::anyhow!(e))));
@@ -429,10 +499,30 @@ impl Worker {
         });
     }
 
-    pub fn diff(&self, seq: Gen, source: DiffSource, file: ChangedFile, opts: DiffOptions) {
-        let _ = self.spawn("diff", move |r, tx| {
-            let _ = tx.send(Msg::Diff(seq, r.file_diff(source, &file, opts)));
+    /// Loads a file's diff and prepares it for display: plain first, then
+    /// with colors.
+    pub fn diff(&self, seq: Gen, source: DiffSource, file: ChangedFile, opts: DiffOptions, doc: DocOptions, cancel: CancelToken) {
+        let ctx = self.ctx.clone();
+        let started = self.spawn("diff", move |r, tx| {
+            let result = r.file_diff(source, &file, opts, &cancel).and_then(|d| prepared(DiffDoc::build(d, doc, &cancel)));
+            // Stopped (the pane was replaced or closed): nobody waits for it.
+            if cancel.is_cancelled() {
+                return;
+            }
+            let plain = result.as_ref().ok().filter(|_| doc.highlight).cloned();
+            let _ = tx.send(Msg::Diff(seq, result));
+            if let Some(plain) = plain {
+                ctx.request_repaint();
+                if let Some(colored) = plain.highlighted(&file.path, &cancel)
+                    && !cancel.is_cancelled()
+                {
+                    let _ = tx.send(Msg::DiffHighlighted(seq, Arc::new(colored)));
+                }
+            }
         });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::Diff(seq, Err(anyhow::anyhow!(e))));
+        }
     }
 
     /// Runs a maintenance or write job; its result arrives as [`Msg::Job`].
@@ -441,6 +531,37 @@ impl Worker {
             let _ = tx.send(Msg::Job(f()));
         });
     }
+}
+
+/// Sends a prepared blame, then (if wanted) its highlighted version.
+fn send_blame(
+    tx: &Sender<Msg>,
+    ctx: &egui::Context,
+    seq: Gen,
+    result: anyhow::Result<Arc<BlameDoc>>,
+    path: &[u8],
+    opts: DocOptions,
+    cancel: &CancelToken,
+) {
+    // Stopped (the view was replaced or closed): nobody waits for it.
+    if cancel.is_cancelled() {
+        return;
+    }
+    let plain = result.as_ref().ok().filter(|_| opts.highlight).cloned();
+    let _ = tx.send(Msg::Blame(seq, result));
+    if let Some(plain) = plain {
+        ctx.request_repaint();
+        if let Some(colored) = plain.highlighted(path, cancel)
+            && !cancel.is_cancelled()
+        {
+            let _ = tx.send(Msg::BlameHighlighted(seq, Arc::new(colored)));
+        }
+    }
+}
+
+/// A doc prepared on a worker, or why not (`None`: stopped).
+fn prepared<T>(doc: Option<T>) -> anyhow::Result<Arc<T>> {
+    doc.map(Arc::new).ok_or_else(|| tine_core::Cancelled.into())
 }
 
 impl Drop for Worker {

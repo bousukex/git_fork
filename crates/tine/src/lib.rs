@@ -9,6 +9,7 @@ pub mod input;
 pub mod ops_registry;
 pub mod probe;
 pub mod repo;
+pub mod settings;
 pub mod shortcuts;
 pub mod theme;
 pub mod ui;

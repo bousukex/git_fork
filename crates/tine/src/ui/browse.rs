@@ -4,7 +4,7 @@ use bstr::{BString, ByteSlice};
 use egui::{Align2, FontId, Pos2, Rect, RichText, ScrollArea, Sense, vec2};
 use tine_core::model::Oid;
 
-use super::{format_time, paint_text};
+use super::{code_galley, format_time, paint_text};
 use crate::{
     blame_model::{AGE_BUCKETS, BlameDoc},
     repo::{
@@ -15,7 +15,6 @@ use crate::{
 };
 
 const ROW_H: f32 = 22.0;
-const CODE_SIZE: f32 = 12.5;
 const ANNOTATION_W: f32 = 300.0;
 
 /// Something chosen in a browse view, applied after drawing.
@@ -252,7 +251,10 @@ fn blame(ui: &mut egui::Ui, workdir: &std::path::Path, v: &BlameView, actions: &
         ui.centered_and_justified(|ui| ui.label(RichText::new("The file is empty").color(p.text_weak)));
         return;
     }
-    let font = FontId::monospace(CODE_SIZE);
+    let size = crate::settings::current(ui.ctx()).diff_font_size;
+    let font = FontId::monospace(size);
+    // 22 points at the default size, so the annotation fits.
+    let row_h = (size + 9.5).round();
     let char_w = ui.painter().layout_no_wrap("0".into(), font.clone(), p.text).size().x;
     let num_w = (doc.number_width as f32 + 1.0) * char_w;
     let code_x = ANNOTATION_W + num_w + 12.0;
@@ -263,11 +265,11 @@ fn blame(ui: &mut egui::Ui, workdir: &std::path::Path, v: &BlameView, actions: &
     let offset: f32 = ui.ctx().data(|d| d.get_temp(offset_id)).unwrap_or(0.0);
     // A target line (e.g. after "Blame Previous Revision") is centered; a
     // keyboard move only scrolls as far as needed to keep the line visible.
-    let mut set_offset = v.scroll_to.map(|line| (line as f32 * ROW_H - viewport / 2.0).max(0.0));
-    let page = (viewport / ROW_H).max(1.0) as usize;
+    let mut set_offset = v.scroll_to.map(|line| (line as f32 * row_h - viewport / 2.0).max(0.0));
+    let page = (viewport / row_h).max(1.0) as usize;
     if let Some(i) = super::history::keyboard_nav(ui, v.selected, doc.blame.lines.len(), page.saturating_sub(1).max(1)) {
         actions.push(Action::SelectLine(i));
-        set_offset = keep_visible(i, ROW_H, offset, viewport).or(set_offset);
+        set_offset = keep_visible(i, row_h, offset, viewport).or(set_offset);
     }
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -275,10 +277,11 @@ fn blame(ui: &mut egui::Ui, workdir: &std::path::Path, v: &BlameView, actions: &
         if let Some(o) = set_offset {
             area = area.vertical_scroll_offset(o);
         }
-        let out = area.show_rows(ui, ROW_H, doc.blame.lines.len(), |ui, range| {
+        let out = area.show_rows(ui, row_h, doc.blame.lines.len(), |ui, range| {
             let width = content_w.max(ui.available_width());
             for i in range {
-                blame_row(ui, &doc, i, width, code_x, num_w, &font, v.selected == Some(i), selected_origin, actions);
+                let size = vec2(width, row_h);
+                blame_row(ui, &doc, i, size, code_x, num_w, &font, v.selected == Some(i), selected_origin, actions);
             }
         });
         ui.ctx().data_mut(|d| d.insert_temp(offset_id, out.state.offset.y));
@@ -294,7 +297,7 @@ fn blame_row(
     ui: &mut egui::Ui,
     doc: &BlameDoc,
     i: usize,
-    width: f32,
+    size: egui::Vec2,
     code_x: f32,
     num_w: f32,
     font: &FontId,
@@ -306,7 +309,8 @@ fn blame_row(
     let line = &doc.blame.lines[i];
     let origin = &doc.blame.origins[line.origin];
     let commit = &doc.blame.commits[origin.commit];
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let row_h = size.y;
     let label = format!("blame line {} {}", line.final_line, commit.id.short());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
     if resp.clicked() || resp.secondary_clicked() {
@@ -363,10 +367,10 @@ fn blame_row(
         painter.rect_filled(rect, 0.0, p.row_hover);
     }
     // Annotation column: age bar always, details on a chunk's first line.
-    let ann = Rect::from_min_size(rect.min, vec2(ANNOTATION_W, ROW_H));
+    let ann = Rect::from_min_size(rect.min, vec2(ANNOTATION_W, row_h));
     let age = doc.age[origin.commit] as f32;
     let strength = 1.0 - age / AGE_BUCKETS as f32 * 0.85;
-    painter.rect_filled(Rect::from_min_size(ann.min, vec2(4.0, ROW_H)), 0.0, p.accent.gamma_multiply(strength));
+    painter.rect_filled(Rect::from_min_size(ann.min, vec2(4.0, row_h)), 0.0, p.accent.gamma_multiply(strength));
     if doc.chunk_start[i] {
         painter.line_segment([rect.left_top(), rect.right_top()], (1.0, p.separator));
         let text = if uncommitted {
@@ -377,9 +381,9 @@ fn blame_row(
         let r = Rect::from_min_max(ann.min + vec2(10.0, 0.0), ann.max - vec2(8.0, 0.0));
         paint_text(painter, r, &text, FontId::proportional(11.5), if uncommitted { p.status_modified } else { p.text_weak }, Align2::LEFT_CENTER);
     }
-    let num_r = Rect::from_min_size(Pos2::new(rect.left() + ANNOTATION_W, rect.top()), vec2(num_w, ROW_H));
+    let num_r = Rect::from_min_size(Pos2::new(rect.left() + ANNOTATION_W, rect.top()), vec2(num_w, row_h));
     painter.rect_filled(num_r.expand2(vec2(4.0, 0.0)), 0.0, p.sidebar_bg);
     paint_text(painter, num_r, &line.final_line.to_string(), font.clone(), p.diff_gutter, Align2::RIGHT_CENTER);
-    let galley = painter.layout_no_wrap(doc.text[i].clone(), font.clone(), p.text);
+    let galley = code_galley(painter, &doc.text[i], doc.spans(i), font.clone(), p.text, p);
     painter.galley(Pos2::new(rect.left() + code_x, rect.center().y - galley.size().y / 2.0), galley, p.text);
 }

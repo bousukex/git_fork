@@ -4,7 +4,7 @@ use bstr::ByteSlice;
 use egui::{Align2, FontId, Pos2, Rect, RichText, ScrollArea, Sense, vec2};
 use tine_core::{diff::DiffOptions, model::ChangeKind};
 
-use super::paint_text;
+use super::{code_galley, paint_text};
 use std::collections::BTreeSet;
 
 use tine_core::patch::PatchMode;
@@ -14,8 +14,6 @@ use crate::{
     repo::{DiffPane, LineActions, PatchTarget, Side},
     theme::Palette,
 };
-
-const FONT_SIZE: f32 = 12.5;
 
 /// Toolbar above the diff; returns changed options.
 fn header(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions) -> Option<DiffOptions> {
@@ -166,7 +164,8 @@ fn hunk_buttons(ui: &mut egui::Ui, row_rect: Rect, hunk: usize, selected_here: u
     // take no layout space inside the virtualized rows.
     let p = Palette::of(ui.ctx());
     let enabled = actions.disabled.is_none();
-    let font = FontId::proportional(11.5);
+    // 11.5 at the default row height; follows the code font size.
+    let font = FontId::proportional((row_rect.height() * 0.64).min(13.0));
     let mut right = ui.clip_rect().right().min(row_rect.right()) - 4.0;
     for (mode, verb) in buttons {
         let label = format!("{verb} {noun}");
@@ -206,9 +205,10 @@ fn hunk_buttons(ui: &mut egui::Ui, row_rect: Rect, hunk: usize, selected_here: u
 
 fn rows(ui: &mut egui::Ui, doc: &DiffDoc, pane: &DiffPane, actions: Option<LineActions>, events: &mut Vec<DiffEvent>) {
     let p = Palette::of(ui.ctx());
-    let font = FontId::monospace(FONT_SIZE);
+    let size = crate::settings::current(ui.ctx()).diff_font_size;
+    let font = FontId::monospace(size);
     let char_w = ui.painter().layout_no_wrap("0".into(), font.clone(), p.text).size().x;
-    let row_h = (FONT_SIZE * 1.45).round();
+    let row_h = (size * 1.45).round();
     let num_w = (doc.number_width as f32 + 1.0) * char_w;
     let gutter = num_w * 2.0 + 18.0;
     let content_w = gutter + (doc.max_cols as f32 + 4.0) * char_w;
@@ -288,7 +288,7 @@ fn rows(ui: &mut egui::Ui, doc: &DiffDoc, pane: &DiffPane, actions: Option<LineA
                     RowKind::Hunk | RowKind::NoNewline => p.text_weak,
                     _ => p.text,
                 };
-                let galley = painter.layout_no_wrap(row.text.clone(), font.clone(), color);
+                let galley = code_galley(painter, &row.text, &row.spans, font.clone(), color, p);
                 let pos = Pos2::new(rect.left() + gutter + 4.0, rect.center().y - galley.size().y / 2.0);
                 painter.galley(pos, galley, color);
 

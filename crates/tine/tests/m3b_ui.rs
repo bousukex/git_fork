@@ -143,6 +143,65 @@ fn credential_dialog_sends_the_typed_password() {
     release_tx.send(()).unwrap();
 }
 
+#[test]
+fn a_prompt_over_the_settings_takes_the_keyboard() {
+    let _exclusive = PROMPTS.write().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let paths = tine_core::RepoPaths { workdir: dir.path().into(), git_dir: dir.path().into(), common_dir: dir.path().into() };
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let (env_tx, env_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+    ops_registry::submit(
+        &PathBuf::from("/test/ui/askpass-settings"),
+        &paths,
+        OpKind::Fetch("origin".into()),
+        tx,
+        egui::Context::default(),
+        Box::new(move |ctx| {
+            env_tx.send(askpass::env_for(ctx.id, "Fetch", std::path::Path::new("/home/me/project"), None).unwrap()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            Ok(OpOutcome::default())
+        }),
+    )
+    .unwrap();
+    let env = env_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let get = |k: &str| env.iter().find(|(n, _)| n == k).unwrap().1.clone();
+    let (socket, token) = (PathBuf::from(get(askpass::SOCKET_ENV)), get(askpass::TOKEN_ENV).into_string().unwrap());
+
+    let repo = common::sample_repo();
+    let mut h = app(vec![repo.path().into()]);
+    settle(&mut h);
+    h.state_mut().run_command(tine::shortcuts::Command::Settings);
+    h.run_steps(4);
+    assert!(h.query_by_label("Keyboard Shortcuts").is_some());
+    let asked = std::thread::spawn(move || askpass::request(&socket, &token, "", "Password for 'https://alice@example.com': ").unwrap());
+    let start = std::time::Instant::now();
+    while askpass::pending().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no prompt");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The frame the prompt takes over also carries an Enter (meant for the
+    // settings): it must not answer the prompt.
+    h.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+    h.run_steps(3);
+    assert!(askpass::pending().is_some(), "still asking");
+    assert!(h.query_by_label("Credentials needed").is_some());
+    assert!(h.query_by_label("Keyboard Shortcuts").is_none(), "the settings wait behind the prompt");
+    assert!(h.state().settings_open());
+    h.get_by_label("Cancel").click();
+    h.run_steps(4);
+    assert_eq!(asked.join().unwrap(), None, "cancelled, not answered by that Enter");
+    assert!(h.query_by_label("Keyboard Shortcuts").is_some(), "the settings come back");
+    release_tx.send(()).unwrap();
+}
+
 /// A file:// remote with one commit, my clone, and a colleague's clone.
 fn remote_setup() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, i64) {
     let (bare, mine, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());

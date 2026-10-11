@@ -34,6 +34,7 @@ use tine_core::{
 use crate::{
     diff_model::DiffDoc,
     ops_registry::{self, OpContext, OpId},
+    settings::DocOptions,
     watcher::{FsChange, RepoWatcher},
     worker::{Gen, Msg, OpKind, OpOutcome, Worker},
 };
@@ -104,6 +105,17 @@ fn refs_key(r: &RefsSnapshot) -> (Option<tine_core::model::Head>, Vec<(&str, Oid
     (r.head.clone(), r.refs.iter().map(|r| (r.full_name.as_str(), r.target)).collect())
 }
 
+/// Stops a background job when dropped: replacing a pane stops loading
+/// (and highlighting) the diff it showed.
+#[derive(Default)]
+struct StopOnDrop(CancelToken);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// A file diff being shown (or loaded).
 #[derive(Default)]
 pub struct DiffPane {
@@ -111,6 +123,7 @@ pub struct DiffPane {
     pub source: Option<DiffSource>,
     pub doc: Option<Result<Arc<DiffDoc>, String>>,
     seq: Gen,
+    job: StopOnDrop,
     /// Selected rows (indices into `DiffDoc::rows`) for line staging.
     pub selected_rows: std::collections::BTreeSet<usize>,
     /// Row a Shift+click range starts from.
@@ -123,6 +136,24 @@ pub struct DiffPane {
 impl DiffPane {
     pub fn is_loading(&self) -> bool {
         self.file.is_some() && self.doc.is_none()
+    }
+
+    /// The token of the diff being loaded (tests check it gets stopped).
+    #[doc(hidden)]
+    pub fn cancel_token(&self) -> CancelToken {
+        self.job.0.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn seq_for_test(&self) -> Gen {
+        self.seq
+    }
+
+    /// Takes a highlighted version of the shown diff.
+    fn highlighted(&mut self, seq: Gen, doc: Arc<DiffDoc>) {
+        if seq == self.seq && seq != 0 && matches!(self.doc, Some(Ok(_))) {
+            self.doc = Some(Ok(doc));
+        }
     }
 }
 
@@ -168,7 +199,7 @@ struct PatchSelection {
 /// Lines waiting for the user to confirm a discard.
 pub struct LineDiscard {
     pub file: ChangedFile,
-    pub diff: tine_core::model::FileDiff,
+    pub diff: Arc<tine_core::model::FileDiff>,
     pub lines: Vec<(usize, usize)>,
 }
 
@@ -221,6 +252,8 @@ pub struct RepoTab {
     untracked_remover: UntrackedRemover,
     merge_msg_loaded: bool,
     pub diff_opts: DiffOptions,
+    /// How diffs and blame are prepared (from the app's settings).
+    pub doc_opts: DocOptions,
 
     pub errors: Vec<String>,
     pub activity: Vec<String>,
@@ -251,8 +284,10 @@ pub struct RepoTab {
     /// Failed operation whose record the error banner links to.
     pub last_failed_op: Option<OpId>,
     pub output_open: bool,
-    /// Modal dialog waiting for the user.
+    /// Modal dialog waiting for the user (set with `show_dialog`).
     pub dialog: Option<dialog::Dialog>,
+    /// Tells the modals of this tab apart (see [`Self::modal_token`]).
+    modal_gen: u64,
     /// A stash application that stopped with conflicts.
     pub stash_conflict: Option<StashConflict>,
     /// Changes stashed before an operation that stopped half-way.
@@ -342,6 +377,7 @@ impl RepoTab {
             changes_selected: None,
             changes_diff: DiffPane::default(),
             diff_opts: DiffOptions::default(),
+            doc_opts: DocOptions::default(),
             errors: Vec::new(),
             activity: Vec::new(),
             sidebar_filter: String::new(),
@@ -360,6 +396,7 @@ impl RepoTab {
             last_failed_op: None,
             output_open: false,
             dialog: None,
+            modal_gen: 0,
             stash_conflict: None,
             pending_autostash: None,
             rebase_progress: None,
@@ -501,6 +538,23 @@ impl RepoTab {
         &mut self.worker
     }
 
+    /// Opens a dialog (replacing any other).
+    pub fn show_dialog(&mut self, d: dialog::Dialog) {
+        self.dialog = Some(d);
+        self.modal_shown();
+    }
+
+    fn modal_shown(&mut self) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.modal_gen = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Changes whenever this tab opens a modal (unique across tabs), so a
+    /// new one is told from one that was already showing.
+    pub fn modal_token(&self) -> u64 {
+        self.modal_gen
+    }
+
     /// A dialog of this tab is waiting for the user (it owns the keyboard).
     pub fn modal_open(&self) -> bool {
         self.dialog.is_some() || self.pending_discard.is_some() || self.pending_line_discard.is_some()
@@ -573,6 +627,7 @@ impl RepoTab {
             Msg::FileHistoryBatch(seq, batch) => self.on_file_history_batch(seq, batch),
             Msg::FileHistoryDone(seq, r) => self.on_file_history_done(seq, r),
             Msg::Blame(seq, r) => self.on_blame(seq, r),
+            Msg::BlameHighlighted(seq, doc) => self.on_blame_highlighted(seq, doc),
             Msg::Files(seq, r) if seq == self.files_seq => {
                 self.files_seq = 0;
                 self.files_cancel = None;
@@ -619,17 +674,23 @@ impl RepoTab {
                 Err(e) => self.commit.details = Some(Err(format!("{e:#}"))),
             },
             Msg::Diff(seq, r) if seq == self.browse_diff.seq && seq != 0 => {
-                self.browse_diff.doc = Some(r.map(|d| Arc::new(DiffDoc::new(d))).map_err(|e| format!("{e:#}")));
+                self.browse_diff.doc = Some(r.map_err(|e| format!("{e:#}")));
             }
-            Msg::Diff(seq, r) if seq == self.commit_diff.seq => {
-                self.commit_diff.doc = Some(r.map(|d| Arc::new(DiffDoc::new(d))).map_err(|e| format!("{e:#}")));
+            Msg::Diff(seq, r) if seq == self.commit_diff.seq && seq != 0 => {
+                self.commit_diff.doc = Some(r.map_err(|e| format!("{e:#}")));
             }
-            Msg::Diff(seq, r) if seq == self.changes_diff.seq => {
-                self.changes_diff.doc = Some(r.map(|d| Arc::new(DiffDoc::new(d))).map_err(|e| format!("{e:#}")));
+            Msg::Diff(seq, r) if seq == self.changes_diff.seq && seq != 0 => {
+                self.changes_diff.doc = Some(r.map_err(|e| format!("{e:#}")));
                 // Rows shift whenever the diff is recomputed.
                 self.changes_diff.selected_rows.clear();
                 self.changes_diff.anchor = None;
                 self.changes_diff.stale = false;
+            }
+            // Same rows, now colored: the selection stays.
+            Msg::DiffHighlighted(seq, doc) => {
+                for pane in [&mut self.browse_diff, &mut self.commit_diff, &mut self.changes_diff] {
+                    pane.highlighted(seq, doc.clone());
+                }
             }
             Msg::Job(r) => match r {
                 Ok(line) if line.is_empty() => {}
@@ -760,8 +821,15 @@ impl RepoTab {
             _ => None,
         };
         let source = DiffSource::Commit { id, parent };
-        self.commit_diff = DiffPane { file: Some(file.clone()), source: Some(source), doc: None, seq: self.gens.bump(), ..Default::default() };
-        self.worker.diff(self.commit_diff.seq, source, file.clone(), self.diff_opts);
+        self.commit_diff = self.load_diff(file.clone(), source);
+    }
+
+    /// A pane for the diff of `file`, loading (the old pane, once replaced,
+    /// stops its load).
+    fn load_diff(&mut self, file: ChangedFile, source: DiffSource) -> DiffPane {
+        let pane = DiffPane { file: Some(file.clone()), source: Some(source), seq: self.gens.bump(), ..Default::default() };
+        self.worker.diff(pane.seq, source, file, self.diff_opts, self.doc_opts, pane.job.0.clone());
+        pane
     }
 
     pub fn select_change(&mut self, side: Side, file: ChangedFile) {
@@ -784,10 +852,10 @@ impl RepoTab {
         // Keep showing the previous diff of the same file while reloading.
         let keep = self.changes_diff.file.as_ref() == Some(&file) && self.changes_diff.source == Some(source);
         let doc = if keep { self.changes_diff.doc.take() } else { None };
-        let stale = doc.is_some();
-        self.changes_diff =
-            DiffPane { file: Some(file.clone()), source: Some(source), doc, seq: self.gens.bump(), stale, ..Default::default() };
-        self.worker.diff(self.changes_diff.seq, source, file, self.diff_opts);
+        let mut pane = self.load_diff(file, source);
+        pane.stale = doc.is_some();
+        pane.doc = doc;
+        self.changes_diff = pane;
     }
 
     /// After a status refresh, keep the selected file if it still has
@@ -956,6 +1024,7 @@ impl RepoTab {
             files.into_iter().filter(|f| f.kind != tine_core::model::ChangeKind::Conflicted).collect();
         if !files.is_empty() && !self.busy() {
             self.pending_discard = Some(files);
+            self.modal_shown();
         }
     }
 
@@ -1102,6 +1171,7 @@ impl RepoTab {
         let Some(PatchSelection { file, doc, lines }) = self.patch_lines(target) else { return };
         if mode == PatchMode::Discard {
             self.pending_line_discard = Some(LineDiscard { file, diff: doc.source.clone(), lines });
+            self.modal_shown();
             return;
         }
         self.run_patch(mode, file, doc.source.clone(), lines);
@@ -1113,7 +1183,7 @@ impl RepoTab {
         }
     }
 
-    fn run_patch(&mut self, mode: PatchMode, file: ChangedFile, diff: tine_core::model::FileDiff, lines: Vec<(usize, usize)>) {
+    fn run_patch(&mut self, mode: PatchMode, file: ChangedFile, diff: Arc<tine_core::model::FileDiff>, lines: Vec<(usize, usize)>) {
         let n = lines.len();
         let set: std::collections::HashSet<(usize, usize)> = lines.into_iter().collect();
         let opts = self.diff_opts;
@@ -1265,14 +1335,35 @@ impl RepoTab {
             return;
         }
         self.diff_opts = opts;
-        for pane in [&mut self.commit_diff, &mut self.browse_diff] {
+        self.reload_diffs(false);
+    }
+
+    /// Loads the shown diffs again (their options changed); `keep` shows
+    /// the current ones until the new ones arrive.
+    fn reload_diffs(&mut self, keep: bool) {
+        for browse in [false, true] {
+            let pane = if browse { &self.browse_diff } else { &self.commit_diff };
             if let (Some(file), Some(source)) = (pane.file.clone(), pane.source) {
-                pane.seq = self.gens.bump();
-                pane.doc = None;
-                self.worker.diff(pane.seq, source, file, opts);
+                let mut fresh = self.load_diff(file, source);
+                let pane = if browse { &mut self.browse_diff } else { &mut self.commit_diff };
+                if keep {
+                    fresh.doc = pane.doc.take();
+                }
+                *pane = fresh;
             }
         }
         self.load_changes_diff();
+    }
+
+    /// Changes how diffs and blame are prepared (tab width, highlighting):
+    /// the shown ones are prepared again, the old ones staying up meanwhile.
+    pub fn set_doc_options(&mut self, opts: DocOptions) {
+        if self.doc_opts == opts {
+            return;
+        }
+        self.doc_opts = opts;
+        self.reload_diffs(true);
+        self.rebuild_blames();
     }
 
     pub fn head_commit(&self) -> Option<Oid> {

@@ -144,15 +144,15 @@ fn status_with_unusual_file_names() {
     // Diffs for each source resolve the right file, even with glob characters.
     let r = repo.reader();
     let file = |list: &[tine_core::model::ChangedFile], name: &[u8]| list.iter().find(|f| f.path == name).unwrap().clone();
-    let d = r.file_diff(DiffSource::Unstaged, &file(&st.unstaged, b"keep.txt"), DiffOptions::default()).unwrap();
+    let d = r.file_diff(DiffSource::Unstaged, &file(&st.unstaged, b"keep.txt"), DiffOptions::default(), &CancelToken::default()).unwrap();
     assert_eq!(d.stats(), (1, 0));
-    let d = r.file_diff(DiffSource::Unstaged, &file(&st.unstaged, b"glob*[x].txt"), DiffOptions::default()).unwrap();
+    let d = r.file_diff(DiffSource::Unstaged, &file(&st.unstaged, b"glob*[x].txt"), DiffOptions::default(), &CancelToken::default()).unwrap();
     assert_eq!(d.hunks[0].lines[0].content, "g");
-    let d = r.file_diff(DiffSource::Unstaged, &file(&st.unstaged, "日本語 ファイル.txt".as_bytes()), DiffOptions::default()).unwrap();
+    let d = r.file_diff(DiffSource::Unstaged, &file(&st.unstaged, "日本語 ファイル.txt".as_bytes()), DiffOptions::default(), &CancelToken::default()).unwrap();
     assert_eq!(d.hunks[0].lines[0].content, "こんにちは");
-    let d = r.file_diff(DiffSource::Unstaged, &file(&st.unstaged, b"latin\xe9.txt"), DiffOptions::default()).unwrap();
+    let d = r.file_diff(DiffSource::Unstaged, &file(&st.unstaged, b"latin\xe9.txt"), DiffOptions::default(), &CancelToken::default()).unwrap();
     assert_eq!(d.stats(), (1, 0));
-    let d = r.file_diff(DiffSource::Staged, &st.staged[0], DiffOptions::default()).unwrap();
+    let d = r.file_diff(DiffSource::Staged, &st.staged[0], DiffOptions::default(), &CancelToken::default()).unwrap();
     assert!(d.header.iter().any(|h| h.starts_with(b"rename from")), "{:?}", d.header);
     assert!(d.hunks.is_empty());
 }
@@ -169,14 +169,14 @@ fn commit_files_and_diffs() {
     let files = r.commit_files(oid(&root), None).unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].kind, ChangeKind::Added);
-    let d = r.file_diff(DiffSource::Commit { id: oid(&root), parent: None }, &files[0], DiffOptions::default()).unwrap();
+    let d = r.file_diff(DiffSource::Commit { id: oid(&root), parent: None }, &files[0], DiffOptions::default(), &CancelToken::default()).unwrap();
     assert_eq!(d.stats(), (3, 0));
 
     let files = r.commit_files(oid(&c2), Some(oid(&root))).unwrap();
     let names: Vec<_> = files.iter().map(|f| (f.path.to_string(), f.kind)).collect();
     assert_eq!(names, [("a.txt".into(), ChangeKind::Modified), ("bin.dat".into(), ChangeKind::Added)]);
     let src = DiffSource::Commit { id: oid(&c2), parent: Some(oid(&root)) };
-    let d = r.file_diff(src, &files[0], DiffOptions::default()).unwrap();
+    let d = r.file_diff(src, &files[0], DiffOptions::default(), &CancelToken::default()).unwrap();
     let changed: Vec<_> = d.hunks[0]
         .lines
         .iter()
@@ -184,7 +184,7 @@ fn commit_files_and_diffs() {
         .map(|l| (l.kind, l.content.to_string()))
         .collect();
     assert_eq!(changed, [(LineKind::Deleted, "two".into()), (LineKind::Added, "TWO".into())]);
-    assert!(r.file_diff(src, &files[1], DiffOptions::default()).unwrap().binary);
+    assert!(r.file_diff(src, &files[1], DiffOptions::default(), &CancelToken::default()).unwrap().binary);
 }
 
 #[test]

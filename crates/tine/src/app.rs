@@ -28,6 +28,7 @@ struct Persisted {
     active: usize,
     /// Recent commit messages, oldest first.
     messages: Vec<String>,
+    settings: crate::settings::Settings,
 }
 
 const MAX_MESSAGES: usize = 30;
@@ -47,6 +48,8 @@ pub struct TineApp {
     /// to a tab when that work tree is opened again.
     held_orphans: Vec<crate::ops_registry::OrphanedResult>,
     quick: Option<QuickLaunch>,
+    /// The settings dialog is open.
+    settings_open: bool,
     /// Repositories being opened in the background, in request order.
     opening: Vec<Opening>,
 }
@@ -107,8 +110,15 @@ impl DebugOverlay {
 
 impl TineApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
+        Self::with_storage(cc, paths, cc.storage)
+    }
+
+    /// Starts from the state saved in `storage` (tests pass their own).
+    pub fn with_storage(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>, storage: Option<&dyn eframe::Storage>) -> Self {
         crate::setup_context(&cc.egui_ctx);
-        let state: Persisted = cc.storage.and_then(|s| eframe::get_value(s, STORAGE_KEY)).unwrap_or_default();
+        let mut state: Persisted = storage.and_then(|s| eframe::get_value(s, STORAGE_KEY)).unwrap_or_default();
+        state.settings = state.settings.validated();
+        crate::settings::set_current(&cc.egui_ctx, state.settings);
         let mut app =
             TineApp {
             tabs: Vec::new(),
@@ -122,6 +132,7 @@ impl TineApp {
             notices: Vec::new(),
             held_orphans: Vec::new(),
             quick: None,
+            settings_open: false,
             opening: Vec::new(),
         };
         let restoring = paths.is_empty();
@@ -271,6 +282,23 @@ impl TineApp {
     }
 
     /// Title of the active repository tab.
+    pub fn settings(&self) -> crate::settings::Settings {
+        self.state.settings
+    }
+
+    pub fn set_settings(&mut self, settings: crate::settings::Settings) {
+        self.state.settings = settings.validated();
+    }
+
+    pub fn settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// Recent commit messages (oldest first).
+    pub fn recent_messages(&self) -> &[String] {
+        &self.state.messages
+    }
+
     pub fn active_title(&self) -> Option<&str> {
         self.tabs.get(self.active).map(|t| t.title.as_str())
     }
@@ -283,22 +311,30 @@ impl TineApp {
         self.tabs.get_mut(self.active)
     }
 
-    /// Decides who owns the keyboard this frame (see [`input::Layer`]). A
-    /// tab dialog that appears while Quick Launch is open closes it.
+    /// Decides who owns the keyboard (see [`input::Layer`]); called again
+    /// whenever a modal may have come up, so the rest of the frame follows.
+    /// A tab dialog that appears closes Quick Launch and the settings: only
+    /// one modal shows at a time (a prompt hides the others meanwhile).
     fn decide_layer(&mut self, ctx: &egui::Context) {
-        let layer = if crate::askpass::pending().is_some() {
-            input::Layer::Prompt
-        } else if self.tabs.get(self.active).is_some_and(RepoTab::modal_open) {
-            input::Layer::Dialog
-        } else if self.quick.is_some() {
-            input::Layer::QuickLaunch
-        } else {
-            input::Layer::Views
-        };
-        if layer == input::Layer::Dialog {
+        let tab_modal = self.tabs.get(self.active).filter(|t| t.modal_open()).map(RepoTab::modal_token);
+        if tab_modal.is_some() {
+            self.settings_open = false;
+        }
+        if tab_modal.is_some() || self.settings_open {
             self.quick = None;
         }
-        input::set_layer(ctx, layer);
+        let (layer, token) = if let Some(p) = crate::askpass::pending() {
+            (input::Layer::Prompt, p.id)
+        } else if let Some(token) = tab_modal {
+            (input::Layer::Dialog, token)
+        } else if self.settings_open {
+            (input::Layer::Settings, 0)
+        } else if self.quick.is_some() {
+            (input::Layer::QuickLaunch, 0)
+        } else {
+            (input::Layer::Views, 0)
+        };
+        input::set_owner(ctx, layer, token);
     }
 
     /// Global keys, unless a modal layer has them.
@@ -328,6 +364,10 @@ impl TineApp {
         match cmd {
             Command::QuickLaunch => self.open_quick_launch(),
             Command::OpenRepository => self.pick_folder(),
+            Command::Settings => {
+                self.quick = None;
+                self.settings_open = true;
+            }
             Command::DebugOverlay => self.debug.open = !self.debug.open,
             Command::NextTab | Command::PreviousTab if !self.tabs.is_empty() => {
                 let n = self.tabs.len();
@@ -504,6 +544,11 @@ impl TineApp {
                     if pref != before {
                         ui.ctx().set_theme(pref);
                     }
+                    ui.separator();
+                    if ui.button(with_hint("Settings…", Command::Settings)).clicked() {
+                        self.settings_open = true;
+                        ui.close();
+                    }
                 });
                 if let Some(t) = self.tabs.get(self.active)
                     && let Some((id, text)) = ui::output::running_summary(t)
@@ -648,7 +693,6 @@ impl eframe::App for TineApp {
         let p = Palette::of(&ctx);
         input::begin_frame(&ctx);
         self.poll_opening(&ctx);
-        self.decide_layer(&ctx);
         self.debug.record(frame.info().cpu_usage);
         self.debug.show(&ctx, self.tabs.get(self.active));
         if let Some(rx) = &self.picker
@@ -659,8 +703,10 @@ impl eframe::App for TineApp {
                 self.open(&dir, &ctx);
             }
         }
+        crate::settings::set_current(&ctx, self.state.settings);
         let mut requests = Vec::new();
         for t in &mut self.tabs {
+            t.set_doc_options(self.state.settings.doc_options());
             t.poll();
             requests.extend(t.open_request.take());
             for m in t.committed_messages.drain(..) {
@@ -689,7 +735,11 @@ impl eframe::App for TineApp {
             t.refresh_if_changed();
         }
         self.focused = focused;
+        // After the results of this frame (one may have brought up a
+        // dialog), and again after the shortcuts (one may have opened one).
+        self.decide_layer(&ctx);
         self.shortcuts(&ctx);
+        self.decide_layer(&ctx);
 
         let title = match self.tabs.get(self.active) {
             Some(t) => format!("{} — Tine", t.title),
@@ -725,8 +775,10 @@ impl eframe::App for TineApp {
 
         if self.tabs.is_empty() {
             egui::CentralPanel::default().show(ui, |ui| self.welcome(ui));
-            self.quick_launch_frame(&ctx);
-            let _ = ui::askpass::show(&ctx);
+            if !ui::askpass::show(&ctx) {
+                ui::settings::show(&ctx, &mut self.state.settings, &mut self.settings_open);
+                self.quick_launch_frame(&ctx);
+            }
             return;
         }
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
@@ -773,6 +825,11 @@ impl eframe::App for TineApp {
         // by when they first appeared, so it could otherwise cover one).
         if !ui::askpass::show(&ctx) {
             ui::dialogs::show(&ctx, tab);
+            // Never two modals at once (decide_layer closes the settings
+            // when a dialog comes up).
+            if !tab.modal_open() {
+                ui::settings::show(&ctx, &mut self.state.settings, &mut self.settings_open);
+            }
             self.quick_launch_frame(&ctx);
         }
     }

@@ -118,7 +118,7 @@ impl RepoTab {
 
     pub fn open_fetch_dialog(&mut self, remote: Option<String>) {
         if self.remote_block(Needs::Idle, false).is_none() {
-            self.dialog = Some(Dialog::Fetch { remote, prune: false });
+            self.show_dialog(Dialog::Fetch { remote, prune: false });
         }
     }
 
@@ -157,7 +157,7 @@ impl RepoTab {
                 .map(|r| r.short_name.clone())
                 .unwrap_or_default()
         });
-        self.dialog = Some(Dialog::Pull {
+        self.show_dialog(Dialog::Pull {
             remote_branch,
             rebase: remote::pull_rebases_by_default(&self.git),
             stash_first: self.status.has_tracked_changes(),
@@ -202,7 +202,7 @@ impl RepoTab {
             }
         };
         let lease = (remote.clone(), remote_branch.clone(), self.tracking_target(&remote, &remote_branch));
-        self.dialog = Some(Dialog::Push {
+        self.show_dialog(Dialog::Push {
             branch,
             remote,
             remote_branch,
@@ -273,7 +273,7 @@ impl RepoTab {
 
     pub fn request_delete_remote_ref(&mut self, remote: &str, full_ref: &str) {
         if self.remote_block(Needs::Idle, false).is_none() {
-            self.dialog = Some(Dialog::DeleteRemoteRef { remote: remote.into(), full_ref: full_ref.into() });
+            self.show_dialog(Dialog::DeleteRemoteRef { remote: remote.into(), full_ref: full_ref.into() });
         }
     }
 
