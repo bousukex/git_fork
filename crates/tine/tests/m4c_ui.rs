@@ -43,9 +43,15 @@ fn ctrl_comma_opens_settings_which_own_the_keyboard() {
     h.key_press_modifiers(Modifiers::COMMAND, Key::Comma);
     h.run_steps(4);
     assert!(h.state().settings_open(), "Ctrl+, opens the settings");
-    // The shortcut list comes from the table.
+    // The shortcut list (its own page) comes from the table. (The dialog
+    // changes size with the page and takes a few frames to settle.)
+    h.get_by_label("Shortcuts").click();
+    h.run_steps(4);
     assert!(h.query_by_label("Quick Launch").is_some() && h.query_by_label("Ctrl+P").is_some());
     assert!(h.query_by_label_contains("Stage / unstage the selection (File list)").is_some());
+    h.get_by_label("General").click();
+    h.run_steps(4);
+    assert!(h.query_by_label("Theme").is_some());
     // Global shortcuts wait while the dialog is open.
     h.key_press_modifiers(Modifiers::COMMAND, Key::P);
     h.run_steps(2);
@@ -171,7 +177,7 @@ fn a_dialog_coming_up_over_the_settings_takes_over_without_their_keys() {
     settle(&mut h);
     h.state_mut().run_command(tine::shortcuts::Command::Settings);
     h.run_steps(4);
-    assert!(h.query_by_label("Keyboard Shortcuts").is_some());
+    assert!(h.query_by_label("Settings").is_some());
     // An operation brings up a dialog (as a result arriving would) in the
     // frame an Enter meant for the settings comes.
     h.state_mut().active_tab_mut().unwrap().open_stash_dialog();
@@ -180,7 +186,7 @@ fn a_dialog_coming_up_over_the_settings_takes_over_without_their_keys() {
     assert!(!h.state().settings_open(), "the settings made way");
     assert!(h.state_mut().active_tab_mut().unwrap().dialog.is_some(), "the dialog stays");
     h.run_steps(2);
-    assert!(h.query_by_label("Keyboard Shortcuts").is_none(), "one modal at a time");
+    assert!(h.query_by_label("Settings").is_none(), "one modal at a time");
     assert!(h.query_by_label("Stash Changes").is_some());
     settle(&mut h);
     assert_eq!(stash_count(repo.path()), 0, "that Enter confirmed nothing");

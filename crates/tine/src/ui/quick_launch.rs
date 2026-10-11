@@ -77,6 +77,8 @@ const COMMANDS: &[Command] = &[
     Command::ToggleOutput,
     Command::OpenRepository,
     Command::CloseTab,
+    Command::OpenTerminal,
+    Command::OpenFileManager,
     Command::Settings,
 ];
 

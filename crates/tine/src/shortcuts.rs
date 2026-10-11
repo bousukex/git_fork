@@ -23,6 +23,8 @@ pub enum Command {
     CloseTab,
     Refresh,
     ToggleOutput,
+    OpenTerminal,
+    OpenFileManager,
     Settings,
     DebugOverlay,
 }
@@ -45,6 +47,8 @@ impl Command {
             Command::CloseTab => "Close Repository Tab",
             Command::Refresh => "Refresh",
             Command::ToggleOutput => "Show/Hide Output",
+            Command::OpenTerminal => "Open in Terminal",
+            Command::OpenFileManager => "Open in File Manager",
             Command::Settings => "Settings…",
             Command::DebugOverlay => "Debug Overlay",
         }

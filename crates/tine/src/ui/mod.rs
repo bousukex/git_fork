@@ -57,6 +57,21 @@ pub fn code_galley(painter: &Painter, text: &str, spans: &[Span], font: FontId, 
     painter.layout_job(job)
 }
 
+/// "Open File" and "Show in File Manager" for a path of the work tree
+/// (disabled when the work tree doesn't have it).
+pub fn file_tool_items(ui: &mut egui::Ui, workdir: &std::path::Path, path: &[u8]) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let rel = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path));
+    let present = workdir.join(&rel).symlink_metadata().is_ok();
+    for tool in [crate::tools::Tool::OpenFile(rel.clone()), crate::tools::Tool::ShowFile(rel)] {
+        let resp = ui.add_enabled(present, egui::Button::new(tool.label())).on_disabled_hover_text("Not in the working tree");
+        if resp.clicked() {
+            crate::tools::run(ui.ctx(), &tool, workdir);
+            ui.close();
+        }
+    }
+}
+
 /// Paints truncated text vertically centered in `rect`.
 pub fn paint_text(painter: &Painter, rect: Rect, text: &str, font: FontId, color: Color32, align: Align2) {
     let galley = truncated(painter, text, font, color, rect.width());

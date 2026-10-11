@@ -29,6 +29,7 @@ struct Persisted {
     /// Recent commit messages, oldest first.
     messages: Vec<String>,
     settings: crate::settings::Settings,
+    tools: crate::tools::ToolSettings,
 }
 
 const MAX_MESSAGES: usize = 30;
@@ -50,6 +51,7 @@ pub struct TineApp {
     quick: Option<QuickLaunch>,
     /// The settings dialog is open.
     settings_open: bool,
+    settings_ui: ui::settings::SettingsUi,
     /// Repositories being opened in the background, in request order.
     opening: Vec<Opening>,
 }
@@ -133,6 +135,7 @@ impl TineApp {
             held_orphans: Vec::new(),
             quick: None,
             settings_open: false,
+            settings_ui: Default::default(),
             opening: Vec::new(),
         };
         let restoring = paths.is_empty();
@@ -294,6 +297,24 @@ impl TineApp {
         self.settings_open
     }
 
+    pub fn settings_ui(&mut self) -> &mut ui::settings::SettingsUi {
+        &mut self.settings_ui
+    }
+
+    pub fn tool_settings(&self) -> &crate::tools::ToolSettings {
+        &self.state.tools
+    }
+
+    pub fn set_tool_settings(&mut self, tools: crate::tools::ToolSettings) {
+        crate::tools::set_current(&self.ctx, tools.clone());
+        self.state.tools = tools;
+    }
+
+    /// App-level messages (e.g. results for tabs that were closed).
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
     /// Recent commit messages (oldest first).
     pub fn recent_messages(&self) -> &[String] {
         &self.state.messages
@@ -364,10 +385,7 @@ impl TineApp {
         match cmd {
             Command::QuickLaunch => self.open_quick_launch(),
             Command::OpenRepository => self.pick_folder(),
-            Command::Settings => {
-                self.quick = None;
-                self.settings_open = true;
-            }
+            Command::Settings => self.open_settings(),
             Command::DebugOverlay => self.debug.open = !self.debug.open,
             Command::NextTab | Command::PreviousTab if !self.tabs.is_empty() => {
                 let n = self.tabs.len();
@@ -391,9 +409,19 @@ impl TineApp {
                     Command::NewBranch => t.open_create_branch("HEAD", "HEAD"),
                     Command::Refresh => t.refresh(),
                     Command::ToggleOutput => t.output_open = !t.output_open,
+                    Command::OpenTerminal => crate::tools::run(&self.ctx, &crate::tools::Tool::Terminal, &t.paths.workdir),
+                    Command::OpenFileManager => crate::tools::run(&self.ctx, &crate::tools::Tool::FileManager, &t.paths.workdir),
                     _ => {}
                 }
             }
+        }
+    }
+
+    pub fn open_settings(&mut self) {
+        self.quick = None;
+        if !self.settings_open {
+            self.settings_open = true;
+            self.settings_ui.opened(&self.ctx, &self.state.tools);
         }
     }
 
@@ -546,7 +574,7 @@ impl TineApp {
                     }
                     ui.separator();
                     if ui.button(with_hint("Settings…", Command::Settings)).clicked() {
-                        self.settings_open = true;
+                        self.open_settings();
                         ui.close();
                     }
                 });
@@ -591,6 +619,13 @@ impl TineApp {
                     close = Some(i);
                 }
                 resp.context_menu(|ui| {
+                    for tool in [crate::tools::Tool::Terminal, crate::tools::Tool::FileManager] {
+                        if ui.button(tool.label()).clicked() {
+                            crate::tools::run(ui.ctx(), &tool, &t.paths.workdir);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
                     if ui.button("Close Tab").clicked() {
                         close = Some(i);
                         ui.close();
@@ -704,6 +739,8 @@ impl eframe::App for TineApp {
             }
         }
         crate::settings::set_current(&ctx, self.state.settings);
+        crate::tools::set_current(&ctx, self.state.tools.clone());
+        self.settings_ui.identity.poll();
         let mut requests = Vec::new();
         for t in &mut self.tabs {
             t.set_doc_options(self.state.settings.doc_options());
@@ -720,6 +757,18 @@ impl eframe::App for TineApp {
         // work tree, keep them until one is opened.
         for o in crate::worker::take_orphaned_results() {
             self.deliver_orphan(o);
+        }
+        // How external programs ended, for the tab they were started from
+        // (a notice if it was closed).
+        for r in crate::tools::take_results() {
+            let tab = self.tabs.iter_mut().find(|t| t.paths.workdir == r.origin);
+            match (r.outcome, tab) {
+                (Err(e), Some(t)) => t.error(e),
+                (Err(e), None) => self.notices.push(format!("{e} ({})", r.origin.display())),
+                (Ok(Some(note)), Some(t)) => t.activity.push(note),
+                (Ok(Some(note)), None) => self.notices.push(format!("{note} ({})", r.origin.display())),
+                (Ok(None), _) => {}
+            }
         }
         let excess = self.state.messages.len().saturating_sub(MAX_MESSAGES);
         self.state.messages.drain(..excess);
@@ -776,7 +825,7 @@ impl eframe::App for TineApp {
         if self.tabs.is_empty() {
             egui::CentralPanel::default().show(ui, |ui| self.welcome(ui));
             if !ui::askpass::show(&ctx) {
-                ui::settings::show(&ctx, &mut self.state.settings, &mut self.settings_open);
+                ui::settings::show(&ctx, &mut self.state.settings, &mut self.state.tools, &mut self.settings_ui, &mut self.settings_open);
                 self.quick_launch_frame(&ctx);
             }
             return;
@@ -828,7 +877,7 @@ impl eframe::App for TineApp {
             // Never two modals at once (decide_layer closes the settings
             // when a dialog comes up).
             if !tab.modal_open() {
-                ui::settings::show(&ctx, &mut self.state.settings, &mut self.settings_open);
+                ui::settings::show(&ctx, &mut self.state.settings, &mut self.state.tools, &mut self.settings_ui, &mut self.settings_open);
             }
             self.quick_launch_frame(&ctx);
         }

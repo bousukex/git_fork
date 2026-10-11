@@ -173,7 +173,7 @@ fn a_prompt_over_the_settings_takes_the_keyboard() {
     settle(&mut h);
     h.state_mut().run_command(tine::shortcuts::Command::Settings);
     h.run_steps(4);
-    assert!(h.query_by_label("Keyboard Shortcuts").is_some());
+    assert!(h.query_by_label("Settings").is_some());
     let asked = std::thread::spawn(move || askpass::request(&socket, &token, "", "Password for 'https://alice@example.com': ").unwrap());
     let start = std::time::Instant::now();
     while askpass::pending().is_none() {
@@ -193,12 +193,12 @@ fn a_prompt_over_the_settings_takes_the_keyboard() {
     h.run_steps(3);
     assert!(askpass::pending().is_some(), "still asking");
     assert!(h.query_by_label("Credentials needed").is_some());
-    assert!(h.query_by_label("Keyboard Shortcuts").is_none(), "the settings wait behind the prompt");
+    assert!(h.query_by_label("Settings").is_none(), "the settings wait behind the prompt");
     assert!(h.state().settings_open());
     h.get_by_label("Cancel").click();
     h.run_steps(4);
     assert_eq!(asked.join().unwrap(), None, "cancelled, not answered by that Enter");
-    assert!(h.query_by_label("Keyboard Shortcuts").is_some(), "the settings come back");
+    assert!(h.query_by_label("Settings").is_some(), "the settings come back");
     release_tx.send(()).unwrap();
 }
 

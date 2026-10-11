@@ -12,6 +12,7 @@ pub mod repo;
 pub mod settings;
 pub mod shortcuts;
 pub mod theme;
+pub mod tools;
 pub mod ui;
 pub mod watcher;
 pub mod worker;

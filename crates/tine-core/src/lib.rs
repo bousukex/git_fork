@@ -3,6 +3,7 @@
 pub mod autostash;
 pub mod blame;
 pub mod branches;
+pub mod config;
 pub mod diff;
 pub mod file_history;
 pub mod fuzzy;

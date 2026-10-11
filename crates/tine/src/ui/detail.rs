@@ -95,6 +95,9 @@ fn files(ui: &mut egui::Ui, tab: &RepoTab, actions: &mut Vec<Action>) {
                             actions.push(Action::Blame(i));
                             ui.close();
                         }
+                        ui.separator();
+                        // The file as it is now, in the working tree.
+                        super::file_tool_items(ui, &tab.paths.workdir, &f.path);
                         if ui.button("Copy Path").clicked() {
                             ui.ctx().copy_text(f.path.to_string());
                             ui.close();

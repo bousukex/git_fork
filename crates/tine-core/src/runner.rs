@@ -175,6 +175,13 @@ impl GitRunner {
         Ok(())
     }
 
+    /// Runs `program` instead of the `git` on PATH (tests use a wrapper
+    /// that fails on purpose).
+    pub fn with_program(mut self, program: impl Into<OsString>) -> Self {
+        self.git = program.into();
+        self
+    }
+
     /// Same configuration, different directory.
     pub fn with_workdir(&self, workdir: impl Into<PathBuf>) -> Self {
         Self { workdir: workdir.into(), ..self.clone() }

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use common::{git, sample_repo, settle};
 use egui::Theme;
-use egui_kittest::Harness;
+use egui_kittest::{Harness, kittest::Queryable as _};
 
 static PROMPTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
@@ -550,4 +550,38 @@ fn settings_dialog() {
             h.run_steps(6);
         },
     );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn settings_git_and_tools() {
+    let _serial = serial();
+    let repo = sample_repo();
+    let path = repo.path().to_path_buf();
+    let global = tempfile::tempdir().unwrap();
+    std::fs::write(global.path().join("gitconfig"), "[user]\n\tname = 山田 太郎\n\temail = taro@example.com\n").unwrap();
+    for (name, page) in [("settings_git", "Git"), ("settings_tools", "Tools")] {
+        let config = global.path().join("gitconfig");
+        shoot(
+            name,
+            [1200.0, 720.0],
+            |cc| {
+                let mut app = tine::app::TineApp::new(cc, vec![path.clone()]);
+                let git = tine_core::GitRunner::new(global.path()).with_env("GIT_CONFIG_GLOBAL", &config);
+                app.settings_ui().identity.set_runner(git);
+                app
+            },
+            |h| {
+                settle(h);
+                h.state_mut().run_command(tine::shortcuts::Command::Settings);
+                h.run_steps(4);
+                h.get_by_label(page).click();
+                settle(h);
+                if page == "Git" {
+                    h.state_mut().settings_ui().identity.email = "taro@example.org".into();
+                    h.run_steps(4);
+                }
+            },
+        );
+    }
 }

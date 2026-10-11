@@ -134,6 +134,8 @@ fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab
                         events.push(ListEvent::Blame(f.path.clone()));
                         ui.close();
                     }
+                    ui.separator();
+                    super::file_tool_items(ui, &tab.paths.workdir, &f.path);
                     if ui.button("Copy Path").clicked() {
                         ui.ctx().copy_text(f.path.to_str_lossy().into_owned());
                         ui.close();
@@ -183,6 +185,7 @@ fn conflict_menu(ui: &mut egui::Ui, tab: &RepoTab, f: &ChangedFile, side: Side, 
         ui.close();
     }
     ui.separator();
+    super::file_tool_items(ui, &tab.paths.workdir, &f.path);
     if ui.button("Copy Path").clicked() {
         ui.ctx().copy_text(f.path.to_str_lossy().into_owned());
         ui.close();

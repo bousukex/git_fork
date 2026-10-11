@@ -1276,7 +1276,11 @@ impl RepoTab {
                         self.error(format!("{} was cancelled; {}", kind.label(), notes.join("; ")));
                     }
                 } else {
-                    self.error(format!("{} failed: {e:#}", kind.label()));
+                    let message = format!("{} failed: {e:#}", kind.label());
+                    self.error(match identity_hint(&message) {
+                        Some(hint) => format!("{message}\n{hint}"),
+                        None => message,
+                    });
                 }
             }
         }
@@ -1371,6 +1375,16 @@ impl RepoTab {
     }
 }
 
+/// What to do when git doesn't know who is committing.
+pub fn identity_hint(git_message: &str) -> Option<&'static str> {
+    const SIGNS: [&str; 4] =
+        ["Please tell me who you are", "Author identity unknown", "Committer identity unknown", "unable to auto-detect email address"];
+    SIGNS
+        .iter()
+        .any(|s| git_message.contains(s))
+        .then_some("Set your name and email in Settings → Git (Ctrl+,).")
+}
+
 impl Drop for RepoTab {
     /// Results that arrived but were not processed yet, and recovery state
     /// (stashed changes waiting, a stash conflict) are handed to the app so
@@ -1408,6 +1422,33 @@ impl Drop for RepoTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commits_without_an_identity_point_to_the_settings() {
+        // What git really says when it doesn't know who commits.
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("LC_ALL", "C")
+                .env_remove("EMAIL")
+                .env_remove("GIT_AUTHOR_NAME")
+                .env_remove("GIT_AUTHOR_EMAIL")
+                .env_remove("GIT_COMMITTER_NAME")
+                .env_remove("GIT_COMMITTER_EMAIL")
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        let out = git(&["-c", "user.useConfigOnly=true", "commit", "-q", "--allow-empty", "-m", "x"]);
+        assert!(!out.status.success());
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(identity_hint(&said).is_some_and(|h| h.contains("Settings")), "{said}");
+        assert_eq!(identity_hint("error: pathspec 'x' did not match"), None);
+    }
 
     fn commit(n: u8) -> CommitSummary {
         CommitSummary {
