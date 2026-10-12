@@ -340,6 +340,8 @@ pub struct FileDiff {
     pub header: Vec<BString>,
     pub binary: bool,
     pub hunks: Vec<Hunk>,
+    /// A Git LFS file: the objects its pointers stand for (shown instead).
+    pub lfs: Option<crate::lfs::LfsView>,
 }
 
 impl FileDiff {

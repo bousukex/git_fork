@@ -11,6 +11,7 @@ pub mod highlight;
 pub mod graph;
 pub mod integrate;
 pub mod interactive;
+pub mod lfs;
 pub mod log;
 pub mod maintenance;
 pub mod merge_file;
@@ -25,6 +26,7 @@ pub mod search;
 pub mod sequencer;
 pub mod stash;
 pub mod status;
+pub mod worktree;
 
 pub use reader::{CliReader, RepoPaths, RepoReader};
 pub use runner::{CancelToken, Cancelled, CommandRecord, GitError, GitRunner, Recorder};

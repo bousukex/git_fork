@@ -10,7 +10,9 @@ use crate::{
     runner::GitRunner,
 };
 
-const DIFF_FLAGS: [&str; 3] = ["--no-color", "--no-ext-diff", "--find-renames"];
+/// The raw diff, always: no external diff, no textconv (a program that
+/// could do anything, and whose output lines couldn't be staged).
+const DIFF_FLAGS: [&str; 4] = ["--no-color", "--no-ext-diff", "--no-textconv", "--find-renames"];
 
 /// What a file diff is computed against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +140,7 @@ pub fn conflict_view(content: Option<&[u8]>) -> FileDiff {
     FileDiff {
         header: vec![CONFLICT_HEADER.into()],
         binary: false,
+        lfs: None,
         hunks: vec![Hunk {
             old_start: 1,
             old_lines: count,
@@ -188,7 +191,16 @@ pub fn file_diff(git: &GitRunner, source: DiffSource, file: &ChangedFile, opts: 
         args.push(os(orig));
     }
     args.push(os(&file.path));
-    Ok(parse_patch(&git.output_with(&args, ok_codes)?))
+    let mut diff = parse_patch(&git.output_with(&args, ok_codes)?);
+    // Pointer files of Git LFS: what they stand for (when they may be).
+    if crate::lfs::maybe_pointer_diff(&diff) {
+        match crate::lfs::view(git, source, file) {
+            Ok(view) => diff.lfs = view,
+            // Not taken for "no LFS": the diff shows as it is.
+            Err(e) => log::warn!("couldn't tell whether {} is a Git LFS file: {e:#}", file.path),
+        }
+    }
+    Ok(diff)
 }
 
 fn parse_range(s: &[u8]) -> Option<(u32, u32)> {

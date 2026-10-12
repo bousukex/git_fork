@@ -3,10 +3,12 @@
 mod actions;
 pub mod browse;
 pub mod dialog;
+pub mod lfs;
 pub mod merge;
 pub mod rebase;
 pub mod remote;
 pub mod search;
+pub mod worktree;
 
 pub use actions::{Needs, StashConflict};
 
@@ -171,6 +173,8 @@ pub struct CommitPane {
 
 /// How discard gets rid of untracked files (the trash, or a test stub).
 type UntrackedRemover = Arc<dyn Fn(&std::path::Path) -> anyhow::Result<()> + Send + Sync>;
+/// How a folder is picked (the desktop's dialog, or a test stub).
+type FolderDialog = Arc<dyn Fn() -> Option<std::path::PathBuf> + Send + Sync>;
 
 /// Whether hunk/line actions are available for the shown diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +311,25 @@ pub struct RepoTab {
     pub rebase_done: Option<rebase::RebaseDone>,
     /// A conflicted file in the merge editor.
     pub merge: Option<merge::MergeEditor>,
+    /// Git LFS: used here, installed, which listed files.
+    pub lfs: lfs::LfsState,
+    /// The repository's worktrees (main first), kept current.
+    pub worktrees: Vec<tine_core::worktree::Worktree>,
+    worktrees_seq: Gen,
+    /// Listing them failed (shown in the sidebar).
+    pub worktrees_error: Option<String>,
+    prune_seq: Gen,
+    /// The modal showing when the prune preview was asked for.
+    prune_token: u64,
+    /// A folder being picked for a new worktree, for the dialog showing
+    /// then (its modal token).
+    folder_picker: Option<(u64, crossbeam_channel::Receiver<Option<std::path::PathBuf>>)>,
+    folder_dialog: FolderDialog,
+    /// A worktree removal confirmed here, for the app to carry out.
+    pub remove_requested: Option<worktree::RemoveRequest>,
+    /// The worktree being removed (this path) is this tab's, or this tab is
+    /// in a folder inside it: it sleeps until closed, or woken.
+    pub removal_pending: Option<std::path::PathBuf>,
     /// The tab asked to close once its unsaved changes were given up (the
     /// app closes it).
     pub close_requested: bool,
@@ -426,6 +449,16 @@ impl RepoTab {
             rebase_session_error: None,
             rebase_done: None,
             merge: None,
+            lfs: lfs::LfsState::default(),
+            worktrees: Vec::new(),
+            worktrees_seq: 0,
+            worktrees_error: None,
+            prune_seq: 0,
+            prune_token: 0,
+            folder_picker: None,
+            folder_dialog: Arc::new(|| rfd::FileDialog::new().set_title("Folder for the New Worktree").pick_folder()),
+            remove_requested: None,
+            removal_pending: None,
             close_requested: false,
             rebase_range_seq: 0,
             rebase_range_cancel: None,
@@ -457,6 +490,7 @@ impl RepoTab {
         tab._watcher = Some(RepoWatcher::start(
             tab.paths.workdir.clone(),
             tab.paths.git_dir.clone(),
+            tab.paths.common_dir.clone(),
             tab.git.clone(),
             tab.worker.sender(),
             ctx.clone(),
@@ -486,6 +520,8 @@ impl RepoTab {
         self.gens.refs_then_log = then_log.then_some(self.gens.refs);
         self.refs_req_regen = ops_registry::generation(self.repo_key());
         self.worker.refs(self.gens.refs);
+        self.request_worktrees();
+        self.request_lfs_state();
     }
 
     /// Reloads refs, status and history.
@@ -545,6 +581,7 @@ impl RepoTab {
         for msg in msgs {
             self.handle(msg);
         }
+        self.poll_folder_picker();
         self.poll_search();
         if self.work_tree_dirty && !self.op_active() {
             self.work_tree_changed();
@@ -571,8 +608,11 @@ impl RepoTab {
         &mut self.worker
     }
 
-    /// Opens a dialog (replacing any other).
+    /// Opens a dialog (replacing any other); none while asleep.
     pub fn show_dialog(&mut self, d: dialog::Dialog) {
+        if self.asleep() {
+            return;
+        }
         // Commits being read for a rebase dialog no longer get one.
         if !matches!(d, dialog::Dialog::InteractiveRebase(_)) {
             self.stop_rebase_range();
@@ -619,6 +659,11 @@ impl RepoTab {
     }
 
     fn handle(&mut self, msg: Msg) {
+        // Asleep while its worktree is being removed: only how operations
+        // ended counts (whatever was being read is dropped).
+        if self.asleep() && !matches!(msg, Msg::OpDone(..) | Msg::Job(..)) {
+            return;
+        }
         match msg {
             Msg::Refs(seq, r) if seq == self.gens.refs => {
                 match r {
@@ -647,6 +692,7 @@ impl RepoTab {
                     self.rebase_progress = tine_core::status::rebase_progress(&self.paths.git_dir);
                     self.check_rebase_session();
                     self.check_merge_editor();
+                    self.request_lfs_local();
                     self.sync_commit_box_with_state();
                     if self.status.state == RepoState::Clean
                         && self.stash_conflict.is_none()
@@ -668,7 +714,13 @@ impl RepoTab {
                         }
                     }
                 }
-                Err(e) => self.error(format!("Failed to read status: {e:#}")),
+                Err(e) => {
+                    let message = format!("Failed to read status: {e:#}");
+                    self.error(match lfs::lfs_hint(&message) {
+                        Some(hint) => format!("{message}\n{hint}"),
+                        None => message,
+                    });
+                }
             }
             }
             Msg::LogBatch(seq, batch) if seq == self.gens.log => {
@@ -683,6 +735,11 @@ impl RepoTab {
             Msg::BlameHighlighted(seq, doc) => self.on_blame_highlighted(seq, doc),
             Msg::RebaseRange(seq, r) if seq == self.rebase_range_seq && seq != 0 => self.on_rebase_range(r),
             Msg::MergeOpened(seq, r) => self.on_merge_opened(seq, r),
+            Msg::Worktrees(seq, r) => self.on_worktrees(seq, r),
+            Msg::LfsState(seq, used, installed) => self.on_lfs_state(seq, used, installed),
+            Msg::LfsTracked(seq, target, r) => self.on_lfs_tracked(seq, target, r),
+            Msg::WorktreeLosses(seq, path, r) => self.on_worktree_losses(seq, path, r),
+            Msg::PrunePreview(seq, r) => self.on_prune_preview(seq, r),
             Msg::MergeHighlighted(seq, text, spans) => self.on_merge_highlighted(seq, text, spans),
             Msg::Files(seq, r) if seq == self.files_seq => {
                 self.files_seq = 0;
@@ -721,6 +778,7 @@ impl RepoTab {
                     self.commit.details = Some(Ok(details));
                     self.commit.files = files;
                     self.commit.selected_file = None;
+                    self.request_lfs_commit();
                     if !self.commit.files.is_empty() {
                         self.select_commit_file(0);
                     } else {
@@ -827,6 +885,10 @@ impl RepoTab {
     }
 
     fn on_fs_change(&mut self, change: FsChange) {
+        // Only read: listed again at once.
+        if change.worktrees {
+            self.request_worktrees();
+        }
         if ops_registry::active_for(self.repo_key()) {
             self.held_fs.merge(change);
         } else if change.refs {
@@ -1011,7 +1073,7 @@ impl RepoTab {
     /// An operation on this repository is queued or running (from any tab
     /// or worktree), or the refresh after one has not completed yet.
     pub fn busy(&self) -> bool {
-        self.op_active() || !self.state_fresh()
+        self.asleep() || self.op_active() || !self.state_fresh()
     }
 
     /// Remembers which file to select after `targets` leave the `side` list.
@@ -1307,6 +1369,9 @@ impl RepoTab {
         {
             self.merge_save_done(*editor, None);
         }
+        if matches!(kind, OpKind::RemoveWorktree(_)) && result.is_err() {
+            self.request_worktrees();
+        }
         // Whatever the operation did, the shown diff is outdated until the
         // refresh below brings a new one.
         if self.changes_diff.doc.is_some() {
@@ -1359,7 +1424,7 @@ impl RepoTab {
                     }
                 } else {
                     let message = format!("{} failed: {e:#}", kind.label());
-                    self.error(match identity_hint(&message) {
+                    self.error(match identity_hint(&message).or_else(|| lfs::lfs_hint(&message)) {
                         Some(hint) => format!("{message}\n{hint}"),
                         None => message,
                     });

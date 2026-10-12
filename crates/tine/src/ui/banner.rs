@@ -34,6 +34,24 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
     let busy = tab.busy();
     let state = tab.status.state;
 
+    if tab.lfs_missing() {
+        frame(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    "This repository uses Git LFS, but git-lfs isn't installed: its large files show as pointers, and \
+                     checking some out may fail.",
+                )
+                .truncate(),
+            )
+            .on_hover_text("Install git-lfs (https://git-lfs.com), then open the repository again");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Dismiss").clicked() {
+                    tab.lfs.banner_dismissed = true;
+                }
+            });
+        });
+    }
+
     if !matches!(state, RepoState::Clean | RepoState::Bisecting) {
         let title = match state {
             RepoState::Merging => "Merge in progress".to_owned(),

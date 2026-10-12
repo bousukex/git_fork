@@ -140,6 +140,8 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
     }
     let p = Palette::of(ctx);
     let mut act: Option<Act> = None;
+    // Runs with the dialog kept open.
+    let mut aside: Option<Act> = None;
     let mut cancel = false;
     let dirty = tab.status.has_tracked_changes();
     let clean_block = tab.block_reason(Needs::CleanState);
@@ -149,6 +151,151 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
         ui.set_width(460.0);
         match &mut dialog {
             Dialog::InteractiveRebase(_) | Dialog::EditMergeResult { .. } => unreachable!("shown above"),
+            Dialog::AddWorktree { path, path_text, path_edited, how, name, open } => {
+                use crate::repo::worktree::AddHow;
+                ui.heading("New Worktree");
+                let mut issue = None;
+                match how {
+                    AddHow::NewBranch { start_label, .. } => {
+                        hint(ui, &format!("A new branch, starting at {start_label}"));
+                        let before = name.clone();
+                        name_field(ui, name, "Branch name");
+                        if *name != before
+                            && !*path_edited
+                            && let Some(p) = tab.default_worktree_path(name.trim())
+                        {
+                            *path_text = p.to_string_lossy().into_owned();
+                            *path = p;
+                        }
+                        issue = ref_name_problem(name)
+                            .or_else(|| branch_exists(tab, name).then_some("A branch with this name already exists"));
+                    }
+                    AddHow::Existing { branch } => hint(ui, &format!("Checks out the branch '{branch}' there")),
+                    AddHow::Detached { label, .. } => hint(ui, &format!("Checks out {label} there, detached")),
+                }
+                ui.add_space(4.0);
+                let label = ui.label("Location");
+                ui.horizontal(|ui| {
+                    let w = ui.available_width() - 80.0;
+                    if ui.add(egui::TextEdit::singleline(path_text).desired_width(w)).labelled_by(label.id).changed() {
+                        // Typed: the text is the path, as it is (spaces count).
+                        *path = std::path::PathBuf::from(path_text.as_str());
+                        *path_edited = true;
+                    }
+                    if ui.button("Browse…").on_hover_text("Choose the folder to put it in").clicked() {
+                        aside = Some(Box::new(|t| t.pick_worktree_folder()));
+                    }
+                });
+                let p = path.as_path();
+                let path_issue = if !p.is_absolute() {
+                    Some("Enter a full path")
+                } else if p.exists() && std::fs::read_dir(p).map_or(true, |mut d| d.next().is_some()) {
+                    Some("Something is there already (an empty folder will do)")
+                } else {
+                    None
+                };
+                if let Some(why) = issue.filter(|_| !name.is_empty()).or(path_issue) {
+                    problem(ui, why);
+                }
+                ui.checkbox(open, "Open it in a new tab");
+                let ready = issue.is_none() && path_issue.is_none();
+                let (ok, no) = buttons(ui, "Create", false, ready);
+                if ok {
+                    let target = path.clone();
+                    let how = match how {
+                        AddHow::NewBranch { start, .. } => {
+                            tine_core::worktree::NewWorktree::NewBranch { name: name.trim().to_owned(), start: start.clone() }
+                        }
+                        AddHow::Existing { branch } => tine_core::worktree::NewWorktree::Existing { branch: branch.clone() },
+                        AddHow::Detached { commit, .. } => tine_core::worktree::NewWorktree::Detached { commit: commit.clone() },
+                    };
+                    let open = *open;
+                    act = Some(Box::new(move |t| t.add_worktree(target, how, open)));
+                }
+                cancel = no;
+            }
+            Dialog::LockWorktree { worktree, reason } => {
+                ui.heading(format!("Lock '{}'", worktree.name()));
+                hint(ui, "A locked worktree isn't pruned, moved or removed by accident (one on a removable disk, say).");
+                name_field(ui, reason, "Why (optional)");
+                let (ok, no) = buttons(ui, "Lock", false, true);
+                if ok {
+                    let (w, r) = (worktree.clone(), reason.clone());
+                    act = Some(Box::new(move |t| t.lock_worktree(w, r)));
+                }
+                cancel = no;
+            }
+            Dialog::RemoveWorktree { worktree, losses, discard, .. } => {
+                ui.heading(format!("Remove the worktree '{}'?", worktree.name()));
+                ui.label(RichText::new(worktree.path.to_string_lossy()).small().monospace());
+                let mut ready = false;
+                let mut force = tine_core::worktree::Force { discard: false, locked: worktree.locked.is_some() };
+                match losses {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            hint(ui, "Looking at what it would lose…");
+                        });
+                    }
+                    Some(Err(e)) => problem(ui, &format!("Can't tell what it would lose: {e}")),
+                    Some(Ok(l)) => {
+                        if l.missing {
+                            hint(ui, "Its folder is gone already: only git's record of it is removed.");
+                        }
+                        let list = |ui: &mut egui::Ui, title: &str, files: &[bstr::BString]| {
+                            if files.is_empty() {
+                                return;
+                            }
+                            ui.label(RichText::new(title).small().strong());
+                            for f in files.iter().take(6) {
+                                ui.label(RichText::new(f.to_string()).small().monospace());
+                            }
+                            if files.len() > 6 {
+                                hint(ui, &format!("and {} more", files.len() - 6));
+                            }
+                        };
+                        list(ui, "Changed or untracked files (lost):", &l.changed);
+                        list(ui, "Ignored files (deleted too):", &l.ignored);
+                        list(ui, "Submodules checked out in it (deleted too):", &l.submodules);
+                        if l.unreferenced > 0 {
+                            ui.label(RichText::new("Commits only its detached HEAD has:").small().strong());
+                            hint(ui, &format!("{} commit(s) no branch or tag reaches; nothing refers to them afterwards.", l.unreferenced));
+                        }
+                        if let Some(reason) = &worktree.locked {
+                            let why = if reason.is_empty() { String::new() } else { format!(" ({reason})") };
+                            hint(ui, &format!("It is locked{why}: removing it unlocks it."));
+                        }
+                        let blocked = l.state != RepoState::Clean;
+                        if blocked {
+                            problem(ui, &format!("A {} is in progress there: finish or abort it first.", state_name(l.state)));
+                        }
+                        let loses = l.any();
+                        if loses {
+                            ui.checkbox(discard, "Remove it anyway, losing these");
+                        }
+                        force.discard = l.needs_force();
+                        ready = !blocked && (!loses || *discard);
+                    }
+                }
+                let (ok, no) = buttons(ui, "Remove", true, ready);
+                if ok && let Some(Ok(l)) = losses {
+                    let (w, l) = (worktree.clone(), l.clone());
+                    act = Some(Box::new(move |t| t.confirm_remove_worktree(w, force, l)));
+                }
+                cancel = no;
+            }
+            Dialog::PruneWorktrees { lines } => {
+                ui.heading("Prune worktree records?");
+                hint(ui, "git keeps a record of each worktree; these have lost theirs (their folder is gone):");
+                for l in lines.iter() {
+                    ui.label(RichText::new(l.as_str()).small().monospace());
+                }
+                let (ok, no) = buttons(ui, "Prune", false, true);
+                if ok {
+                    act = Some(Box::new(|t| t.prune_worktrees()));
+                }
+                cancel = no;
+            }
             Dialog::LeaveMerge { then } => {
                 let path = tab.merge.as_ref().map(|m| m.path.to_string()).unwrap_or_default();
                 ui.heading("Discard the merge editor's changes?");
@@ -560,6 +707,9 @@ pub fn show(ctx: &egui::Context, tab: &mut RepoTab) {
         a(tab);
     } else if !(cancel || modal.should_close()) {
         tab.dialog = Some(dialog);
+        if let Some(a) = aside {
+            a(tab);
+        }
     }
 }
 

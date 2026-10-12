@@ -136,6 +136,9 @@ fn run_checkout(git: &GitRunner, target: &CheckoutTarget) -> anyhow::Result<()> 
 impl RepoTab {
     /// Why an action can't run now, if it can't.
     pub fn block_reason(&self, needs: Needs) -> Option<&'static str> {
+        if self.asleep() {
+            return Some("This worktree is being removed");
+        }
         if self.op_active() {
             return Some("Waiting for the current operation");
         }
@@ -877,6 +880,16 @@ impl RepoTab {
             FollowUp::RebaseEndFailed(e) => self.error(format!("Couldn't tidy up after the interactive rebase (press F5 to try again): {e}")),
             FollowUp::RebaseUndone => self.rebase_done = None,
             FollowUp::MergeSaved(saved) => self.merge_save_done(saved.editor, Some(*saved)),
+            FollowUp::WorktreeAdded { path, open, warning } => {
+                if let Some(w) = warning {
+                    self.error(format!("The worktree {} was added, but git reported a failure: {w}", path.display()));
+                }
+                if open {
+                    self.open_request = Some(path);
+                }
+                self.request_worktrees();
+            }
+            FollowUp::Worktrees => self.request_worktrees(),
         }
     }
 

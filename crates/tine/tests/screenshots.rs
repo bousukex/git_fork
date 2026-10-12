@@ -731,6 +731,70 @@ fn merge_editor() {
     );
 }
 
+/// The Worktrees section (one locked, one gone) with the new worktree
+/// dialog over it; and a Git LFS file's diff with the banner about
+/// git-lfs.
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn worktrees_and_lfs() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("project");
+    std::fs::create_dir(&path).unwrap();
+    let mut t = 1_760_000_000;
+    git(&path, &["init", "-q", "-b", "main"], &mut t);
+    git(&path, &["config", "user.name", "山田 太郎"], &mut t);
+    git(&path, &["config", "user.email", "taro@example.com"], &mut t);
+    let pointer = |c: char, size: u64| {
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {size}\n", c.to_string().repeat(64))
+    };
+    std::fs::write(path.join(".gitattributes"), "*.psd filter=lfs diff=lfs merge=lfs -text\n").unwrap();
+    std::fs::write(path.join("ロゴ.psd"), pointer('3', 4_812_337)).unwrap();
+    std::fs::write(path.join("README.md"), "# project\n").unwrap();
+    git(&path, &["add", "-A"], &mut t);
+    git(&path, &["commit", "-qm", "ロゴを追加"], &mut t);
+    for (name, branch) in [("project-feature-login", "feature/login"), ("project-hotfix", "hotfix"), ("project-old", "old")] {
+        let p = dir.path().join(name);
+        git(&path, &["worktree", "add", "-q", "-b", branch, p.to_str().unwrap()], &mut t);
+    }
+    git(&path, &["worktree", "lock", "--reason", "外付けディスク", dir.path().join("project-hotfix").to_str().unwrap()], &mut t);
+    std::fs::remove_dir_all(dir.path().join("project-old")).unwrap();
+    std::fs::write(path.join("ロゴ.psd"), pointer('9', 5_102_884)).unwrap();
+    shoot(
+        "worktrees",
+        [1300.0, 760.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            h.state_mut().active_tab_mut().unwrap().request_add_worktree(None);
+            if let Some(tine::repo::dialog::Dialog::AddWorktree { name, path, path_text, .. }) =
+                &mut h.state_mut().active_tab_mut().unwrap().dialog
+            {
+                *name = "feature/search".into();
+                *path_text = path_text.replace("project-worktree", "project-feature-search");
+                *path = path_text.as_str().into();
+            }
+            h.run_steps(6);
+        },
+    );
+    shoot(
+        "lfs_diff",
+        [1300.0, 760.0],
+        |cc| {
+            let mut app = tine::app::TineApp::new(cc, vec![path.clone()]);
+            app.show_local_changes();
+            app
+        },
+        |h| {
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            let f = tab.list(tine::repo::Side::Unstaged).into_iter().find(|f| f.path.ends_with(".psd".as_bytes())).unwrap();
+            tab.click_change(tine::repo::Side::Unstaged, &f, false, false);
+            settle(h);
+        },
+    );
+}
+
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn interactive_rebase_edit_stop() {

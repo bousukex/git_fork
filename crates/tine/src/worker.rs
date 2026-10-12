@@ -79,6 +79,11 @@ pub enum FollowUp {
     RebaseUndone,
     /// The merge editor's result was written.
     MergeSaved(Box<MergeSaved>),
+    /// A worktree was added (`open`: as a tab); `warning`: git failed
+    /// after making it (a post-checkout hook, say).
+    WorktreeAdded { path: std::path::PathBuf, open: bool, warning: Option<String> },
+    /// The worktrees changed: list them again.
+    Worktrees,
 }
 
 /// A merge editor save that went through.
@@ -169,6 +174,16 @@ pub enum Msg {
     MergeOpened(Gen, anyhow::Result<Box<MergeOpened>>),
     /// Syntax colors for the merge editor's text `.1`.
     MergeHighlighted(Gen, Arc<crate::merge_model::MergeText>, Arc<crate::merge_model::MergeSpans>),
+    Worktrees(Gen, anyhow::Result<Vec<tine_core::worktree::Worktree>>),
+    /// What removing worktree `.1` would lose.
+    WorktreeLosses(Gen, std::path::PathBuf, anyhow::Result<tine_core::worktree::Losses>),
+    /// What pruning would remove.
+    PrunePreview(Gen, anyhow::Result<Vec<String>>),
+    /// Whether the repository uses Git LFS (and git-lfs is installed, when
+    /// asked).
+    LfsState(Gen, anyhow::Result<bool>, Option<bool>),
+    /// Which files of a list go through Git LFS.
+    LfsTracked(Gen, crate::repo::lfs::LfsTarget, anyhow::Result<std::collections::HashSet<bstr::BString>>),
 }
 
 /// The repository's tracked files, prepared for Quick Launch matching.
@@ -222,6 +237,11 @@ pub enum OpKind {
     /// Saving the merge editor's result (and marking it resolved);
     /// `editor`: which opening of the editor it is for.
     SaveMerge { resolved: bool, editor: Gen },
+    AddWorktree(String),
+    RemoveWorktree(std::path::PathBuf),
+    LockWorktree(String),
+    UnlockWorktree(String),
+    PruneWorktrees,
 }
 
 impl OpKind {
@@ -268,6 +288,11 @@ impl OpKind {
             OpKind::FinishRebase => "Finish interactive rebase",
             OpKind::SaveMerge { resolved: false, .. } => "Save",
             OpKind::SaveMerge { resolved: true, .. } => "Save and mark resolved",
+            OpKind::AddWorktree(_) => "Add worktree",
+            OpKind::RemoveWorktree(_) => "Remove worktree",
+            OpKind::LockWorktree(_) => "Lock worktree",
+            OpKind::UnlockWorktree(_) => "Unlock worktree",
+            OpKind::PruneWorktrees => "Prune worktrees",
         }
     }
 }
@@ -281,6 +306,9 @@ pub struct Worker {
     search_cancel: Option<CancelToken>,
     /// Tests: make starting background threads fail.
     fail_spawns: bool,
+    /// No background reads start (the tab sleeps while its worktree is
+    /// removed).
+    paused: bool,
     /// Key of the repository's shared write queue.
     repo: PathBuf,
     running: Arc<RunningJobs>,
@@ -317,7 +345,7 @@ impl Worker {
         let (tx, rx) = unbounded();
         // Linked worktrees share refs, so they share one write queue.
         let repo = repo_key(&reader.paths().common_dir);
-        Self { reader, tx, rx, ctx, log_cancel: None, search_cancel: None, fail_spawns: false, repo, running: Arc::default() }
+        Self { reader, tx, rx, ctx, log_cancel: None, search_cancel: None, fail_spawns: false, paused: false, repo, running: Arc::default() }
     }
 
     /// The jobs of this worker still running (they outlive it).
@@ -379,6 +407,19 @@ impl Worker {
         self.fail_spawns = false;
     }
 
+    /// Stops the history and search reads, and starts no others until
+    /// [`Self::resume`] (write operations still queue).
+    pub fn pause(&mut self) {
+        self.paused = true;
+        for c in [self.log_cancel.take(), self.search_cancel.take()].into_iter().flatten() {
+            c.cancel();
+        }
+    }
+
+    pub fn resume(&mut self) {
+        self.paused = false;
+    }
+
     /// Delivers `msg` as if a job had sent it.
     #[doc(hidden)]
     pub fn send_for_test(&self, msg: Msg) {
@@ -388,6 +429,9 @@ impl Worker {
     /// Runs `job` on its own thread; reports (and returns) a failure to
     /// start it.
     fn spawn(&self, name: &str, job: impl FnOnce(&dyn RepoReader, &Sender<Msg>) + Send + 'static) -> Result<(), String> {
+        if self.paused {
+            return Err("paused".into());
+        }
         let reader = self.reader.clone();
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
@@ -611,6 +655,52 @@ impl Worker {
         });
         if let Err(e) = started {
             let _ = self.tx.send(Msg::MergeOpened(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    pub fn worktrees(&self, seq: Gen) {
+        let started = self.spawn("worktrees", move |r, tx| {
+            let _ = tx.send(Msg::Worktrees(seq, r.worktrees()));
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::Worktrees(seq, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// Looks at what removing `w` would lose (run where `git` is).
+    pub fn worktree_losses(&self, seq: Gen, git: tine_core::GitRunner, w: tine_core::worktree::Worktree) {
+        let path = w.path.clone();
+        let started = self.spawn("worktree-losses", move |_, tx| {
+            let _ = tx.send(Msg::WorktreeLosses(seq, w.path.clone(), tine_core::worktree::losses(&git, &w)));
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::WorktreeLosses(seq, path, Err(anyhow::anyhow!(e))));
+        }
+    }
+
+    /// Whether the repository uses Git LFS; with `installed`, also whether
+    /// git-lfs is there.
+    pub fn lfs_state(&self, seq: Gen, git: tine_core::GitRunner, installed: bool) {
+        let _ = self.spawn("lfs-state", move |_, tx| {
+            let used = tine_core::lfs::repo_uses_lfs(&git);
+            let installed = installed.then(|| tine_core::lfs::installed(&git));
+            let _ = tx.send(Msg::LfsState(seq, used, installed));
+        });
+    }
+
+    /// Which rows of a list go through Git LFS (on either side).
+    pub fn lfs_tracked(&self, seq: Gen, git: tine_core::GitRunner, target: crate::repo::lfs::LfsTarget, rows: Vec<tine_core::lfs::LfsRow>) {
+        let _ = self.spawn("lfs-tracked", move |_, tx| {
+            let _ = tx.send(Msg::LfsTracked(seq, target, tine_core::lfs::tracked_rows(&git, &rows)));
+        });
+    }
+
+    pub fn prune_preview(&self, seq: Gen, git: tine_core::GitRunner) {
+        let started = self.spawn("prune-preview", move |_, tx| {
+            let _ = tx.send(Msg::PrunePreview(seq, tine_core::worktree::prune_preview(&git)));
+        });
+        if let Err(e) = started {
+            let _ = self.tx.send(Msg::PrunePreview(seq, Err(anyhow::anyhow!(e))));
         }
     }
 

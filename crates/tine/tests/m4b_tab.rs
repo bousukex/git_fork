@@ -254,22 +254,37 @@ fn file_listing_is_redone_after_changes_and_failures() {
 fn a_diff_for_old_options_is_dropped() {
     let repo = sample_repo();
     let (mut tab, gates) = gated_tab(repo.path(), Gates { diff: Gate::closed(), ..Default::default() });
+    // Plain only (a colored copy would replace the doc compared below).
     tab.set_doc_options(plain());
     let head = tab.head_commit().unwrap();
     tab.open_file_history(head, "README.md".into(), None);
     assert!(poll_until(&mut tab, |t| !history_view(t).loading));
     // The newest entry's diff is on its way; the options change meanwhile.
-    let before = gates.diff.arrived();
-    assert!(poll_until(&mut tab, |_| gates.diff.arrived() > before));
+    // The calls are told apart by what they are for (other diffs, of local
+    // changes, may come and go).
+    let commit = |ws: bool| move |l: &str| l.starts_with("Commit") && l.contains(" README.md ") && l.contains(&format!("ignore_whitespace: {ws}"));
+    let ws = tab.diff_opts.ignore_whitespace;
+    let call = |tab: &mut RepoTab, which: &dyn Fn(&str) -> bool| {
+        let mut found = None;
+        assert!(poll_until(tab, |_| {
+            found = gates.diff.find(which);
+            found.is_some()
+        }));
+        found.unwrap()
+    };
+    let old = call(&mut tab, &commit(ws));
     let mut opts = tab.diff_opts;
-    opts.ignore_whitespace = !opts.ignore_whitespace;
+    opts.ignore_whitespace = !ws;
     tab.set_diff_options(opts);
-    wait_arrived(&mut tab, &gates.diff, before + 2);
-    gates.diff.release(before + 1);
+    let new = call(&mut tab, &commit(!ws));
+    gates.diff.release(new);
     assert!(poll_until(&mut tab, |t| t.browse_diff.doc.is_some()));
     let fresh = tab.browse_diff.doc.clone().unwrap().unwrap();
-    gates.diff.release(before);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // The older one let through, and over (every diff job left is one
+    // still held): nothing of it is taken.
+    gates.diff.release(old);
+    let running = tab.worker_mut().running_jobs();
+    assert!(poll_until(&mut tab, |_| running.count("diff") == gates.diff.held()));
     tab.poll();
     assert!(std::sync::Arc::ptr_eq(&fresh, tab.browse_diff.doc.as_ref().unwrap().as_ref().unwrap()));
 }

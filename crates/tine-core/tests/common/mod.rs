@@ -106,6 +106,21 @@ impl TestRepo {
         )
     }
 
+    /// Runs git in another folder (a worktree) with the same isolated
+    /// setup; returns (success, stdout, stderr).
+    pub fn try_git_in<I, S>(dir: &Path, args: I) -> (bool, String, String)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let out = Command::new("git").current_dir(dir).args(args).envs(ENV).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
     pub fn write(&self, name: impl AsRef<Path>, content: &str) -> PathBuf {
         let path = self.path().join(name);
         if let Some(parent) = path.parent() {

@@ -59,6 +59,41 @@ pub struct TineApp {
     settings_ui: ui::settings::SettingsUi,
     /// Repositories being opened in the background, in request order.
     opening: Vec<Opening>,
+    /// Worktree removals under way (see `worktree_removals`).
+    removals: Vec<Removal>,
+    /// Tabs asleep after a failed removal, being checked before they wake.
+    wake_checks: Vec<WakeCheck>,
+}
+
+/// A worktree being removed: the operation (whichever tab started it), and
+/// the tabs asleep for it, by work tree — on the worktree, or in a folder
+/// inside it.
+struct Removal {
+    op: crate::ops_registry::OpId,
+    worktree: PathBuf,
+    tabs: Vec<PathBuf>,
+}
+
+/// A tab whose worktree removal failed: whether its repository is still
+/// there as it was (checked off the UI thread).
+struct WakeCheck {
+    workdir: PathBuf,
+    rx: Receiver<Result<(), String>>,
+}
+
+/// The repository of `paths` is still there as it was: from its folder, git
+/// finds the same work tree, git dir and shared git dir (not, say, a
+/// repository around it once its own is gone).
+fn still_there(paths: &tine_core::RepoPaths) -> Result<(), String> {
+    use tine_core::worktree::same_place;
+    let found = tine_core::RepoPaths::discover(&paths.workdir).map_err(|e| format!("{e:#}"))?;
+    let same = same_place(&found.workdir, &paths.workdir)
+        && same_place(&found.git_dir, &paths.git_dir)
+        && same_place(&found.common_dir, &paths.common_dir);
+    match same && paths.git_dir.is_dir() {
+        true => Ok(()),
+        false => Err(format!("git finds the repository of {} there now", found.workdir.display())),
+    }
 }
 
 /// A repository being discovered off the UI thread.
@@ -144,6 +179,8 @@ impl TineApp {
             settings_open: false,
             settings_ui: Default::default(),
             opening: Vec::new(),
+            removals: Vec::new(),
+            wake_checks: Vec::new(),
         };
         let restoring = paths.is_empty();
         let to_open = if restoring { app.state.open.clone() } else { paths };
@@ -196,6 +233,10 @@ impl TineApp {
             self.active = i;
             return;
         }
+        if let Some(why) = self.being_removed(path) {
+            self.open_error = Some(why);
+            return;
+        }
         if !path.is_dir() {
             self.open_error = Some(format!("Folder not found: {}", path.display()));
             return;
@@ -246,6 +287,11 @@ impl TineApp {
                     self.active = i;
                     return;
                 }
+                // Found while its worktree began to be removed.
+                if let Some(why) = self.being_removed(&workdir) {
+                    self.open_error = Some(why);
+                    return;
+                }
                 self.state.recent.retain(|p| p != &workdir);
                 self.state.recent.insert(0, workdir.clone());
                 self.state.recent.truncate(MAX_RECENT);
@@ -277,6 +323,101 @@ impl TineApp {
             let _ = tx.send(dir);
             ctx.request_repaint();
         });
+    }
+
+    /// Why `path` can't be opened now: a worktree it is in is being
+    /// removed.
+    fn being_removed(&self, path: &Path) -> Option<String> {
+        use tine_core::worktree::is_within;
+        let r = self.removals.iter().find(|r| is_within(path, &r.worktree))?;
+        Some(format!("{}: the worktree {} is being removed", path.display(), r.worktree.display()))
+    }
+
+    /// Worktree removals the tabs asked for, and their ends. Before one
+    /// starts, every tab on the worktree or in a folder inside it (a
+    /// submodule, say) is checked — nothing of its own may be lost — and put
+    /// to sleep. Once the operation ends (whichever tab started it, open or
+    /// not), they close if it went; if it failed, each wakes only after its
+    /// repository is found to be there as it was (or closes, saying so).
+    fn worktree_removals(&mut self) {
+        use tine_core::worktree::{is_within, same_place};
+
+        use crate::ops_registry::{OpState, Outcome};
+        for i in 0..self.tabs.len() {
+            let Some(req) = self.tabs[i].remove_requested.take() else { continue };
+            let name = req.worktree.name();
+            let affected: Vec<usize> = (0..self.tabs.len()).filter(|&t| is_within(&self.tabs[t].paths.workdir, &req.worktree.path)).collect();
+            let blocked = affected.iter().find_map(|&t| self.tabs[t].removal_block().map(|why| (t, why)));
+            if let Some((t, why)) = blocked {
+                let whose = match same_place(&self.tabs[t].paths.workdir, &req.worktree.path) {
+                    true => String::new(),
+                    false => format!(" (in {}, open in a tab)", self.tabs[t].paths.workdir.display()),
+                };
+                self.tabs[i].error(format!("Can't remove the worktree '{name}': {why}{whose}"));
+                continue;
+            }
+            let worktree = req.worktree.path.clone();
+            let Some(op) = self.tabs[i].remove_worktree(req) else { continue };
+            for &t in &affected {
+                self.tabs[t].sleep_for_removal(worktree.clone());
+            }
+            let tabs = affected.iter().map(|&t| self.tabs[t].paths.workdir.clone()).collect();
+            self.removals.push(Removal { op, worktree, tabs });
+        }
+        let mut k = 0;
+        while k < self.removals.len() {
+            let state = crate::ops_registry::state(self.removals[k].op);
+            if state.as_ref().is_some_and(OpState::is_active) {
+                k += 1;
+                continue;
+            }
+            let r = self.removals.remove(k);
+            let removed = state == Some(OpState::Finished(Outcome::Succeeded));
+            for workdir in r.tabs {
+                let Some(t) = self.tabs.iter().position(|t| t.paths.workdir == workdir && t.asleep()) else { continue };
+                if removed {
+                    self.close_tab_now(t);
+                } else {
+                    let paths = self.tabs[t].paths.clone();
+                    let (tx, rx) = bounded(1);
+                    let ctx = self.ctx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(still_there(&paths));
+                        ctx.request_repaint();
+                    });
+                    self.wake_checks.push(WakeCheck { workdir, rx });
+                }
+            }
+        }
+        let mut k = 0;
+        while k < self.wake_checks.len() {
+            let result = match self.wake_checks[k].rx.try_recv() {
+                Ok(r) => r,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    k += 1;
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err("the check stopped".into()),
+            };
+            let c = self.wake_checks.remove(k);
+            let Some(t) = self.tabs.iter().position(|t| t.paths.workdir == c.workdir && t.asleep()) else { continue };
+            match result {
+                Ok(()) => self.tabs[t].wake(),
+                Err(why) => {
+                    self.notices.push(format!(
+                        "Closed the tab of {}: removing the worktree failed part-way, and its repository isn't there as it was ({why})",
+                        c.workdir.display()
+                    ));
+                    self.close_tab_now(t);
+                }
+            }
+        }
+    }
+
+    /// The tab is asleep and its repository is being checked before it
+    /// wakes (after a failed removal).
+    fn waking(&self, workdir: &Path) -> bool {
+        self.wake_checks.iter().any(|c| c.workdir == workdir)
     }
 
     /// Unsaved merge editor changes, by tab.
@@ -391,6 +532,11 @@ impl TineApp {
         &self.notices
     }
 
+    /// Why the last repository asked for couldn't be opened.
+    pub fn open_error(&self) -> Option<&str> {
+        self.open_error.as_deref()
+    }
+
     /// Recent commit messages (oldest first).
     pub fn recent_messages(&self) -> &[String] {
         &self.state.messages
@@ -406,6 +552,19 @@ impl TineApp {
 
     pub fn active_tab_mut(&mut self) -> Option<&mut RepoTab> {
         self.tabs.get_mut(self.active)
+    }
+
+    /// Every tab (tests reach the inactive ones).
+    #[doc(hidden)]
+    pub fn tabs_mut(&mut self) -> &mut [RepoTab] {
+        &mut self.tabs
+    }
+
+    /// Makes tab `i` the active one.
+    pub fn activate(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.active = i;
+        }
     }
 
     /// Decides who owns the keyboard (see [`input::Layer`]); called again
@@ -836,6 +995,7 @@ impl eframe::App for TineApp {
             }
         }
         self.on_close_request(&ctx);
+        self.worktree_removals();
         // Operations whose tab was closed: the work tree that started them
         // takes them over (its stash conflict, stashed changes…); other
         // worktrees of the repository just refresh. Without a tab for that
@@ -915,17 +1075,35 @@ impl eframe::App for TineApp {
             }
             return;
         }
+        let waking = self.tabs.get(self.active).is_some_and(|t| self.waking(&t.paths.workdir));
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let asleep = tab.asleep();
 
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(240.0)
             .size_range(160.0..=480.0)
             .frame(egui::Frame::NONE.fill(p.sidebar_bg).inner_margin(egui::Margin::symmetric(6, 0)))
-            .show(ui, |ui| ui::sidebar::show(ui, tab));
+            .show(ui, |ui| {
+                ui.add_enabled_ui(!asleep, |ui| ui::sidebar::show(ui, tab));
+            });
 
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(p.bg)).show(ui, |ui| {
             error_banner(ui, tab);
+            if asleep {
+                // Nothing to do here until the removal is over.
+                let text = match waking {
+                    true => "Removing this worktree failed; checking that it is all still there…",
+                    false => "This worktree is being removed…",
+                };
+                ui.centered_and_justified(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(text).color(p.text_weak));
+                    });
+                });
+                return;
+            }
             ui::banner::show(ui, tab);
             if tab.output_open {
                 egui::Panel::bottom("output")

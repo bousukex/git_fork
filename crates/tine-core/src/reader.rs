@@ -40,27 +40,25 @@ impl RepoPaths {
     }
 
     pub fn discover_with(git: &GitRunner) -> Result<RepoPaths> {
-        let out = git
-            .output([
-                "rev-parse",
-                "--is-bare-repository",
-                "--show-toplevel",
-                "--absolute-git-dir",
-                "--path-format=absolute",
-                "--git-common-dir",
-            ])
+        let bare = git
+            .output(["rev-parse", "--is-bare-repository"])
             .with_context(|| format!("{} is not a git repository", git.workdir().display()))?;
-        let mut lines = out.lines();
-        if lines.next() == Some(b"true") {
+        if bare.trim() == b"true" {
             bail!("bare repositories are not supported");
         }
-        let path = |l: Option<&[u8]>| -> Result<PathBuf> {
-            let l = l.filter(|l| !l.is_empty()).context("unexpected `git rev-parse` output")?;
-            Ok(PathBuf::from(OsString::from_vec(l.to_vec())))
+        // One path per call: a path may hold a line break (only the one git
+        // ends its answer with is taken off).
+        let path = |args: &[&str]| -> Result<PathBuf> {
+            let out = git.output(args)?;
+            let p = out.strip_suffix(b"\n").unwrap_or(&out);
+            if p.is_empty() {
+                bail!("unexpected `git rev-parse` output");
+            }
+            Ok(PathBuf::from(OsString::from_vec(p.to_vec())))
         };
-        let workdir = path(lines.next())?;
-        let git_dir = path(lines.next())?;
-        let common_dir = path(lines.next())?;
+        let workdir = path(&["rev-parse", "--show-toplevel"])?;
+        let git_dir = path(&["rev-parse", "--absolute-git-dir"])?;
+        let common_dir = path(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
         Ok(RepoPaths { workdir, git_dir, common_dir })
     }
 }
@@ -108,6 +106,8 @@ pub trait RepoReader: Send + Sync {
     /// A conflicted file opened for the merge editor
     /// ([`crate::merge_file::open`]).
     fn merge_open(&self, path: &[u8], cancel: &CancelToken) -> Result<crate::merge_file::Opened>;
+    /// The repository's worktrees ([`crate::worktree::list`]).
+    fn worktrees(&self) -> Result<Vec<crate::worktree::Worktree>>;
 }
 
 #[derive(Debug, Clone)]
@@ -215,5 +215,9 @@ impl RepoReader for CliReader {
 
     fn merge_open(&self, path: &[u8], cancel: &CancelToken) -> Result<crate::merge_file::Opened> {
         crate::merge_file::open(&self.git, &self.paths.git_dir, path, cancel)
+    }
+
+    fn worktrees(&self) -> Result<Vec<crate::worktree::Worktree>> {
+        crate::worktree::list(&self.git)
     }
 }

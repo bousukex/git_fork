@@ -24,6 +24,8 @@ use tine_core::{
 pub struct Gate {
     on: AtomicBool,
     calls: Mutex<Vec<Option<Sender<()>>>>,
+    /// What each held call was for (in arrival order).
+    labels: Mutex<Vec<String>>,
     /// Every call, held or not.
     total: AtomicUsize,
 }
@@ -34,6 +36,11 @@ impl Gate {
     }
 
     fn wait(&self) {
+        self.wait_as(String::new());
+    }
+
+    /// Like `wait`, telling what the call is for (see [`Self::find`]).
+    fn wait_as(&self, label: String) {
         self.total.fetch_add(1, Ordering::Relaxed);
         // Checked and queued under the lock `open` takes: a call can't slip
         // in between its check and `open` releasing the queue.
@@ -44,6 +51,7 @@ impl Gate {
             }
             let (tx, rx) = bounded(1);
             calls.push(Some(tx));
+            self.labels.lock().unwrap().push(label);
             rx
         };
         // An error means the gate is gone (the test ended): go on.
@@ -53,6 +61,17 @@ impl Gate {
     /// Calls that have arrived so far.
     pub fn arrived(&self) -> usize {
         self.calls.lock().unwrap().len()
+    }
+
+    /// The first held call whose label matches, by its index.
+    pub fn find(&self, matches: impl Fn(&str) -> bool) -> Option<usize> {
+        let _calls = self.calls.lock().unwrap();
+        self.labels.lock().unwrap().iter().position(|l| matches(l))
+    }
+
+    /// Calls still held (not released).
+    pub fn held(&self) -> usize {
+        self.calls.lock().unwrap().iter().filter(|c| c.is_some()).count()
     }
 
     /// Calls so far, including those an open gate let through.
@@ -96,6 +115,7 @@ pub struct Gates {
     pub diff: Gate,
     pub rebase_range: Gate,
     pub merge_open: Gate,
+    pub worktrees: Gate,
     /// Calls that ended stopped (git never ran, or was stopped).
     pub stopped_diffs: AtomicUsize,
     pub stopped_blames: AtomicUsize,
@@ -135,7 +155,7 @@ impl RepoReader for Gated {
         self.inner.commit_files(id, parent)
     }
     fn file_diff(&self, source: DiffSource, file: &ChangedFile, opts: DiffOptions, cancel: &CancelToken) -> anyhow::Result<FileDiff> {
-        self.gates.diff.wait();
+        self.gates.diff.wait_as(format!("{source:?} {} {opts:?}", file.path));
         count_stop(self.inner.file_diff(source, file, opts, cancel), &self.gates.stopped_diffs)
     }
     fn search(
@@ -172,6 +192,10 @@ impl RepoReader for Gated {
     fn rebase_range(&self, base: Option<Oid>, cancel: &CancelToken) -> anyhow::Result<tine_core::interactive::Range> {
         self.gates.rebase_range.wait();
         self.inner.rebase_range(base, cancel)
+    }
+    fn worktrees(&self) -> anyhow::Result<Vec<tine_core::worktree::Worktree>> {
+        self.gates.worktrees.wait();
+        self.inner.worktrees()
     }
     fn merge_open(&self, path: &[u8], cancel: &CancelToken) -> anyhow::Result<tine_core::merge_file::Opened> {
         self.gates.merge_open.wait();

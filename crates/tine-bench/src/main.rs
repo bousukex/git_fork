@@ -254,8 +254,68 @@ fn bench_highlight(files: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `worktrees <repo>`: what M5c runs in the background — listing the
+/// worktrees and telling whether HEAD uses Git LFS (each refs reload), the
+/// LFS marks of the local changes (each status reload) and of HEAD's
+/// commit, and what removing a worktree would lose (looked at in the dialog
+/// and again before removing). Warm (one run first), 7 runs each.
+fn bench_worktrees(repo: &Path) -> Result<()> {
+    use tine_core::{
+        GitRunner,
+        diff::{DiffSource, commit_files},
+        lfs::{self, LfsRow},
+        worktree,
+    };
+    let git = GitRunner::new(repo);
+    let reader = CliReader::open(repo)?;
+    let time = |name: &str, f: &mut dyn FnMut() -> Result<String>| -> Result<()> {
+        let what = f()?;
+        let mut runs = Vec::new();
+        for _ in 0..7 {
+            let t = Instant::now();
+            f()?;
+            runs.push(t.elapsed());
+        }
+        println!("  {name:<28} {}  ({what})", percentiles(runs));
+        Ok(())
+    };
+    let files = git.output(["ls-files", "-z"])?.split(|&b| b == 0).filter(|p| !p.is_empty()).count();
+    println!("{}: {files} files", repo.display());
+    time("worktree list", &mut || Ok(format!("{} worktrees", worktree::list(&git)?.len())))?;
+    time("uses Git LFS (HEAD)", &mut || Ok(format!("{}", lfs::repo_uses_lfs(&git)?)))?;
+    let status = reader.status()?;
+    let head = reader.refs()?.head_target();
+    let unstaged = LfsRow::rows(DiffSource::Unstaged, head, &status.unstaged);
+    let staged = LfsRow::rows(DiffSource::Staged, head, &status.staged);
+    time("LFS marks, local changes", &mut || {
+        let (u, s) = (lfs::tracked_rows(&git, &unstaged)?, lfs::tracked_rows(&git, &staged)?);
+        Ok(format!("{} + {} rows, {} marked", unstaged.len(), staged.len(), u.len() + s.len()))
+    })?;
+    if let Some(id) = head {
+        let parent = git.output_with(["rev-parse", "-q", "--verify", &format!("{}^", id.to_hex())], &[1])?;
+        let parent = tine_core::model::Oid::from_hex(parent.trim_ascii());
+        let changed = commit_files(&git, id, parent)?;
+        let source = DiffSource::Commit { id, parent };
+        let rows = LfsRow::rows(source, None, &changed);
+        time("LFS marks, HEAD's commit", &mut || Ok(format!("{} rows, {} marked", rows.len(), lfs::tracked_rows(&git, &rows)?.len())))?;
+    }
+    if let Some(w) = worktree::list(&git)?.into_iter().find(|w| !w.main && w.path.is_dir()) {
+        time("what removing would lose", &mut || {
+            let l = worktree::losses(&git, &w)?;
+            Ok(format!("{}: {} changed, {} ignored", w.name(), l.changed.len(), l.ignored.len()))
+        })?;
+    }
+    let (peak, _) = memory_mib();
+    println!("  memory: peak {peak:.0} MiB");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("worktrees") {
+        anyhow::ensure!(args.len() == 2, "usage: tine-bench worktrees <repo>");
+        return bench_worktrees(Path::new(&args[1]));
+    }
     if args.first().map(String::as_str) == Some("highlight") {
         anyhow::ensure!(args.len() >= 2, "usage: tine-bench highlight <file>…");
         return bench_highlight(&args[1..]);

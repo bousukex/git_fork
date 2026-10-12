@@ -112,6 +112,29 @@ pub enum Dialog {
     },
     /// Deleting `full_ref` (e.g. `refs/heads/x`) on `remote`.
     DeleteRemoteRef { remote: String, full_ref: String },
+    /// A new worktree at `path` (`path_edited`: typed or picked, so the
+    /// branch name no longer sets it); `name`: the new branch's.
+    /// `path`: where it goes (any bytes); `path_text`: that, as edited
+    /// (typing sets `path` from it).
+    AddWorktree {
+        path: std::path::PathBuf,
+        path_text: String,
+        path_edited: bool,
+        how: super::worktree::AddHow,
+        name: String,
+        open: bool,
+    },
+    LockWorktree { worktree: tine_core::worktree::Worktree, reason: String },
+    /// `losses`: what it would lose (`None` while looked at); `discard`:
+    /// confirmed that it goes.
+    RemoveWorktree {
+        worktree: tine_core::worktree::Worktree,
+        losses: Option<Result<tine_core::worktree::Losses, String>>,
+        seq: crate::worker::Gen,
+        discard: bool,
+    },
+    /// What `git worktree prune` would remove.
+    PruneWorktrees { lines: Vec<String> },
     /// Giving up the merge editor's unsaved changes, then `then`.
     LeaveMerge { then: super::merge::MergeLeave },
     /// Editing the merge editor's result as text (`editor`: which opening

@@ -104,8 +104,9 @@ fn files(ui: &mut egui::Ui, tab: &RepoTab, actions: &mut Vec<Action>) {
                         }
                     });
                     status_badge(ui.painter(), Pos2::new(rect.left() + 14.0, rect.center().y), f.kind, p);
+                    let tag = if tab.is_lfs_in_commit(&f.path) { super::lfs_tag(ui.painter(), rect, p) } else { 0.0 };
                     let (name, dir) = split_path(&f.path);
-                    let text_rect = Rect::from_min_max(Pos2::new(rect.left() + 28.0, rect.top()), rect.right_bottom());
+                    let text_rect = Rect::from_min_max(Pos2::new(rect.left() + 28.0, rect.top()), rect.right_bottom() - egui::vec2(tag, 0.0));
                     let name_galley = super::truncated(ui.painter(), &name, FontId::proportional(13.0), p.text, text_rect.width());
                     let name_w = name_galley.size().x;
                     ui.painter().galley(

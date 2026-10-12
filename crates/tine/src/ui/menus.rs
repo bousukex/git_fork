@@ -36,6 +36,8 @@ pub enum RefAction {
     /// Interactive rebase of the commits after this one (`None`: from the
     /// root, including it).
     InteractiveRebase(Option<Oid>),
+    /// A new worktree with this local branch checked out.
+    NewWorktree(String),
 }
 
 pub fn apply(tab: &mut RepoTab, a: RefAction) {
@@ -50,6 +52,7 @@ pub fn apply(tab: &mut RepoTab, a: RefAction) {
         RefAction::CherryPick(c) => tab.request_cherry_pick(&c),
         RefAction::Revert(c) => tab.request_revert(&c),
         RefAction::InteractiveRebase(base) => tab.open_interactive_rebase(base),
+        RefAction::NewWorktree(b) => tab.request_add_worktree(Some(b)),
         RefAction::Reset(o, l) => tab.request_reset(o, &l),
         RefAction::Rename(b) => tab.request_rename_branch(&b),
         RefAction::DeleteBranch(b) => tab.request_delete_branch(&b),
@@ -192,6 +195,19 @@ pub fn branch_menu(ui: &mut egui::Ui, tab: &RepoTab, r: &GitRef, out: &mut Optio
     }
     if item(ui, format!("Create Tag on '{name}'…"), idle) {
         *out = Some(RefAction::CreateTag(r.full_name.clone(), name.clone()));
+    }
+    if r.kind == RefKind::LocalBranch {
+        let elsewhere = tab.worktrees.iter().any(|w| !tab.is_this_worktree(w) && w.branch_name() == Some(name.as_str()));
+        let block = if r.is_head {
+            Some("It is checked out here")
+        } else if elsewhere {
+            Some("It is checked out in another worktree")
+        } else {
+            idle
+        };
+        if item(ui, "Check Out in New Worktree…", block) {
+            *out = Some(RefAction::NewWorktree(name.clone()));
+        }
     }
     if r.kind == RefKind::LocalBranch {
         ui.separator();

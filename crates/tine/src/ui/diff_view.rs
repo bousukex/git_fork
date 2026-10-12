@@ -84,6 +84,7 @@ fn show_inner(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions, actions: Op
             ui,
             "Deleted on one side of the conflict. Right-click the file to keep a version or resolve by deleting.",
         ),
+        Some(Ok(doc)) if doc.source.lfs.is_some() => lfs_view(ui, doc.source.lfs.as_ref().expect("checked")),
         Some(Ok(doc)) if doc.binary => placeholder(ui, "Binary file"),
         Some(Ok(doc)) if doc.is_empty() => {
             let msg = if file.is_submodule {
@@ -105,6 +106,51 @@ fn show_inner(ui: &mut egui::Ui, pane: &DiffPane, opts: DiffOptions, actions: Op
         }
     }
     events
+}
+
+/// A size in bytes, readably.
+pub fn human_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{n} bytes") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+/// A Git LFS file's diff: the objects its pointers stand for (nothing is
+/// downloaded to show it).
+fn lfs_view(ui: &mut egui::Ui, view: &tine_core::lfs::LfsView) {
+    use tine_core::lfs::LfsSide;
+    let p = Palette::of(ui.ctx());
+    let side = |s: &LfsSide| match s {
+        LfsSide::Absent => "(no file)".to_owned(),
+        LfsSide::Pointer(ptr) => format!("object {} · {}", ptr.short_oid(), human_size(ptr.size)),
+        LfsSide::Contents { size } => format!("the file's contents · {}", human_size(*size)),
+    };
+    egui::Frame::NONE.inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+        ui.label(RichText::new("Git LFS object").strong());
+        ui.add_space(4.0);
+        egui::Grid::new("lfs-sides").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label(RichText::new("Before").color(p.text_weak));
+            ui.label(RichText::new(side(&view.old)).monospace());
+            ui.end_row();
+            ui.label(RichText::new("After").color(p.text_weak));
+            ui.label(RichText::new(side(&view.new)).monospace());
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        if matches!(view.new, LfsSide::Contents { .. }) {
+            ui.label(RichText::new("The working tree has the file's contents (not its pointer).").small().color(p.text_weak));
+        }
+        ui.label(
+            RichText::new("The repository keeps a small pointer to the file; its contents are stored with Git LFS.")
+                .small()
+                .color(p.text_weak),
+        );
+    });
 }
 
 fn conflict_legend(ui: &mut egui::Ui) {

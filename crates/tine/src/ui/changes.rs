@@ -146,8 +146,9 @@ fn file_list(ui: &mut egui::Ui, id: &str, files: &[ChangedFile], side: Side, tab
                 });
 
                 status_badge(ui.painter(), Pos2::new(rect.left() + 14.0, rect.center().y), f.kind, p);
+                let tag = if tab.is_lfs(side, &f.path) { super::lfs_tag(ui.painter(), rect, p) } else { 0.0 };
                 let (name, dir) = split_path(&f.path);
-                let text_rect = Rect::from_min_max(Pos2::new(rect.left() + 28.0, rect.top()), Pos2::new(rect.right() - 6.0, rect.bottom()));
+                let text_rect = Rect::from_min_max(Pos2::new(rect.left() + 28.0, rect.top()), Pos2::new(rect.right() - 6.0 - tag, rect.bottom()));
                 let galley = super::truncated(ui.painter(), &name, FontId::proportional(13.0), p.text, text_rect.width());
                 let name_w = galley.size().x;
                 ui.painter().galley(Pos2::new(text_rect.left(), rect.center().y - galley.size().y / 2.0), galley, p.text);

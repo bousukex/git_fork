@@ -111,6 +111,17 @@ pub fn split_path(path: &BString) -> (String, String) {
 }
 
 /// Paints a small rounded status letter box (like Fork's file icons).
+/// A small "LFS" tag at the right end of a file row (the file goes
+/// through Git LFS); returns the width it takes.
+pub fn lfs_tag(painter: &Painter, row: Rect, p: &Palette) -> f32 {
+    let galley = painter.layout_no_wrap("LFS".into(), FontId::proportional(10.0), p.text_weak);
+    let w = galley.size().x + 8.0;
+    let rect = Rect::from_min_max(Pos2::new(row.right() - 6.0 - w, row.center().y - 7.0), Pos2::new(row.right() - 6.0, row.center().y + 7.0));
+    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, p.separator), egui::StrokeKind::Inside);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, p.text_weak);
+    w + 10.0
+}
+
 pub fn status_badge(painter: &Painter, center: Pos2, kind: ChangeKind, p: &Palette) {
     let rect = Rect::from_center_size(center, egui::vec2(15.0, 15.0));
     let color = status_color(kind, p);

@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 
 use egui::{Align2, FontFamily, FontId, Pos2, Rect, RichText};
-use tine_core::model::{GitRef, Oid, RefKind, Tracking};
+use tine_core::{
+    model::{GitRef, Oid, RefKind, Tracking},
+    worktree::Worktree,
+};
 
 use super::paint_text;
 use crate::{
@@ -21,6 +24,112 @@ enum Action {
     Ref(super::menus::RefAction),
     /// Path relative to the work tree, as raw bytes (may not be UTF-8).
     OpenSubmodule(bstr::BString),
+    Worktree(WorktreeAction),
+}
+
+enum WorktreeAction {
+    Add,
+    Open(Worktree),
+    Tool(crate::tools::Tool, std::path::PathBuf),
+    Lock(Worktree),
+    Unlock(Worktree),
+    Remove(Worktree),
+    Prune,
+}
+
+/// The repository's worktrees: open one, add, lock, remove.
+fn worktrees(ui: &mut egui::Ui, tab: &RepoTab, actions: &mut Vec<Action>) {
+    let p = Palette::of(ui.ctx());
+    let id = ui.make_persistent_id("worktrees-section");
+    let mut add = false;
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+        .show_header(ui, |ui| {
+            ui.label(RichText::new(format!("Worktrees  {}", tab.worktrees.len())).small().strong().color(p.text_weak));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let block = tab.block_reason(crate::repo::Needs::Idle);
+                let resp = ui
+                    .add_enabled(block.is_none(), egui::Button::new(RichText::new("+").small()).frame(false))
+                    .on_hover_text("New worktree…")
+                    .on_disabled_hover_text(block.unwrap_or_default());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, block.is_none(), "New worktree"));
+                add = resp.clicked();
+            });
+        })
+        .body(|ui| {
+            if let Some(e) = &tab.worktrees_error {
+                ui.label(RichText::new(format!("Can't list them: {e}")).small().color(p.status_deleted));
+            }
+            for w in &tab.worktrees {
+                let this = tab.is_this_worktree(w);
+                let mut right = match (w.branch_name(), w.bare) {
+                    (_, true) => "bare".to_owned(),
+                    (Some(b), _) => b.to_owned(),
+                    (None, _) => "detached".to_owned(),
+                };
+                if w.locked.is_some() {
+                    right.push_str(" · locked");
+                }
+                if w.prunable.is_some() {
+                    right.push_str(" · missing");
+                }
+                let name = w.name();
+                let resp = labeled_item(ui, 0, &name, &right, false, this, &format!("worktree {name}"));
+                let mut tip = w.path.to_string_lossy().into_owned();
+                if w.main {
+                    tip.push_str("\nThe main worktree");
+                }
+                if this {
+                    tip.push_str("\nThis tab");
+                }
+                if let Some(r) = w.locked.as_deref().filter(|r| !r.is_empty()) {
+                    tip.push_str(&format!("\nLocked: {r}"));
+                }
+                if let Some(r) = &w.prunable {
+                    tip.push_str(&format!("\nMissing: {r}"));
+                }
+                let resp = resp.on_hover_text(tip);
+                if resp.double_clicked() && !this {
+                    actions.push(Action::Worktree(WorktreeAction::Open(w.clone())));
+                }
+                resp.context_menu(|ui| worktree_menu(ui, tab, w, this, actions));
+            }
+        });
+    if add {
+        actions.push(Action::Worktree(WorktreeAction::Add));
+    }
+}
+
+fn worktree_menu(ui: &mut egui::Ui, tab: &RepoTab, w: &Worktree, this: bool, actions: &mut Vec<Action>) {
+    let idle = tab.block_reason(crate::repo::Needs::Idle);
+    let present = w.path.is_dir() && !w.bare;
+    let mut entry = |ui: &mut egui::Ui, label: &str, block: Option<&str>, act: WorktreeAction| {
+        let resp = ui.add_enabled(block.is_none(), egui::Button::new(label));
+        if resp.on_disabled_hover_text(block.unwrap_or_default()).clicked() {
+            actions.push(Action::Worktree(act));
+            ui.close();
+        }
+    };
+    let open_block = if this { Some("This tab") } else if !present { Some("Its folder isn't there") } else { None };
+    entry(ui, "Open", open_block, WorktreeAction::Open(w.clone()));
+    let tool_block = (!present).then_some("Its folder isn't there");
+    entry(ui, "Open in Terminal", tool_block, WorktreeAction::Tool(crate::tools::Tool::Terminal, w.path.clone()));
+    entry(ui, "Open in File Manager", tool_block, WorktreeAction::Tool(crate::tools::Tool::FileManager, w.path.clone()));
+    ui.separator();
+    let main_block = w.main.then_some("The main worktree");
+    if w.locked.is_some() {
+        entry(ui, "Unlock", main_block.or(idle), WorktreeAction::Unlock(w.clone()));
+    } else {
+        entry(ui, "Lock…", main_block.or(idle), WorktreeAction::Lock(w.clone()));
+    }
+    entry(ui, "Remove…", main_block.or(idle), WorktreeAction::Remove(w.clone()));
+    if w.prunable.is_some() {
+        entry(ui, "Prune Missing Worktrees…", idle, WorktreeAction::Prune);
+    }
+    ui.separator();
+    if ui.button("Copy Path").clicked() {
+        ui.ctx().copy_text(w.path.to_string_lossy().into_owned());
+        ui.close();
+    }
 }
 
 /// Branch names grouped into folders by `/`.
@@ -52,7 +161,14 @@ fn labeled_item(ui: &mut egui::Ui, depth: usize, text: &str, right: &str, select
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, a11y));
     let left = rect.left() + 10.0 + depth as f32 * INDENT;
     let family = if bold { FontFamily::Name(crate::fonts::BOLD.into()) } else { FontFamily::Proportional };
-    let right_w = if right.is_empty() { 0.0 } else { 70.0 };
+    // As wide as its text (at least the usual column, at most a bit over
+    // half the row): the name gives way first.
+    let right_w = if right.is_empty() {
+        0.0
+    } else {
+        let w = ui.painter().layout_no_wrap(right.to_owned(), FontId::proportional(11.5), p.text_weak).size().x + 2.0;
+        w.clamp(70.0, (rect.width() * 0.55).max(70.0))
+    };
     let text_rect = Rect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(rect.right() - 8.0 - right_w, rect.bottom()));
     paint_text(ui.painter(), text_rect, text, FontId::new(13.0, family), p.text, Align2::LEFT_CENTER);
     if !right.is_empty() {
@@ -229,6 +345,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
             });
         }
 
+        worktrees(ui, tab, &mut actions);
+
         let stashes: Vec<_> = tab.refs.stashes.iter().filter(|s| matches(&s.message)).collect();
         section(ui, "Stashes", stashes.len(), |ui| {
             for s in stashes {
@@ -264,6 +382,15 @@ pub fn show(ui: &mut egui::Ui, tab: &mut RepoTab) {
                 use std::os::unix::ffi::OsStrExt as _;
                 tab.open_request = Some(tab.paths.workdir.join(std::ffi::OsStr::from_bytes(&path)));
             }
+            Action::Worktree(a) => match a {
+                WorktreeAction::Add => tab.request_add_worktree(None),
+                WorktreeAction::Open(w) => tab.open_worktree(&w),
+                WorktreeAction::Tool(tool, path) => crate::tools::run(ui.ctx(), &tool, &path),
+                WorktreeAction::Lock(w) => tab.request_lock_worktree(&w),
+                WorktreeAction::Unlock(w) => tab.unlock_worktree(w),
+                WorktreeAction::Remove(w) => tab.request_remove_worktree(&w),
+                WorktreeAction::Prune => tab.request_prune_worktrees(),
+            },
         }
     }
 }

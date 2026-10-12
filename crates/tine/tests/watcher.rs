@@ -48,7 +48,7 @@ fn reports_relevant_changes_only() {
 
     let (tx, rx) = unbounded();
     let runner = GitRunner::new(&d).with_env("GIT_CONFIG_GLOBAL", "/dev/null");
-    let _w = RepoWatcher::start(d.clone(), d.join(".git"), runner, tx, egui::Context::default());
+    let _w = RepoWatcher::start(d.clone(), d.join(".git"), d.join(".git"), runner, tx, egui::Context::default());
     std::thread::sleep(Duration::from_millis(500));
 
     // Ignored build output: nothing.
@@ -80,7 +80,7 @@ fn constant_reads_by_other_tools_do_not_delay_updates() {
 
     let (tx, rx) = unbounded();
     let runner = GitRunner::new(&d).with_env("GIT_CONFIG_GLOBAL", "/dev/null");
-    let _w = RepoWatcher::start(d.clone(), d.join(".git"), runner, tx, egui::Context::default());
+    let _w = RepoWatcher::start(d.clone(), d.join(".git"), d.join(".git"), runner, tx, egui::Context::default());
     std::thread::sleep(Duration::from_millis(500));
 
     // A shell prompt or editor polling git: reads every 20ms.
@@ -111,7 +111,7 @@ fn continuous_changes_are_reported_within_two_seconds() {
     git(&d, &["commit", "-qm", "init"]);
     let (tx, rx) = unbounded();
     let runner = GitRunner::new(&d).with_env("GIT_CONFIG_GLOBAL", "/dev/null");
-    let _w = RepoWatcher::start(d.clone(), d.join(".git"), runner, tx, egui::Context::default());
+    let _w = RepoWatcher::start(d.clone(), d.join(".git"), d.join(".git"), runner, tx, egui::Context::default());
     std::thread::sleep(Duration::from_millis(500));
 
     // A tracked file rewritten every 100ms (never quiet for 300ms).

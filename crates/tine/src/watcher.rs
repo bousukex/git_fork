@@ -35,16 +35,19 @@ pub struct FsChange {
     /// Branches, tags or HEAD moved (implies `status`).
     pub refs: bool,
     pub status: bool,
+    /// Worktrees were added, removed, locked, or switched branches.
+    pub worktrees: bool,
 }
 
 impl FsChange {
     pub fn merge(&mut self, other: FsChange) {
         self.refs |= other.refs;
         self.status |= other.status;
+        self.worktrees |= other.worktrees;
     }
 
     pub fn any(self) -> bool {
-        self.refs || self.status
+        self.refs || self.status || self.worktrees
     }
 }
 
@@ -52,10 +55,26 @@ impl FsChange {
 enum Kind {
     Refs,
     Status,
+    /// The repository's worktrees (another one's HEAD, lock…).
+    Worktrees,
     Worktree(BString),
 }
 
-fn classify(path: &Path, workdir: &Path, git_dir: &Path) -> Option<Kind> {
+/// A change under `worktrees/` (relative path `rel`) that changes the list
+/// of worktrees: one's records added or removed, its HEAD moved, its lock
+/// or location changed — not its index, logs and the like.
+fn changes_worktree_list(rel: &Path) -> bool {
+    let parts: Vec<&[u8]> = rel.components().map(|c| c.as_os_str().as_bytes()).collect();
+    match parts.as_slice() {
+        [b"worktrees"] | [b"worktrees", _] => true,
+        [b"worktrees", _, file] => matches!(*file, b"HEAD" | b"locked" | b"gitdir"),
+        _ => false,
+    }
+}
+
+/// What a change at `path` means for the worktree at `workdir` (its git
+/// dir `git_dir`, the repository's shared one `common_dir`).
+fn classify(path: &Path, workdir: &Path, git_dir: &Path, common_dir: &Path) -> Option<Kind> {
     if let Ok(rel) = path.strip_prefix(git_dir) {
         let name = rel.file_name()?.as_bytes();
         if name.ends_with(b".lock") {
@@ -65,7 +84,21 @@ fn classify(path: &Path, workdir: &Path, git_dir: &Path) -> Option<Kind> {
         return match first {
             b"HEAD" | b"packed-refs" | b"refs" => Some(Kind::Refs),
             b"index" | b"rebase-merge" | b"rebase-apply" => Some(Kind::Status),
+            b"worktrees" => changes_worktree_list(rel).then_some(Kind::Worktrees),
             _ if name.ends_with(b"_HEAD") && rel.components().count() == 1 => Some(Kind::Status),
+            _ => None,
+        };
+    }
+    // A linked worktree: the refs it shares, the other worktrees.
+    if let Ok(rel) = path.strip_prefix(common_dir) {
+        let name = rel.file_name()?.as_bytes();
+        if name.ends_with(b".lock") {
+            return None;
+        }
+        return match rel.components().next()?.as_os_str().as_bytes() {
+            b"packed-refs" | b"refs" => Some(Kind::Refs),
+            b"HEAD" => Some(Kind::Worktrees),
+            b"worktrees" => changes_worktree_list(rel).then_some(Kind::Worktrees),
             _ => None,
         };
     }
@@ -90,11 +123,18 @@ impl Drop for RepoWatcher {
 impl RepoWatcher {
     /// Starts watching on a background thread. Setup errors (such as the
     /// inotify watch limit) are reported through `tx` as a failed job.
-    pub fn start(workdir: PathBuf, git_dir: PathBuf, git: GitRunner, tx: Sender<Msg>, ctx: egui::Context) -> Self {
+    pub fn start(
+        workdir: PathBuf,
+        git_dir: PathBuf,
+        common_dir: PathBuf,
+        git: GitRunner,
+        tx: Sender<Msg>,
+        ctx: egui::Context,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let spawned = std::thread::Builder::new().name("tine-watch".into()).spawn(move || {
-            if let Err(e) = run(&workdir, &git_dir, &git, &tx, &ctx, &stop2) {
+            if let Err(e) = run(&workdir, &git_dir, &common_dir, &git, &tx, &ctx, &stop2) {
                 let _ = tx.send(Msg::Job(Err(anyhow::anyhow!(
                     "File watching is unavailable ({e:#}); changes made outside Tine appear after pressing F5 or refocusing the window."
                 ))));
@@ -111,6 +151,7 @@ impl RepoWatcher {
 fn run(
     workdir: &Path,
     git_dir: &Path,
+    common_dir: &Path,
     git: &GitRunner,
     tx: &Sender<Msg>,
     ctx: &egui::Context,
@@ -121,8 +162,15 @@ fn run(
         let _ = etx.send(res);
     })?;
     watcher.watch(workdir, RecursiveMode::Recursive)?;
-    if !git_dir.starts_with(workdir) {
-        watcher.watch(git_dir, RecursiveMode::Recursive)?;
+    // A linked worktree's git dir is inside the shared one: watching that
+    // covers both.
+    for dir in [common_dir, git_dir] {
+        if !dir.starts_with(workdir) {
+            watcher.watch(dir, RecursiveMode::Recursive)?;
+            if git_dir.starts_with(dir) {
+                break;
+            }
+        }
     }
     log::info!("watching {}", workdir.display());
 
@@ -142,9 +190,10 @@ fn run(
                 let event: notify::Event = event;
                 if !matches!(event.kind, EventKind::Access(_)) {
                     for path in &event.paths {
-                        match classify(path, workdir, git_dir) {
+                        match classify(path, workdir, git_dir, common_dir) {
                             Some(Kind::Refs) => change.refs = true,
                             Some(Kind::Status) => change.status = true,
+                            Some(Kind::Worktrees) => change.worktrees = true,
                             Some(Kind::Worktree(p)) => {
                                 worktree.insert(p);
                             }
@@ -200,7 +249,7 @@ mod tests {
     fn classifies_paths() {
         let wd = Path::new("/r");
         let gd = Path::new("/r/.git");
-        let c = |p: &str| classify(Path::new(p), wd, gd);
+        let c = |p: &str| classify(Path::new(p), wd, gd, gd);
         assert_eq!(c("/r/.git/HEAD"), Some(Kind::Refs));
         assert_eq!(c("/r/.git/refs/heads/main"), Some(Kind::Refs));
         assert_eq!(c("/r/.git/refs/heads/main.lock"), None);
@@ -214,5 +263,26 @@ mod tests {
         assert_eq!(c("/r/src/日本語.rs"), Some(Kind::Worktree("src/日本語.rs".into())));
         assert_eq!(c("/r"), None);
         assert_eq!(c("/elsewhere/x"), None);
+        assert_eq!(c("/r/.git/worktrees/wt/HEAD"), Some(Kind::Worktrees));
+        assert_eq!(c("/r/.git/worktrees/wt"), Some(Kind::Worktrees));
+        assert_eq!(c("/r/.git/worktrees/wt/locked"), Some(Kind::Worktrees));
+        // Another worktree's work (its index, logs…) doesn't change the list.
+        assert_eq!(c("/r/.git/worktrees/wt/index"), None);
+        assert_eq!(c("/r/.git/worktrees/wt/logs/HEAD"), None);
+        assert_eq!(c("/r/.git/worktrees/wt/ORIG_HEAD"), None);
+        // A linked worktree: its own git dir, then what it shares.
+        let (wd, gd, cd) = (Path::new("/wt"), Path::new("/r/.git/worktrees/wt"), Path::new("/r/.git"));
+        let c = |p: &str| classify(Path::new(p), wd, gd, cd);
+        assert_eq!(c("/r/.git/worktrees/wt/HEAD"), Some(Kind::Refs));
+        assert_eq!(c("/r/.git/worktrees/wt/index"), Some(Kind::Status));
+        assert_eq!(c("/r/.git/refs/heads/main"), Some(Kind::Refs));
+        assert_eq!(c("/r/.git/HEAD"), Some(Kind::Worktrees));
+        assert_eq!(c("/r/.git/worktrees/other/HEAD"), Some(Kind::Worktrees));
+        assert_eq!(c("/r/.git/worktrees/other/locked"), Some(Kind::Worktrees));
+        assert_eq!(c("/r/.git/worktrees/other/gitdir"), Some(Kind::Worktrees));
+        assert_eq!(c("/r/.git/worktrees/other/index"), None);
+        assert_eq!(c("/r/.git/worktrees/other/logs/HEAD"), None);
+        assert_eq!(c("/r/.git/objects/ab/cd"), None);
+        assert_eq!(c("/wt/src/a.rs"), Some(Kind::Worktree("src/a.rs".into())));
     }
 }
