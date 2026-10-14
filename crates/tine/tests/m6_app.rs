@@ -263,7 +263,7 @@ fn about_shows_versions_places_and_licenses() {
     h.run_steps(4);
     assert!(h.state().about_open());
     assert!(h.query_by_label(&format!("Tine {}", env!("CARGO_PKG_VERSION"))).is_some());
-    assert!(h.query_by_label("Not decided yet").is_some());
+    assert!(h.query_by_label("MIT OR Apache-2.0 (© 2026 K2Y)").is_some());
     assert!(h.query_by_label(&state.display().to_string()).is_some());
     assert!(h.query_by_label_contains("/proc/").is_some(), "the helper, as git runs it");
     let git = h.state().git_version().unwrap().as_ref().unwrap().to_string();

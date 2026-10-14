@@ -7,8 +7,8 @@ Name:           tine
 Version:        @VERSION@
 Release:        1%{?dist}
 Summary:        A Git client for Linux, after Fork's layout
-# Tine's own license isn't decided yet; this is what Cargo.toml declares.
-# THIRD_PARTY_LICENSES lists what is built in.
+# Tine's own (LICENSE-MIT, LICENSE-APACHE); THIRD_PARTY_LICENSES lists what
+# is built in.
 License:        MIT OR Apache-2.0
 URL:            https://github.com/bousukex/git_fork
 Source0:        tine-%{version}.tar.gz
@@ -60,7 +60,7 @@ rm -rf %{buildroot}%{_datadir}/doc/tine
 target/release/tine --version
 
 %files
-%license packaging/THIRD_PARTY_LICENSES
+%license LICENSE-MIT LICENSE-APACHE packaging/THIRD_PARTY_LICENSES
 %{_bindir}/tine
 %{_datadir}/applications/tine.desktop
 %{_datadir}/icons/hicolor/*/apps/tine.png

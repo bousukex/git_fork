@@ -140,6 +140,13 @@ fn the_license_list_is_current_and_complete() {
     assert!(o.status.success(), "{}{}", text(&o.stdout), text(&o.stderr));
     let list = tine::app::THIRD_PARTY_LICENSES;
     assert_eq!(list, std::fs::read_to_string(root().join("packaging/THIRD_PARTY_LICENSES")).unwrap());
+    // Tine's own: what Cargo.toml declares, a text for each.
+    let manifest = std::fs::read_to_string(root().join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("\nlicense = \"MIT OR Apache-2.0\"\n"), "{manifest}");
+    let mit = std::fs::read_to_string(root().join("LICENSE-MIT")).unwrap();
+    assert!(mit.contains("Copyright (c) 2026 K2Y") && mit.contains("Permission is hereby granted, free of charge"));
+    let apache = std::fs::read_to_string(root().join("LICENSE-APACHE")).unwrap();
+    assert_eq!(apache, std::fs::read_to_string(root().join("packaging/licenses/Apache-2.0.txt")).unwrap());
     // Every crate in Cargo.lock that ends up in tine is there (a few kinds
     // of them, and the embedded assets' notices).
     for must in [
@@ -271,7 +278,15 @@ fn the_appimage_folder_and_its_pinned_tools() {
     let mode = |p: &str| std::fs::metadata(app.join(p)).unwrap().permissions().mode() & 0o111 != 0;
     assert!(mode("AppRun") && mode("usr/bin/tine"));
     assert_eq!(std::fs::read_link(app.join(".DirIcon")).unwrap(), Path::new("tine.png"));
-    for f in ["tine.desktop", "tine.png", "usr/share/applications/tine.desktop", "usr/share/doc/tine/THIRD_PARTY_LICENSES", "usr/share/doc/tine/APPIMAGE_NOTICES"] {
+    for f in [
+        "tine.desktop",
+        "tine.png",
+        "usr/share/applications/tine.desktop",
+        "usr/share/doc/tine/LICENSE-MIT",
+        "usr/share/doc/tine/LICENSE-APACHE",
+        "usr/share/doc/tine/THIRD_PARTY_LICENSES",
+        "usr/share/doc/tine/APPIMAGE_NOTICES",
+    ] {
         assert!(app.join(f).is_file(), "{f}");
     }
     for n in ICON_SIZES {
@@ -408,7 +423,7 @@ const ICON_SIZES: [u32; 8] = [16, 24, 32, 48, 64, 128, 256, 512];
 fn installed_files(bin: &Path, data: &Path) -> Vec<PathBuf> {
     let mut files = vec![bin.join("tine"), data.join("applications/tine.desktop")];
     files.extend(ICON_SIZES.map(|n| data.join(format!("icons/hicolor/{n}x{n}/apps/tine.png"))));
-    files.push(data.join("doc/tine/THIRD_PARTY_LICENSES"));
+    files.extend(["LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_LICENSES"].map(|f| data.join("doc/tine").join(f)));
     files
 }
 

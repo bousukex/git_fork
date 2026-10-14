@@ -154,7 +154,16 @@ fn the_appimage_runs_tine_and_its_helpers() {
     // Its layout: Tine, its menu entry and icons, the notices; no libraries.
     ok(Command::new(&image).arg("--appimage-extract").current_dir(dir.path()).output().unwrap());
     let app = dir.path().join("squashfs-root");
-    for f in ["AppRun", "tine.desktop", "tine.png", "usr/bin/tine", "usr/share/doc/tine/THIRD_PARTY_LICENSES", "usr/share/doc/tine/APPIMAGE_NOTICES"] {
+    for f in [
+        "AppRun",
+        "tine.desktop",
+        "tine.png",
+        "usr/bin/tine",
+        "usr/share/doc/tine/LICENSE-MIT",
+        "usr/share/doc/tine/LICENSE-APACHE",
+        "usr/share/doc/tine/THIRD_PARTY_LICENSES",
+        "usr/share/doc/tine/APPIMAGE_NOTICES",
+    ] {
         assert!(app.join(f).is_file(), "{f}");
     }
     assert_eq!(std::fs::read_link(app.join(".DirIcon")).unwrap(), Path::new("tine.png"));
@@ -176,16 +185,19 @@ fn the_appimage_runs_tine_and_its_helpers() {
         assert!(runtime.windows(inside.len()).any(|w| w == inside.as_bytes()), "{inside} in the runtime");
         assert!(notices.contains(noticed), "{noticed} in the notices");
     }
-    // Self-checks, mounted (FUSE) and extracted.
+    // Self-checks, mounted (FUSE) and extracted. (The runtime leaves what
+    // it extracts behind, in TMPDIR: here, this test's folder.)
     for extract in [false, true] {
         let mut cmd = Command::new(&image);
         cmd.arg("--self-check");
         if extract {
-            cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+            cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1").env("TMPDIR", dir.path());
         }
         let all = ok(cmd.output().unwrap());
         assert!(all.contains("running from") && all.contains("helper: runs") && all.contains("environment: clean"), "{all}");
     }
+    let extracted = |d: &Path| std::fs::read_dir(d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("appimage_extracted_"));
+    assert!(extracted(dir.path()), "extracted into TMPDIR");
     // Tine's helper as the GUI hands it to git: the very executable inside
     // the image (mounted, or extracted), while Tine (here held in its
     // self-check) runs.
@@ -195,7 +207,7 @@ fn the_appimage_runs_tine_and_its_helpers() {
         let mut cmd = Command::new(&image);
         cmd.arg("--self-check").env("TINE_SELF_CHECK_PAUSE", &gate).stdout(Stdio::piped());
         if extract {
-            cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+            cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1").env("TMPDIR", dir.path());
         }
         let mut held = cmd.spawn().unwrap();
         let mut lines = BufReader::new(held.stdout.take().unwrap());
@@ -281,7 +293,9 @@ fn the_rpm_installs_what_tine_needs() {
     let mut want: Vec<String> = ["/usr/bin/tine", "/usr/share/applications/tine.desktop"].map(String::from).to_vec();
     want.extend([16, 24, 32, 48, 64, 128, 256, 512].map(|n| format!("/usr/share/icons/hicolor/{n}x{n}/apps/tine.png")));
     want.push(format!("/usr/share/licenses/tine-{version}"));
-    want.push(format!("/usr/share/licenses/tine-{version}/THIRD_PARTY_LICENSES"));
+    for f in ["LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_LICENSES"] {
+        want.push(format!("/usr/share/licenses/tine-{version}/{f}"));
+    }
     want.sort();
     assert_eq!(files, want);
     // Unpacked: it runs (helpers and all), its entry is valid, the

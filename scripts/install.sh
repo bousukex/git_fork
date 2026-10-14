@@ -121,6 +121,9 @@ stage "$desktop" "$DATA/applications/tine.desktop" 644
 for n in 16 24 32 48 64 128 256 512; do
     stage "$root/packaging/icons/hicolor/${n}x$n/apps/tine.png" "$DATA/icons/hicolor/${n}x$n/apps/tine.png" 644
 done
+for f in LICENSE-MIT LICENSE-APACHE; do
+    stage "$root/$f" "$DATA/doc/tine/$f" 644
+done
 stage "$root/packaging/THIRD_PARTY_LICENSES" "$DATA/doc/tine/THIRD_PARTY_LICENSES" 644
 
 # Nothing is overwritten that Tine didn't put there as it is; and never a

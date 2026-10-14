@@ -39,7 +39,7 @@ for n in 16 24 32 48 64 128 256 512; do
     mkdir -p "$app/usr/share/icons/hicolor/${n}x$n/apps"
     install -m 644 "$root/packaging/icons/hicolor/${n}x$n/apps/tine.png" "$app/usr/share/icons/hicolor/${n}x$n/apps/tine.png"
 done
-install -m 644 "$root/packaging/THIRD_PARTY_LICENSES" "$root/packaging/APPIMAGE_NOTICES" "$app/usr/share/doc/tine/"
+install -m 644 "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$root/packaging/THIRD_PARTY_LICENSES" "$root/packaging/APPIMAGE_NOTICES" "$app/usr/share/doc/tine/"
 cp "$app/usr/share/applications/tine.desktop" "$app/tine.desktop"
 cp "$root/packaging/icons/hicolor/256x256/apps/tine.png" "$app/tine.png"
 ln -s tine.png "$app/.DirIcon"
@@ -78,7 +78,8 @@ fi
 command -v file >/dev/null 2>&1 || die "appimagetool needs the file command (apt/dnf: file)"
 image=$out/Tine-$version-x86_64.AppImage
 rm -f "$image"
-# appimagetool is an AppImage itself: run it without needing FUSE.
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$tool" --no-appstream --runtime-file "$runtime" "$app" "$image" >"$work/log" 2>&1 ||
+# appimagetool is an AppImage itself: run it without needing FUSE (what it
+# extracts is left behind, in TMPDIR: the work folder, removed after).
+TMPDIR=$work APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$tool" --no-appstream --runtime-file "$runtime" "$app" "$image" >"$work/log" 2>&1 ||
     { cat "$work/log" >&2; die "appimagetool failed"; }
 say "Made $image"

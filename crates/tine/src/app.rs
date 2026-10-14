@@ -646,7 +646,7 @@ impl TineApp {
                     ("Helper", helper.as_str()),
                     ("Settings", state.as_str()),
                     ("Window state", window.as_str()),
-                    ("License", "Not decided yet"),
+                    ("License", "MIT OR Apache-2.0 (© 2026 K2Y)"),
                 ] {
                     ui.label(RichText::new(k).color(p.text_weak));
                     ui.label(RichText::new(v).small().monospace());

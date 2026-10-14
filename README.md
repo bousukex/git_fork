@@ -36,7 +36,7 @@ APPIMAGETOOL=/path/to/appimagetool APPIMAGE_RUNTIME=/path/to/runtime-x86_64 scri
 ```
 
 - appimagetool と runtime は版を固定しています（`packaging/appimage/tools.lock` の sha256 と一致するものだけを使います）。
-- ライブラリは同梱しません。動かすには、glibc 2.39 以上、Wayland か X11 と GPU（Vulkan か EGL）のライブラリ、git 2.43 以上、fontconfig が必要です。FUSE がない場合は `--appimage-extract-and-run` を付けて起動します。
+- ライブラリは同梱しません。動かすには、glibc 2.39 以上、Wayland か X11 と GPU（Vulkan か EGL）のライブラリ、git 2.43 以上、fontconfig が必要です。FUSE がない場合は `--appimage-extract-and-run` を付けて起動します（このとき展開した中身（約 35MB）が `/tmp` に残ります。版ごとに 1 つで、再起動すると消えます）。
 - AppImage をそのまま起動しただけでは、Wayland のタスクバーのアイコンは汎用のものになります。メニューとアイコンを付けるには `scripts/install.sh --binary Tine-….AppImage` で登録します。
 - AppImage には runtime（type2-runtime、静的にリンクした libfuse（LGPL-2.1）など）が入っています。その通知は `packaging/APPIMAGE_NOTICES` にあります。他の人に配布する場合は、LGPL に従い runtime の対応するソースを示す必要があります。
 
@@ -54,7 +54,7 @@ scripts/rpm.sh --dirty    # コミットしていない変更（追跡してい�
 
 ## ライセンス
 
-- Tine 自体のライセンスはまだ決めていません。
+- Tine 自体は MIT と Apache-2.0 のデュアルライセンスです（`LICENSE-MIT`、`LICENSE-APACHE`。どちらかを選んで使えます）。著作権者は K2Y です。
 - Tine に組み込んでいるクレートと素材（egui の既定フォント、syntect の構文定義）のライセンスは、`packaging/THIRD_PARTY_LICENSES` と About（☰ メニュー）で見られます。`scripts/third-party.py` が、x86_64 Linux のビルドの依存（`cargo tree`）と各クレートのソースから作ります。
 
 ## 操作
