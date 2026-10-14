@@ -836,3 +836,62 @@ fn interactive_rebase_edit_stop() {
         },
     );
 }
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn about_and_quitting() {
+    let _serial = serial();
+    shoot(
+        "about",
+        [1100.0, 760.0],
+        |cc| tine::app::TineApp::new(cc, vec![]),
+        |h| {
+            settle(h);
+            h.get_by_label("☰").click();
+            h.run_steps(2);
+            h.get_by_label("About Tine").click();
+            h.run_steps(4);
+            h.get_by_label("Third-Party Licenses…").click();
+            h.run_steps(4);
+        },
+    );
+    // Quitting while a commit waits in its hook.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("project");
+    std::fs::create_dir(&path).unwrap();
+    let mut t = 1_760_000_000;
+    git(&path, &["init", "-q", "-b", "main"], &mut t);
+    git(&path, &["config", "user.name", "山田 太郎"], &mut t);
+    git(&path, &["config", "user.email", "taro@example.com"], &mut t);
+    std::fs::write(path.join("a.txt"), "a\n").unwrap();
+    git(&path, &["add", "-A"], &mut t);
+    git(&path, &["commit", "-qm", "base"], &mut t);
+    std::fs::write(path.join("a.txt"), "b\n").unwrap();
+    git(&path, &["add", "-A"], &mut t);
+    let gate = dir.path().join("gate");
+    std::fs::write(&gate, "").unwrap();
+    let hook = path.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, format!("#!/bin/sh\nwhile [ -e '{}' ]; do sleep 0.05; done\n", gate.display())).unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    shoot(
+        "quit_running",
+        [1100.0, 700.0],
+        |cc| tine::app::TineApp::new(cc, vec![path.clone()]),
+        |h| {
+            settle(h);
+            let tab = h.state_mut().active_tab_mut().unwrap();
+            tab.commit_subject = "ロゴを差し替え".into();
+            tab.commit();
+            for _ in 0..100 {
+                if h.state_mut().active_tab_mut().unwrap().op_active() {
+                    break;
+                }
+                h.step();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+            h.run_steps(4);
+        },
+    );
+    std::fs::remove_file(&gate).unwrap();
+}

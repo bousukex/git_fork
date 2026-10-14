@@ -1,0 +1,7 @@
+# The AppImage tools scripts/appimage.sh uses, pinned by SHA-256 (point
+# APPIMAGETOOL and APPIMAGE_RUNTIME at the files). Both are "continuous"
+# builds: if the files there have moved on, check the new ones and update
+# these lines (and packaging/APPIMAGE_NOTICES for the runtime).
+# name	sha256	where	what
+appimagetool	95cbe7cce9717fce90c484e34052ee7c7f1d7635b33c12525b4776826a7d29b6	https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage	continuous build 313 (git 854e19e)
+runtime	156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074	https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64	continuous build of commit 8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa

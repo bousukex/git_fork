@@ -22,7 +22,10 @@ trash.workspace = true
 log.workspace = true
 env_logger.workspace = true
 serde.workspace = true
+ron.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The version egui uses (reading fonts' character maps in a test).
+skrifa = "0.44"
 egui_kittest.workspace = true

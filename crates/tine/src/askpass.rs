@@ -112,13 +112,23 @@ pub fn set_program(path: impl Into<PathBuf>) {
     with(|s| s.program = Some(path));
 }
 
-/// The `tine` executable git runs as a helper.
+/// The `tine` executable git runs as a helper (askpass, the editor of an
+/// interactive rebase).
 pub fn program() -> anyhow::Result<PathBuf> {
-    use anyhow::Context as _;
     match with(|s| s.program.clone()) {
         Some(p) => Ok(p),
-        None => std::env::current_exe().context("can't find the tine executable"),
+        None => running_executable(),
     }
+}
+
+/// The executable running now, as `/proc/<pid>/exe`: it stays the very
+/// same program even if its file is replaced or removed meanwhile (Tine
+/// updated or uninstalled while it runs), where its path would then name
+/// another version, or nothing.
+pub fn running_executable() -> anyhow::Result<PathBuf> {
+    use anyhow::Context as _;
+    let proc = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+    if proc.exists() { Ok(proc) } else { std::env::current_exe().context("can't find the tine executable") }
 }
 
 static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -188,10 +198,7 @@ pub fn env_for(
 ) -> anyhow::Result<Vec<(String, OsString)>> {
     use anyhow::Context as _;
     let socket = ensure_server().context("can't set up credential prompts")?;
-    let program = match with(|s| s.program.clone()) {
-        Some(p) => p,
-        None => std::env::current_exe().context("can't find the tine executable for credential prompts")?,
-    };
+    let program = program().context("can't find the tine executable for credential prompts")?;
     let token = random_token();
     with(|s| {
         s.sessions.insert(

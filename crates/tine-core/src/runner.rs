@@ -113,28 +113,65 @@ pub struct GitRunner {
 /// files on SIGTERM) before it is killed.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
-/// Stops a process group started with `process_group(0)` (group id == pid):
-/// SIGTERM now, SIGKILL if it is still around after [`TERM_GRACE`].
+/// Stops a process group started with `process_group(0)` (group id == pid),
+/// in the background (see [`stop_group_and_wait`]): reads that end early
+/// don't wait for it.
 fn stop_group(pid: u32) {
+    std::thread::spawn(move || stop_group_and_wait(pid));
+}
+
+/// SIGTERM to the group now, SIGKILL if anything of it is still around after
+/// [`TERM_GRACE`]; returns once nothing of it is left (or a moment after the
+/// SIGKILL). Its output may be closed long before (a hook that closed it
+/// and ignores SIGTERM): a stopped command ends only after this, so nothing
+/// it started outlives it — or Tine, which quits once its operations ended.
+fn stop_group_and_wait(pid: u32) {
     let pgid = -(pid as libc::pid_t);
-    // SAFETY: plain syscalls on a process group we created.
+    // SAFETY: plain syscalls on a process group we created; signal 0 only
+    // checks whether any process of it is left.
+    let gone = || unsafe { libc::kill(pgid, 0) } != 0;
     unsafe {
         libc::kill(pgid, libc::SIGTERM);
     }
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + TERM_GRACE;
-        while Instant::now() < deadline {
-            // SAFETY: signal 0 only checks for existence.
-            if unsafe { libc::kill(pgid, 0) } != 0 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+    let deadline = Instant::now() + TERM_GRACE;
+    while Instant::now() < deadline {
+        if gone() {
+            return;
         }
-        // SAFETY: as above.
-        unsafe {
-            libc::kill(pgid, libc::SIGKILL);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: as above.
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !gone() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The watchdog of a command that stops when its token fires.
+struct Watch {
+    done: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watch {
+    fn none() -> Self {
+        Watch { done: Arc::default(), stopped: Arc::default(), thread: None }
+    }
+
+    /// The command has ended: the watchdog is let go — once, if it stopped
+    /// the command, nothing the command started is left. Whether it did.
+    fn finish(mut self) -> bool {
+        self.done.store(true, Ordering::Relaxed);
+        let stopped = self.stopped.load(Ordering::Relaxed);
+        if stopped && let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
-    });
+        stopped
+    }
 }
 
 impl GitRunner {
@@ -273,13 +310,9 @@ impl GitRunner {
         if input.is_some() {
             cmd.stdin(Stdio::piped());
         }
-        let (mut child, done, stopped) = match &self.cancel {
+        let (mut child, watch) = match &self.cancel {
             Some(token) => self.spawn_cancellable_cmd(cmd, token)?,
-            None => (
-                cmd.spawn().with_context(|| format!("failed to run git in {}", self.workdir.display()))?,
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
-            ),
+            None => (cmd.spawn().with_context(|| format!("failed to run git in {}", self.workdir.display()))?, Watch::none()),
         };
         // Write from another thread so a large output can't deadlock us.
         let writer = input.map(|bytes| {
@@ -290,7 +323,7 @@ impl GitRunner {
             })
         });
         let out = child.wait_with_output();
-        done.store(true, Ordering::Relaxed);
+        let stopped = watch.finish();
         if let Some(w) = writer {
             let _ = w.join();
         }
@@ -298,8 +331,7 @@ impl GitRunner {
         let code = out.status.code();
         // A failure right as the token fired (e.g. a credential prompt the
         // user cancelled made git give up) is a cancellation too.
-        let was_stopped = stopped.load(Ordering::Relaxed)
-            || (!out.status.success() && self.cancel.as_ref().is_some_and(CancelToken::is_cancelled));
+        let was_stopped = stopped || (!out.status.success() && self.cancel.as_ref().is_some_and(CancelToken::is_cancelled));
         self.record(args, &out.stdout, &out.stderr, code, started, was_stopped);
         if was_stopped {
             return Err(Cancelled.into());
@@ -320,15 +352,14 @@ impl GitRunner {
     }
 
     /// Spawns git in its own process group with a watchdog that stops the
-    /// group when `cancel` fires. Returns the child, a flag to set once it
-    /// has been waited for, and a flag set if the watchdog stopped it.
-    fn spawn_cancellable(&self, args: &[OsString], cancel: &CancelToken) -> Result<(Child, Arc<AtomicBool>, Arc<AtomicBool>)> {
+    /// group when `cancel` fires (finish the watch once git was waited for).
+    fn spawn_cancellable(&self, args: &[OsString], cancel: &CancelToken) -> Result<(Child, Watch)> {
         let mut cmd = self.command(args);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         self.spawn_cancellable_cmd(cmd, cancel)
     }
 
-    fn spawn_cancellable_cmd(&self, mut cmd: Command, cancel: &CancelToken) -> Result<(Child, Arc<AtomicBool>, Arc<AtomicBool>)> {
+    fn spawn_cancellable_cmd(&self, mut cmd: Command, cancel: &CancelToken) -> Result<(Child, Watch)> {
         use std::os::unix::process::CommandExt as _;
         let child = cmd
             // Own process group, so helpers git spawns are stopped with it.
@@ -339,17 +370,17 @@ impl GitRunner {
         let done = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let (d, s, c) = (done.clone(), stopped.clone(), cancel.clone());
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             while !d.load(Ordering::Relaxed) {
                 if c.is_cancelled() {
                     s.store(true, Ordering::Relaxed);
-                    stop_group(pid);
+                    stop_group_and_wait(pid);
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        Ok((child, done, stopped))
+        Ok((child, Watch { done, stopped, thread: Some(thread) }))
     }
 
     /// Streams stdout split at `delim`, calling `on_record` for each record
@@ -385,7 +416,7 @@ impl GitRunner {
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         let started = Instant::now();
-        let (mut child, done, _) = self.spawn_cancellable(&args, cancel)?;
+        let (mut child, watch) = self.spawn_cancellable(&args, cancel)?;
         let mut recorded_stdout = Vec::new();
         let pid = child.id();
         let stderr_thread = drain(child.stderr.take().expect("piped"));
@@ -421,7 +452,7 @@ impl GitRunner {
         }
         drop(reader);
         let status = child.wait()?;
-        done.store(true, Ordering::Relaxed);
+        watch.finish();
         let stderr = stderr_thread.join().unwrap_or_default();
         self.record(&args, &recorded_stdout, &stderr, status.code(), started, stopped);
         read_result?;
@@ -453,7 +484,7 @@ impl GitRunner {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         self.check_cancelled()?;
         let started = Instant::now();
-        let (mut child, done, stopped) = self.spawn_cancellable(&args, cancel)?;
+        let (mut child, watch) = self.spawn_cancellable(&args, cancel)?;
         let pid = child.id();
         let stderr_thread = drain(child.stderr.take().expect("piped"));
         let mut stdout = child.stdout.take().expect("piped");
@@ -478,9 +509,9 @@ impl GitRunner {
         }
         drop(stdout);
         let status = child.wait()?;
-        done.store(true, Ordering::Relaxed);
+        let stopped = watch.finish();
         let stderr = stderr_thread.join().unwrap_or_default();
-        let was_stopped = stopped.load(Ordering::Relaxed) || cancel.is_cancelled();
+        let was_stopped = stopped || cancel.is_cancelled();
         self.record(&args, &out, &stderr, status.code(), started, was_stopped || too_large);
         if was_stopped {
             return Err(Cancelled.into());
@@ -522,7 +553,7 @@ impl GitRunner {
                 }
             });
         }
-        let (mut child, done, stopped) = self.spawn_cancellable(&args, &both)?;
+        let (mut child, watch) = self.spawn_cancellable(&args, &both)?;
         let stdout_thread = drain(child.stdout.take().expect("piped"));
         let mut stderr = child.stderr.take().expect("piped");
         let mut all_err = Vec::new();
@@ -549,8 +580,8 @@ impl GitRunner {
             on_progress(&String::from_utf8_lossy(&line));
         }
         let status = child.wait()?;
-        done.store(true, Ordering::Relaxed);
-        let was_stopped = stopped.load(Ordering::Relaxed) || (!status.success() && (cancel.is_cancelled() || self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)));
+        let stopped = watch.finish();
+        let was_stopped = stopped || (!status.success() && (cancel.is_cancelled() || self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)));
         // Ends the helper thread above.
         both.cancel();
         let stdout = stdout_thread.join().unwrap_or_default();
@@ -581,6 +612,47 @@ mod tests {
         let err = git.output(["rev-parse", "HEAD"]).unwrap_err();
         let err = err.downcast::<GitError>().unwrap();
         assert!(err.stderr.contains("not a git repository"), "{}", err.stderr);
+    }
+
+    /// A process is gone (or only waits to be reaped).
+    fn dead(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| s.rsplit(')').next().is_some_and(|r| r.trim_start().starts_with('Z')))
+    }
+
+    #[test]
+    fn a_stopped_command_ends_after_all_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        // A hook of git's (here the fsmonitor one, of a read-only command)
+        // that lets go of its output and ignores SIGTERM: git itself ends at
+        // once, the hook stays. (Not an alias: git passes the signal on to
+        // those and waits for them.)
+        let hook = dir.path().join("stubborn");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nexec >/dev/null 2>&1 </dev/null\ntrap '' TERM\necho $$ > '{}'\nwhile :; do sleep 0.05; done\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let ok = std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap();
+        assert!(ok.success());
+        let monitor = format!("core.fsmonitor={}", hook.display());
+        let cancel = CancelToken::default();
+        let git = GitRunner::new(dir.path()).with_cancel(cancel.clone());
+        let c = cancel.clone();
+        let p = pid_file.clone();
+        std::thread::spawn(move || {
+            while !p.exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            c.cancel();
+        });
+        let err = git.output(["-c", monitor.as_str(), "status"]).unwrap_err();
+        assert!(err.is::<Cancelled>(), "{err:#}");
+        // Ended only once the child was gone too (killed after the grace).
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(dead(pid.trim()), "the child outlived the command");
     }
 
     #[test]

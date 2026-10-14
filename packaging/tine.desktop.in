@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Tine
+GenericName=Git Client
+GenericName[ja]=Git クライアント
+Comment=Browse and work with Git repositories
+Comment[ja]=Git リポジトリの閲覧と操作
+Exec=@EXEC@ -- %F
+Icon=tine
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=git;version control;repository;commit;branch;
+StartupNotify=true
+StartupWMClass=tine

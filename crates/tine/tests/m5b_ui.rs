@@ -40,6 +40,14 @@ fn merging() -> tempfile::TempDir {
     dir
 }
 
+/// One test at a time: operations are counted process-wide (the quit
+/// question lists those of every app in this process).
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn turn() -> std::sync::MutexGuard<'static, ()> {
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn app(d: &Path) -> Harness<'static, TineApp> {
     let paths = vec![d.to_path_buf()];
     let mut h = Harness::builder().with_size([1300.0, 820.0]).build_eframe(move |cc| {
@@ -78,6 +86,7 @@ fn conflicted(h: &mut Harness<'static, TineApp>) -> Vec<String> {
 
 #[test]
 fn resolving_from_the_menu_with_buttons_and_f7() {
+    let _turn = turn();
     let repo = merging();
     let d = repo.path();
     let mut h = app(d);
@@ -107,6 +116,7 @@ fn resolving_from_the_menu_with_buttons_and_f7() {
 
 #[test]
 fn double_click_opens_and_esc_asks_before_discarding() {
+    let _turn = turn();
     let repo = merging();
     let d = repo.path();
     let mut h = app(d);
@@ -136,6 +146,7 @@ fn double_click_opens_and_esc_asks_before_discarding() {
 
 #[test]
 fn the_result_edited_in_a_dialog() {
+    let _turn = turn();
     let repo = merging();
     let d = repo.path();
     let mut h = app(d);
@@ -168,6 +179,7 @@ fn the_result_edited_in_a_dialog() {
 
 #[test]
 fn closing_the_tab_asks_about_unsaved_changes() {
+    let _turn = turn();
     let repo = merging();
     let d = repo.path();
     let mut h = app(d);
@@ -185,6 +197,7 @@ fn closing_the_tab_asks_about_unsaved_changes() {
 
 #[test]
 fn the_editor_stays_reachable_after_the_merge_ends_elsewhere() {
+    let _turn = turn();
     let repo = merging();
     let d = repo.path();
     let mut h = app(d);
@@ -217,6 +230,7 @@ fn the_editor_stays_reachable_after_the_merge_ends_elsewhere() {
 
 #[test]
 fn closing_the_window_asks_about_unsaved_changes() {
+    let _turn = turn();
     let close = |h: &mut Harness<'static, TineApp>| {
         h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
         h.step();

@@ -26,6 +26,7 @@ pub mod search;
 pub mod sequencer;
 pub mod stash;
 pub mod status;
+pub mod version;
 pub mod worktree;
 
 pub use reader::{CliReader, RepoPaths, RepoReader};

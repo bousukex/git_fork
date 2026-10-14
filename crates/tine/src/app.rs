@@ -30,9 +30,41 @@ struct Persisted {
     messages: Vec<String>,
     settings: crate::settings::Settings,
     tools: crate::tools::ToolSettings,
+    /// The theme ("system", "light", "dark") and zoom, kept here too:
+    /// egui's own copies live in eframe's `app.ron`, which can break.
+    theme: Option<String>,
+    zoom: Option<f32>,
 }
 
 const MAX_MESSAGES: usize = 30;
+
+/// How the app is set up (the defaults are what tests want: no state file).
+#[derive(Debug, Clone)]
+pub struct AppOptions {
+    /// Tine's own state file (see [`crate::state_file`]); `None`: only
+    /// eframe's storage.
+    pub state_file: Option<PathBuf>,
+    /// The git whose version is checked at startup.
+    pub git: PathBuf,
+    /// How long quitting waits for the operations it stopped before asking
+    /// again.
+    pub stop_timeout: std::time::Duration,
+}
+
+impl Default for AppOptions {
+    fn default() -> Self {
+        AppOptions { state_file: None, git: "git".into(), stop_timeout: std::time::Duration::from_secs(10) }
+    }
+}
+
+/// The About dialog (and its list of third-party licenses).
+#[derive(Default)]
+struct About {
+    licenses: bool,
+}
+
+/// The licenses of what is built into Tine.
+pub const THIRD_PARTY_LICENSES: &str = include_str!("../../../packaging/THIRD_PARTY_LICENSES");
 
 pub struct TineApp {
     tabs: Vec<RepoTab>,
@@ -49,11 +81,19 @@ pub struct TineApp {
     /// to a tab when that work tree is opened again.
     held_orphans: Vec<crate::ops_registry::OrphanedResult>,
     quick: Option<QuickLaunch>,
-    /// Closing the window waits for this answer: unsaved merge editor
-    /// changes (one line per tab).
-    quit_asked: Option<Vec<String>>,
+    /// Closing the window waits for an answer (about unsaved merge editor
+    /// changes and running operations, as they are then).
+    quit_asked: bool,
     /// The answer was "quit anyway".
     quit_confirmed: bool,
+    /// Quitting once the operations it stopped have ended (since when).
+    stopping: Option<std::time::Instant>,
+    options: AppOptions,
+    state_file: Option<crate::state_file::StateFile>,
+    /// The version of git (checked at startup; `None` until known).
+    git_version: Option<Result<tine_core::version::GitVersion, String>>,
+    git_check: Option<Receiver<Result<tine_core::version::GitVersion, String>>>,
+    about: Option<About>,
     /// The settings dialog is open.
     settings_open: bool,
     settings_ui: ui::settings::SettingsUi,
@@ -157,10 +197,36 @@ impl TineApp {
 
     /// Starts from the state saved in `storage` (tests pass their own).
     pub fn with_storage(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>, storage: Option<&dyn eframe::Storage>) -> Self {
+        Self::with_options(cc, paths, storage, AppOptions::default())
+    }
+
+    /// Starts from Tine's state file (`options.state_file`), else from what
+    /// `storage` has (an older Tine kept it there).
+    pub fn with_options(
+        cc: &eframe::CreationContext<'_>,
+        paths: Vec<PathBuf>,
+        storage: Option<&dyn eframe::Storage>,
+        options: AppOptions,
+    ) -> Self {
         crate::setup_context(&cc.egui_ctx);
-        let mut state: Persisted = storage.and_then(|s| eframe::get_value(s, STORAGE_KEY)).unwrap_or_default();
+        let state_file = options.state_file.clone().map(crate::state_file::StateFile::new);
+        let mut state: Persisted = state_file
+            .as_ref()
+            .and_then(|f| f.load())
+            .or_else(|| storage.and_then(|s| eframe::get_value(s, STORAGE_KEY)))
+            .unwrap_or_default();
         state.settings = state.settings.validated();
         crate::settings::set_current(&cc.egui_ctx, state.settings);
+        restore_look(&cc.egui_ctx, &state);
+        let git_check = {
+            let (tx, rx) = bounded(1);
+            let (git, ctx) = (options.git.clone(), cc.egui_ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(tine_core::version::git_version(git.as_os_str(), std::time::Duration::from_secs(5)));
+                ctx.request_repaint();
+            });
+            rx
+        };
         let mut app =
             TineApp {
             tabs: Vec::new(),
@@ -174,8 +240,14 @@ impl TineApp {
             notices: Vec::new(),
             held_orphans: Vec::new(),
             quick: None,
-            quit_asked: None,
+            quit_asked: false,
             quit_confirmed: false,
+            stopping: None,
+            options,
+            state_file,
+            git_version: None,
+            git_check: Some(git_check),
+            about: None,
             settings_open: false,
             settings_ui: Default::default(),
             opening: Vec::new(),
@@ -430,37 +502,85 @@ impl TineApp {
     }
 
     /// The window is to close: not before unsaved merge editor changes
-    /// (in any tab) were given up.
+    /// (in any tab) were given up, and operations still running were
+    /// stopped — git mustn't be left running Tine as its helper (askpass,
+    /// rebase editor) once Tine is gone.
     fn on_close_request(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) || self.quit_confirmed {
             return;
         }
-        let unsaved = self.unsaved_merges();
-        if !unsaved.is_empty() {
+        if self.stopping.is_some() {
+            // Quitting already, once they have stopped.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.quit_asked = Some(unsaved);
+            return;
+        }
+        if !self.unsaved_merges().is_empty() || !running_operations().is_empty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.quit_asked = true;
         }
     }
 
-    /// Asking whether to quit with unsaved changes.
+    /// Asking whether to quit (unsaved changes, running operations).
     pub fn quit_asked(&self) -> bool {
-        self.quit_asked.is_some()
+        self.quit_asked
+    }
+
+    /// Quitting is asked about or under way: nothing else is shown or taken
+    /// keys (dialogs, prompts, the settings, Quick Launch, About).
+    fn quitting_in_progress(&self) -> bool {
+        self.quit_asked || self.stopping.is_some()
+    }
+
+    /// Stopping operations before quitting.
+    pub fn stopping(&self) -> bool {
+        self.stopping.is_some()
+    }
+
+    /// Quitting was decided (the window is closing).
+    pub fn quitting(&self) -> bool {
+        self.quit_confirmed
     }
 
     fn quit_dialog(&mut self, ctx: &egui::Context) {
-        let Some(unsaved) = &self.quit_asked else { return };
+        if !self.quit_asked {
+            return;
+        }
+        // As things are now (an operation may have ended or started since
+        // the question came up).
+        let (unsaved, running) = (self.unsaved_merges(), running_operations());
+        if unsaved.is_empty() && running.is_empty() {
+            self.quit_asked = false;
+            self.quit_confirmed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
         let p = Palette::of(ctx);
         let mut answer = None;
+        let stop = !running.is_empty();
         egui::Modal::new(egui::Id::new("quit-unsaved")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.heading("Quit and lose unsaved merge changes?");
-            ui.label("The merge editor has changes that aren't saved:");
-            for line in unsaved {
-                ui.label(RichText::new(line).color(p.text_weak));
+            ui.set_width(460.0);
+            ui.heading(if unsaved.is_empty() { "Stop the running operations and quit?" } else { "Quit and lose unsaved merge changes?" });
+            if !unsaved.is_empty() {
+                ui.label("The merge editor has changes that aren't saved:");
+                for line in &unsaved {
+                    ui.label(RichText::new(line).color(p.text_weak));
+                }
+            }
+            if stop {
+                ui.label("These operations haven't finished; they are stopped first (as Cancel does):");
+                for line in &running {
+                    ui.label(RichText::new(line).color(p.text_weak));
+                }
             }
             ui.add_space(8.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let quit = egui::Button::new(RichText::new("Quit Anyway").color(egui::Color32::WHITE)).fill(p.status_deleted);
+                let label = if stop { "Stop and Quit" } else { "Quit Anyway" };
+                // One width for both labels: an operation starting or ending
+                // doesn't move Cancel under the pointer.
+                let quit = egui::Button::new(RichText::new(label).color(egui::Color32::WHITE))
+                    .fill(p.status_deleted)
+                    .min_size(egui::vec2(120.0, 0.0));
                 if ui.add(quit).clicked() {
                     answer = Some(true);
                 }
@@ -470,12 +590,151 @@ impl TineApp {
             });
         });
         match answer {
+            // Whatever runs at the moment of the answer is stopped first.
+            Some(true) if !crate::ops_registry::active_ops().is_empty() => {
+                self.quit_asked = false;
+                self.stopping = Some(std::time::Instant::now());
+            }
             Some(true) => {
-                self.quit_asked = None;
+                self.quit_asked = false;
                 self.quit_confirmed = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            Some(false) => self.quit_asked = None,
+            Some(false) => self.quit_asked = false,
+            None => {}
+        }
+    }
+
+    /// The git version found at startup (`None` until known).
+    pub fn git_version(&self) -> Option<&Result<tine_core::version::GitVersion, String>> {
+        self.git_version.as_ref()
+    }
+
+    /// Whether the About dialog shows.
+    pub fn about_open(&self) -> bool {
+        self.about.is_some()
+    }
+
+    /// The version, where things are, the license; and the licenses of
+    /// what is built in.
+    fn about_dialog(&mut self, ctx: &egui::Context) {
+        let Some(about) = &mut self.about else { return };
+        let p = Palette::of(ctx);
+        let mut close = false;
+        let git = match &self.git_version {
+            None => "(checking…)".to_owned(),
+            Some(Ok(v)) => v.to_string(),
+            Some(Err(e)) => e.clone(),
+        };
+        let exe = match crate::appimage::image() {
+            Some(image) => format!("{} (AppImage)", image.to_string_lossy()),
+            None => std::env::current_exe().map_or_else(|e| e.to_string(), |p| p.display().to_string()),
+        };
+        let helper = crate::askpass::program().map_or_else(|e| format!("{e:#}"), |p| p.display().to_string());
+        let storage = eframe::storage_dir("tine");
+        let state = self.state_file.as_ref().map(|f| f.path().display().to_string()).unwrap_or_else(|| "(not kept)".into());
+        let window = storage.map_or_else(|| "(none)".into(), |d| d.join("app.ron").display().to_string());
+        let modal = egui::Modal::new(egui::Id::new("about-tine")).show(ctx, |ui| {
+            ui.set_width(if about.licenses { 720.0 } else { 520.0 });
+            ui.heading(format!("Tine {}", env!("CARGO_PKG_VERSION")));
+            ui.label(RichText::new("A Git client for Linux, after Fork's layout.").color(p.text_weak));
+            ui.add_space(6.0);
+            egui::Grid::new("about-grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                for (k, v) in [
+                    ("Git", git.as_str()),
+                    ("Executable", exe.as_str()),
+                    ("Helper", helper.as_str()),
+                    ("Settings", state.as_str()),
+                    ("Window state", window.as_str()),
+                    ("License", "Not decided yet"),
+                ] {
+                    ui.label(RichText::new(k).color(p.text_weak));
+                    ui.label(RichText::new(v).small().monospace());
+                    ui.end_row();
+                }
+            });
+            ui.add_space(6.0);
+            if about.licenses {
+                static LINES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+                let lines = LINES.get_or_init(|| THIRD_PARTY_LICENSES.lines().collect());
+                let font = egui::FontId::monospace(11.0);
+                let row = ui.fonts_mut(|f| f.row_height(&font));
+                // In a box of its own size, lines unwrapped (sized by its
+                // contents, the dialog grew every frame).
+                let size = egui::vec2(ui.available_width(), (ctx.content_rect().height() - 360.0).clamp(160.0, 420.0));
+                ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_min_size(size);
+                    egui::ScrollArea::both().auto_shrink([false, false]).show_rows(ui, row, lines.len(), |ui, rows| {
+                        for line in &lines[rows] {
+                            ui.add(egui::Label::new(RichText::new(*line).font(font.clone())).extend());
+                        }
+                    });
+                });
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = ui.button("Close").clicked();
+                let label = if about.licenses { "Hide Third-Party Licenses" } else { "Third-Party Licenses…" };
+                if ui.button(label).clicked() {
+                    about.licenses = !about.licenses;
+                }
+            });
+        });
+        if close || modal.should_close() {
+            self.about = None;
+        }
+    }
+
+    /// Quitting: waits for the stopped operations to end, then closes; if
+    /// that takes long, asks whether to keep waiting.
+    fn stopping_dialog(&mut self, ctx: &egui::Context) {
+        let Some(since) = self.stopping else { return };
+        // All of them, also any that came up since.
+        for op in crate::ops_registry::active_ops() {
+            if op.state != crate::ops_registry::OpState::Cancelling {
+                crate::ops_registry::cancel(op.id);
+            }
+        }
+        let left = running_operations();
+        if left.is_empty() {
+            self.stopping = None;
+            self.quit_confirmed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        let overdue = since.elapsed() >= self.options.stop_timeout;
+        let p = Palette::of(ctx);
+        let mut answer = None;
+        egui::Modal::new(egui::Id::new("quit-stopping")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.heading("Stopping operations…");
+            });
+            for line in &left {
+                ui.label(RichText::new(line).color(p.text_weak));
+            }
+            if overdue {
+                ui.label("They haven't stopped yet. Quitting now may leave git running without Tine.");
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let quit = egui::Button::new(RichText::new("Quit Now").color(egui::Color32::WHITE)).fill(p.status_deleted);
+                    if ui.add(quit).clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Keep Waiting").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            }
+        });
+        match answer {
+            Some(true) => {
+                self.stopping = None;
+                self.quit_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(false) => self.stopping = Some(std::time::Instant::now()),
             None => {}
         }
     }
@@ -573,16 +832,21 @@ impl TineApp {
     /// one modal shows at a time (a prompt hides the others meanwhile).
     fn decide_layer(&mut self, ctx: &egui::Context) {
         let tab_modal = self.tabs.get(self.active).filter(|t| t.modal_open()).map(RepoTab::modal_token);
-        if tab_modal.is_some() || self.quit_asked.is_some() {
+        let quitting = self.quitting_in_progress();
+        if tab_modal.is_some() || quitting {
             self.settings_open = false;
+            self.about = None;
         }
-        if tab_modal.is_some() || self.settings_open || self.quit_asked.is_some() {
+        if tab_modal.is_some() || self.settings_open || quitting || self.about.is_some() {
             self.quick = None;
         }
-        let (layer, token) = if let Some(p) = crate::askpass::pending() {
-            (input::Layer::Prompt, p.id)
-        } else if self.quit_asked.is_some() {
+        // Quitting comes first: what it asks hides everything else.
+        let (layer, token) = if quitting {
             (input::Layer::Dialog, QUIT_TOKEN)
+        } else if let Some(p) = crate::askpass::pending() {
+            (input::Layer::Prompt, p.id)
+        } else if self.about.is_some() {
+            (input::Layer::Dialog, ABOUT_TOKEN)
         } else if let Some(token) = tab_modal {
             (input::Layer::Dialog, token)
         } else if self.settings_open {
@@ -817,6 +1081,10 @@ impl TineApp {
                         self.open_settings();
                         ui.close();
                     }
+                    if ui.button("About Tine").clicked() {
+                        self.about = Some(About::default());
+                        ui.close();
+                    }
                 });
                 if let Some(t) = self.tabs.get(self.active)
                     && let Some((id, text)) = ui::output::running_summary(t)
@@ -964,6 +1232,39 @@ fn error_banner(ui: &mut egui::Ui, tab: &mut RepoTab) {
 
 /// The input owner token of the quit question.
 const QUIT_TOKEN: u64 = u64::MAX;
+/// The input owner token of the About dialog.
+const ABOUT_TOKEN: u64 = u64::MAX - 1;
+
+/// One line per operation queued or running, anywhere.
+fn running_operations() -> Vec<String> {
+    crate::ops_registry::active_ops()
+        .iter()
+        .map(|op| {
+            // The repository by its folder (its key is the shared git dir).
+            let repo = op.repo.parent().filter(|_| op.repo.ends_with(".git")).unwrap_or(&op.repo);
+            let name = repo.file_name().map_or_else(|| repo.display().to_string(), |n| n.to_string_lossy().into_owned());
+            format!("{} — {name}", op.kind.label())
+        })
+        .collect()
+}
+
+/// Theme and zoom as Tine's state last had them (egui's own copies may
+/// have been lost with eframe's file).
+fn restore_look(ctx: &egui::Context, state: &Persisted) {
+    let theme = match state.theme.as_deref() {
+        Some("light") => Some(egui::ThemePreference::Light),
+        Some("dark") => Some(egui::ThemePreference::Dark),
+        Some("system") => Some(egui::ThemePreference::System),
+        _ => None,
+    };
+    if let Some(t) = theme {
+        ctx.set_theme(t);
+    }
+    // Any zoom egui's own Ctrl+Plus / Ctrl+Minus can reach (0.2 to 5).
+    if let Some(z) = state.zoom.filter(|z| (0.2..=5.0).contains(z)) {
+        ctx.set_zoom_factor(z);
+    }
+}
 
 impl eframe::App for TineApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -995,6 +1296,13 @@ impl eframe::App for TineApp {
             }
         }
         self.on_close_request(&ctx);
+        if let Some(rx) = &self.git_check
+            && let Ok(found) = rx.try_recv()
+        {
+            self.git_check = None;
+            self.notices.extend(tine_core::version::git_problem(&found));
+            self.git_version = Some(found);
+        }
         self.worktree_removals();
         // Operations whose tab was closed: the work tree that started them
         // takes them over (its stash conflict, stashed changes…); other
@@ -1069,10 +1377,14 @@ impl eframe::App for TineApp {
 
         if self.tabs.is_empty() {
             egui::CentralPanel::default().show(ui, |ui| self.welcome(ui));
-            if !ui::askpass::show(&ctx) {
+            if !self.quitting_in_progress() && !ui::askpass::show(&ctx) {
                 ui::settings::show(&ctx, &mut self.state.settings, &mut self.state.tools, &mut self.settings_ui, &mut self.settings_open);
                 self.quick_launch_frame(&ctx);
+                self.about_dialog(&ctx);
             }
+            // (Operations of closed tabs may still run when quitting.)
+            self.quit_dialog(&ctx);
+            self.stopping_dialog(&ctx);
             return;
         }
         let waking = self.tabs.get(self.active).is_some_and(|t| self.waking(&t.paths.workdir));
@@ -1135,7 +1447,10 @@ impl eframe::App for TineApp {
         // Credential prompts belong to operations, not tabs, and come first:
         // a tab's dialog waits until no prompt is open (egui stacks modals
         // by when they first appeared, so it could otherwise cover one).
-        if !ui::askpass::show(&ctx) {
+        // Quitting asks alone: nothing behind it shows or takes keys (an
+        // Enter meant for it mustn't confirm a dialog of a tab).
+        let quitting = self.quit_asked || self.stopping.is_some();
+        if !quitting && !ui::askpass::show(&ctx) {
             ui::dialogs::show(&ctx, tab);
             // Never two modals at once (decide_layer closes the settings
             // when a dialog comes up).
@@ -1143,17 +1458,37 @@ impl eframe::App for TineApp {
                 ui::settings::show(&ctx, &mut self.state.settings, &mut self.state.tools, &mut self.settings_ui, &mut self.settings_open);
             }
             self.quick_launch_frame(&ctx);
+            self.about_dialog(&ctx);
         }
         // A tab whose unsaved changes were given up so it could close.
         if let Some(i) = self.tabs.iter().position(|t| t.close_requested) {
             self.close_tab_now(i);
         }
         self.quit_dialog(&ctx);
+        self.stopping_dialog(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.state.open = self.tabs.iter().map(|t| t.paths.workdir.clone()).collect();
         self.state.active = self.active;
+        self.state.theme = Some(
+            match self.ctx.options(|o| o.theme_preference) {
+                egui::ThemePreference::Light => "light",
+                egui::ThemePreference::Dark => "dark",
+                egui::ThemePreference::System => "system",
+            }
+            .to_owned(),
+        );
+        self.state.zoom = Some(self.ctx.zoom_factor());
         eframe::set_value(storage, STORAGE_KEY, &self.state);
+        if let Some(f) = &mut self.state_file {
+            f.save(&self.state);
+        }
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(f) = &mut self.state_file {
+            f.flush();
+        }
     }
 }

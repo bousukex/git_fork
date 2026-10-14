@@ -339,6 +339,11 @@ pub fn active_for(repo: &Path) -> bool {
     with(|r| r.entries.iter().any(|e| e.repo == repo && e.state.is_active()))
 }
 
+/// Operations queued or running, on any repository.
+pub fn active_ops() -> Vec<OpSnapshot> {
+    with(|r| r.entries.iter().filter(|e| e.state.is_active()).map(to_snapshot).collect())
+}
+
 pub fn snapshot(id: OpId) -> Option<OpSnapshot> {
     with(|r| r.entries.iter().find(|e| e.id == id).map(to_snapshot))
 }

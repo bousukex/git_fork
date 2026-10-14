@@ -646,7 +646,8 @@ pub fn rebase_runner(git: &GitRunner, git_dir: &Path, editor: &Editor) -> Result
     }
 }
 
-pub(crate) fn random_id() -> String {
+/// A random hex name (for temporary files that mustn't collide).
+pub fn random_id() -> String {
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let _ = std::io::Read::read_exact(&mut f, &mut bytes);

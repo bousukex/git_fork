@@ -453,6 +453,12 @@ fn a_result_already_sent_for_an_earlier_opening_is_dropped() {
     tab.open_merge_editor("g.txt".into());
     tab.poll();
     assert!(matches!(tab.merge.as_ref().unwrap().state, MergeState::Loading), "f.txt's isn't taken for g.txt");
+    // (g.txt's call may not have reached the gate yet.)
+    let start = std::time::Instant::now();
+    while gates.merge_open.arrived() < 2 {
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     gates.merge_open.release(1);
     assert!(poll_until(&mut tab, |t| t.merge.as_ref().unwrap().session().is_some()));
     assert_eq!(session(&mut tab).opened.path, "g.txt");

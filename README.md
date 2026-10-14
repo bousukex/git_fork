@@ -12,6 +12,50 @@ cargo build --release
 
 - 必要なもの: Rust 1.95 以上、git、C リンカ（gcc）、fontconfig（`fc-match`）
 - 開発用ヘッダ（GTK や Qt）は不要です。Wayland/X11 と Vulkan/GL は実行時に読み込みます。
+- `tine --help` でオプション、`tine --self-check` で git と Tine 自身の helper（askpass、rebase のエディタ）が動くかを確かめられます。
+
+## インストール
+
+**ホームに入れる**（`~/.local/bin/tine` と、メニュー・アイコン・ライセンスの一覧）
+
+```bash
+scripts/install.sh
+```
+
+- ビルドしてから入れます。cargo のない環境（ホストなど）では、ビルド済みの `target/release/tine` を `--no-build` で入れます。
+- 入れる前に、入れる実行ファイルで `--self-check` を実行します。通らなければ（git がない・古いなど）、何も置かずに理由を表示します。
+- 入れたものの記録（sha256 付き）を `~/.local/share/tine/install-manifest` に残します。Tine のインストールが置いたものでないファイルや、その後に変えたファイルは上書きしません（`--force` で上書き）。ファイルを置く場所にフォルダーがある場合は、`--force` でも置きません。
+- `--prefix DIR` で `DIR/bin` と `DIR/share` に入れられます。その `share` をメニューが見ない場所の場合は、そう表示します。
+- 外すには `scripts/uninstall.sh` を実行します。設定と最近使った一覧（`~/.local/share/tine/` の `state.ron`・`app.ron`）は残します。入れた後に変えたファイルも残し、記録にも残すので、後から `scripts/uninstall.sh --force` で外せます。
+- Tine を実行中に入れ直しても、外しても、動いている Tine は自分自身を helper として使い続けます。
+
+**AppImage**（`target/appimage/Tine-<版>-x86_64.AppImage`）
+
+```bash
+APPIMAGETOOL=/path/to/appimagetool APPIMAGE_RUNTIME=/path/to/runtime-x86_64 scripts/appimage.sh
+```
+
+- appimagetool と runtime は版を固定しています（`packaging/appimage/tools.lock` の sha256 と一致するものだけを使います）。
+- ライブラリは同梱しません。動かすには、glibc 2.39 以上、Wayland か X11 と GPU（Vulkan か EGL）のライブラリ、git 2.43 以上、fontconfig が必要です。FUSE がない場合は `--appimage-extract-and-run` を付けて起動します。
+- AppImage をそのまま起動しただけでは、Wayland のタスクバーのアイコンは汎用のものになります。メニューとアイコンを付けるには `scripts/install.sh --binary Tine-….AppImage` で登録します。
+- AppImage には runtime（type2-runtime、静的にリンクした libfuse（LGPL-2.1）など）が入っています。その通知は `packaging/APPIMAGE_NOTICES` にあります。他の人に配布する場合は、LGPL に従い runtime の対応するソースを示す必要があります。
+
+**RPM**（Fedora 向け。`target/rpm/`）
+
+```bash
+scripts/rpm.sh            # HEAD から
+scripts/rpm.sh --dirty    # コミットしていない変更（追跡しているファイル）も含める
+```
+
+- 依存するクレートを vendor してソースに入れるので、ビルドの間はネットワークを使いません。ソース RPM（`.src.rpm`）だけからも作り直せます（版は spec に書き込んであります）。
+- `sudo dnf install ./target/rpm/tine-*.x86_64.rpm` で入れます。
+
+**二つ起動した場合**: 別々のウィンドウになります。設定は、後から保存した方の内容になります（ファイルは壊れません）。
+
+## ライセンス
+
+- Tine 自体のライセンスはまだ決めていません。
+- Tine に組み込んでいるクレートと素材（egui の既定フォント、syntect の構文定義）のライセンスは、`packaging/THIRD_PARTY_LICENSES` と About（☰ メニュー）で見られます。`scripts/third-party.py` が、x86_64 Linux のビルドの依存（`cargo tree`）と各クレートのソースから作ります。
 
 ## 操作
 
@@ -65,6 +109,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test -p tine --test screenshots -- --ignored       # 画面を target/screenshots/*.png に出力
 TINE_PERF_REPO=/path/to/big/repo cargo test --release -p tine --test perf -- --ignored --nocapture
 cargo run --release -p tine-bench -- /path/to/repo       # 履歴読込とグラフ計算の計測
+cargo run --release -p tine-bench -- worktrees /path/to/repo   # worktree 一覧・LFS の判定の計測
+# AppImage と RPM を実際に作って確かめる（時間がかかる）
+TINE_TEST_APPIMAGETOOL=… TINE_TEST_APPIMAGE_RUNTIME=… cargo test -p tine --test m6_packages -- --ignored --test-threads=1
+packaging/icons/render.sh                                # アイコンの PNG を元の画像から作り直す
 ./target/debug/tine --ime-probe                          # 日本語入力（IME）の確認画面
 ```
 
