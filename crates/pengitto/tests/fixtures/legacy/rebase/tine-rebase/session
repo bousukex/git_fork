@@ -1,0 +1,9 @@
+id @ID@
+head @HEAD@
+message reword @C3@
+branch refs/heads/main
+base @BASE@
+autostash @STASH@
+item pick @C1@
+item edit @C2@
+item reword @C3@

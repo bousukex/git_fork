@@ -1,0 +1,31 @@
+[package]
+name = "pengitto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pengitto-core.workspace = true
+anyhow.workspace = true
+bstr.workspace = true
+crossbeam-channel.workspace = true
+libc.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+memmap2.workspace = true
+chrono.workspace = true
+rfd.workspace = true
+notify.workspace = true
+trash.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+ron.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# The version egui uses (reading fonts' character maps in a test).
+skrifa = "0.44"
+egui_kittest.workspace = true

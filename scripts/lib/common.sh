@@ -1,7 +1,7 @@
 # Shared by install.sh and uninstall.sh (sourced; POSIX sh).
 
 die() {
-    printf 'tine: %s\n' "$*" >&2
+    printf 'pengitto: %s\n' "$*" >&2
     exit 1
 }
 
@@ -28,7 +28,7 @@ locate() {
             *) DATA=$HOME/.local/share ;;
         esac
     fi
-    STATE=$DATA/tine
+    STATE=$DATA/pengitto
     MANIFEST=$STATE/install-manifest
     PENDING=$STATE/install-manifest.pending
 }
@@ -51,7 +51,7 @@ lock() {
     exec 9>>"$STATE/install.lock"
     flock 9
     # (For tests: holds on to the lock while this file is there.)
-    while [ -n "${TINE_INSTALL_PAUSE:-}" ] && [ -e "$TINE_INSTALL_PAUSE" ]; do
+    while [ -n "${PENGITTO_INSTALL_PAUSE:-}" ] && [ -e "$PENGITTO_INSTALL_PAUSE" ]; do
         sleep 0.05
     done
 }
@@ -60,16 +60,23 @@ hash_of() {
     sha256sum <"$1" | cut -d' ' -f1
 }
 
-# Whether $1 with hash $2 is a file a Tine installation put there, as it
-# put it (by the manifest, or the one of an installation cut short).
-owned() {
-    for m in "$MANIFEST" "$PENDING"; do
+# Whether $1 with hash $2 is recorded so in one of the records $3….
+recorded() {
+    p=$1 h=$2
+    shift 2
+    for m in "$@"; do
         [ -f "$m" ] || continue
-        if P=$1 H=$2 awk -F "$tab" '$1 == ENVIRON["H"] && $2 == ENVIRON["P"] { found = 1 } END { exit !found }' "$m"; then
+        if P=$p H=$h awk -F "$tab" '$1 == ENVIRON["H"] && $2 == ENVIRON["P"] { found = 1 } END { exit !found }' "$m"; then
             return 0
         fi
     done
     return 1
+}
+
+# Whether $1 with hash $2 is a file a pengitto installation put there, as it
+# put it (by the manifest, or the one of an installation cut short).
+owned() {
+    recorded "$1" "$2" "$MANIFEST" "$PENDING"
 }
 
 # Keeps desktop caches current where they are kept (a cache made where

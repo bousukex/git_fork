@@ -1,6 +1,6 @@
 NOTICES FOR THE APPIMAGE
 
-Besides Tine (see THIRD_PARTY_LICENSES), the AppImage file contains the
+Besides pengitto (see THIRD_PARTY_LICENSES), the AppImage file contains the
 AppImage runtime, which mounts the image when it starts. The runtime
 is the pinned build in packaging/appimage/tools.lock; its sources are at
 https://github.com/AppImage/type2-runtime (and those of what it links

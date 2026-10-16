@@ -1,0 +1,149 @@
+pub mod askpass;
+pub mod banner;
+pub mod browse;
+pub mod changes;
+pub mod detail;
+pub mod dialogs;
+pub mod diff_view;
+pub mod graph_paint;
+pub mod history;
+pub mod menus;
+pub mod merge;
+pub mod output;
+pub mod quick_launch;
+pub mod rebase;
+pub mod settings;
+pub mod sidebar;
+
+use std::sync::Arc;
+
+use bstr::{BString, ByteSlice};
+use egui::{
+    Align2, Color32, FontId, Galley, Painter, Pos2, Rect,
+    text::{LayoutJob, TextFormat},
+};
+use pengitto_core::{highlight::Span, model::ChangeKind};
+
+use crate::theme::Palette;
+
+/// Lays out single-line text cut to `max_width` with an ellipsis.
+pub fn truncated(painter: &Painter, text: &str, font: FontId, color: Color32, max_width: f32) -> Arc<Galley> {
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap.max_width = max_width.max(0.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    painter.layout_job(job)
+}
+
+/// Lays out one line of code, colored by its syntax `spans` (plain
+/// without any).
+pub fn code_galley(painter: &Painter, text: &str, spans: &[Span], font: FontId, color: Color32, p: &Palette) -> Arc<Galley> {
+    if spans.is_empty() {
+        return painter.layout_no_wrap(text.to_owned(), font, color);
+    }
+    let format = |color| TextFormat { font_id: font.clone(), color, ..Default::default() };
+    let mut job = LayoutJob::default();
+    let mut at = 0;
+    for s in spans {
+        let (start, end) = (s.start as usize, s.end as usize);
+        let (Some(before), Some(token)) = (text.get(at..start), text.get(start..end)) else {
+            // Spans of some other text: show it plain.
+            return painter.layout_no_wrap(text.to_owned(), font, color);
+        };
+        job.append(before, 0.0, format(color));
+        job.append(token, 0.0, format(p.syntax_color(s.token)));
+        at = end;
+    }
+    job.append(text.get(at..).unwrap_or_default(), 0.0, format(color));
+    painter.layout_job(job)
+}
+
+/// "Open File" and "Show in File Manager" for a path of the work tree
+/// (disabled when the work tree doesn't have it).
+pub fn file_tool_items(ui: &mut egui::Ui, workdir: &std::path::Path, path: &[u8]) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let rel = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path));
+    let present = workdir.join(&rel).symlink_metadata().is_ok();
+    for tool in [crate::tools::Tool::OpenFile(rel.clone()), crate::tools::Tool::ShowFile(rel)] {
+        let resp = ui.add_enabled(present, egui::Button::new(tool.label())).on_disabled_hover_text("Not in the working tree");
+        if resp.clicked() {
+            crate::tools::run(ui.ctx(), &tool, workdir);
+            ui.close();
+        }
+    }
+}
+
+/// Paints truncated text vertically centered in `rect`.
+pub fn paint_text(painter: &Painter, rect: Rect, text: &str, font: FontId, color: Color32, align: Align2) {
+    let galley = truncated(painter, text, font, color, rect.width());
+    let pos = align.align_size_within_rect(galley.size(), rect).min;
+    painter.galley(pos, galley, color);
+}
+
+/// `2026-10-10 11:03` in local time.
+pub fn format_time(unix: i64) -> String {
+    use chrono::TimeZone as _;
+    match chrono::Local.timestamp_opt(unix, 0).single() {
+        Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        None => String::new(),
+    }
+}
+
+pub fn status_color(kind: ChangeKind, p: &Palette) -> Color32 {
+    match kind {
+        ChangeKind::Added => p.status_added,
+        ChangeKind::Modified | ChangeKind::TypeChanged => p.status_modified,
+        ChangeKind::Deleted => p.status_deleted,
+        ChangeKind::Renamed | ChangeKind::Copied => p.status_renamed,
+        ChangeKind::Untracked => p.status_untracked,
+        ChangeKind::Conflicted => p.status_conflict,
+    }
+}
+
+/// Splits a repo path into (file name, parent directory) for display.
+pub fn split_path(path: &BString) -> (String, String) {
+    let s = path.to_str_lossy();
+    match s.rsplit_once('/') {
+        Some((dir, name)) => (name.to_owned(), dir.to_owned()),
+        None => (s.into_owned(), String::new()),
+    }
+}
+
+/// Paints a small rounded status letter box (like Fork's file icons).
+/// A small "LFS" tag at the right end of a file row (the file goes
+/// through Git LFS); returns the width it takes.
+pub fn lfs_tag(painter: &Painter, row: Rect, p: &Palette) -> f32 {
+    let galley = painter.layout_no_wrap("LFS".into(), FontId::proportional(10.0), p.text_weak);
+    let w = galley.size().x + 8.0;
+    let rect = Rect::from_min_max(Pos2::new(row.right() - 6.0 - w, row.center().y - 7.0), Pos2::new(row.right() - 6.0, row.center().y + 7.0));
+    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, p.separator), egui::StrokeKind::Inside);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, p.text_weak);
+    w + 10.0
+}
+
+pub fn status_badge(painter: &Painter, center: Pos2, kind: ChangeKind, p: &Palette) {
+    let rect = Rect::from_center_size(center, egui::vec2(15.0, 15.0));
+    let color = status_color(kind, p);
+    painter.rect_filled(rect, 3.0, color);
+    painter.text(rect.center(), Align2::CENTER_CENTER, kind.letter(), FontId::proportional(10.5), Color32::WHITE);
+}
+
+/// A full-width clickable list row; returns its rect and response.
+pub fn list_row(ui: &mut egui::Ui, height: f32, selected: bool, focused: bool) -> (Rect, egui::Response) {
+    let p = Palette::of(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+    if selected {
+        let fill = if focused { p.selection_bg } else { p.selection_bg_unfocused };
+        ui.painter().rect_filled(rect, 0.0, fill);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 0.0, p.row_hover);
+    }
+    (rect, resp)
+}
+
+/// Section caption used in panels ("Unstaged", "Staged", …).
+pub fn caption(ui: &mut egui::Ui, text: &str) {
+    let p = Palette::of(ui.ctx());
+    ui.label(egui::RichText::new(text).small().strong().color(p.text_weak));
+}

@@ -2805,6 +2805,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "pengitto"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bstr",
+ "chrono",
+ "crossbeam-channel",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "egui_kittest",
+ "env_logger",
+ "libc",
+ "log",
+ "memmap2",
+ "notify",
+ "pengitto-core",
+ "rfd",
+ "ron",
+ "serde",
+ "skrifa",
+ "tempfile",
+ "trash",
+]
+
+[[package]]
+name = "pengitto-bench"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "pengitto-core",
+]
+
+[[package]]
+name = "pengitto-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bstr",
+ "crossbeam-channel",
+ "libc",
+ "log",
+ "memchr",
+ "rayon",
+ "syntect",
+ "tempfile",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3727,56 +3777,6 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
-]
-
-[[package]]
-name = "tine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bstr",
- "chrono",
- "crossbeam-channel",
- "eframe",
- "egui",
- "egui_extras",
- "egui_kittest",
- "env_logger",
- "libc",
- "log",
- "memmap2",
- "notify",
- "rfd",
- "ron",
- "serde",
- "skrifa",
- "tempfile",
- "tine-core",
- "trash",
-]
-
-[[package]]
-name = "tine-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "tine-core",
-]
-
-[[package]]
-name = "tine-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bstr",
- "crossbeam-channel",
- "libc",
- "log",
- "memchr",
- "rayon",
- "syntect",
- "tempfile",
 ]
 
 [[package]]

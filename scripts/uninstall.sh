@@ -25,11 +25,11 @@ if [ -d "$STATE" ]; then
     lock
 fi
 if [ ! -f "$MANIFEST" ] && [ ! -f "$PENDING" ]; then
-    say "Tine isn't installed in $DATA (there is no record of an installation)."
+    say "pengitto isn't installed in $DATA (there is no record of an installation)."
     exit 0
 fi
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/tine-uninstall.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/pengitto-uninstall.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 trap 'exit 1' INT TERM HUP
 : >"$work/kept"
@@ -61,13 +61,13 @@ else
     rm -f "$MANIFEST"
 fi
 rm -f "$PENDING"
-rmdir "$DATA/doc/tine" 2>/dev/null || true
+rmdir "$DATA/doc/pengitto" 2>/dev/null || true
 refresh_caches
 
 say "Removed:${removed:- nothing}"
 [ -z "$kept" ] || say "Kept (changed since they were installed; --force removes them):$kept"
-data=${XDG_DATA_HOME:-$HOME/.local/share}/tine
-case $data in /*) ;; *) data=$HOME/.local/share/tine ;; esac
+data=${XDG_DATA_HOME:-$HOME/.local/share}/pengitto
+case $data in /*) ;; *) data=$HOME/.local/share/pengitto ;; esac
 if [ -d "$data" ]; then
     say "Your settings and recent repositories are kept in $data."
 fi

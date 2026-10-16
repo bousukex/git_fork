@@ -1,6 +1,6 @@
 #!/bin/sh
-# Makes the hicolor PNGs of Tine's icon from the source image
-# (tine-source.webp): the rounded square is cut out, its outside made
+# Makes the hicolor PNGs of pengitto's icon from the source image
+# (pengitto-source.webp): the rounded square is cut out, its outside made
 # transparent, and the result scaled down. Run it again only when the
 # source changes; the PNGs are kept in the repository.
 # Needs dwebp (apt: webp) and ImageMagick's convert.
@@ -8,7 +8,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-dwebp -quiet "$here/tine-source.webp" -o "$work/source.png"
+dwebp -quiet "$here/pengitto-source.webp" -o "$work/source.png"
 # The rounded square of the source (measured on its rim): 1111x1100 at
 # 68,63, corners of about 270px.
 convert "$work/source.png" -crop 1111x1100+68+63 +repage "$work/square.png"
@@ -17,5 +17,5 @@ convert "$work/square.png" "$work/mask.png" -alpha off -compose CopyOpacity -com
 convert "$work/cut.png" -background none -gravity center -extent 1150x1150 "$work/icon.png"
 for n in 16 24 32 48 64 128 256 512; do
     mkdir -p "$here/hicolor/${n}x${n}/apps"
-    convert "$work/icon.png" -filter Lanczos -resize "${n}x${n}" -strip "PNG32:$here/hicolor/${n}x${n}/apps/tine.png"
+    convert "$work/icon.png" -filter Lanczos -resize "${n}x${n}" -strip "PNG32:$here/hicolor/${n}x${n}/apps/pengitto.png"
 done

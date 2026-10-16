@@ -1,7 +1,7 @@
 #!/bin/sh
-# Installs Tine: the executable in ~/.local/bin, its menu entry, icons and
+# Installs pengitto: the executable in ~/.local/bin, its menu entry, icons and
 # licenses in your data folder (or all under --prefix). Everything is made
-# ready and checked first, then put in place; files Tine didn't put there
+# ready and checked first, then put in place; files pengitto didn't put there
 # (or that were changed since) aren't overwritten without --force.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -12,13 +12,13 @@ usage() {
 Usage: scripts/install.sh [OPTION]...
   --prefix DIR       install into DIR/bin and DIR/share (default: ~/.local/bin
                      and your data folder, ~/.local/share)
-  --binary FILE      install FILE (a tine executable, or a Tine AppImage)
-  --no-build         don't build: install target/release/tine as it is
+  --binary FILE      install FILE (a pengitto executable, or a pengitto AppImage)
+  --no-build         don't build: install target/release/pengitto as it is
   --exec PATH        the executable path the menu entry runs (default: the
                      installed one)
   --no-integration   don't refresh desktop caches
   --no-manifest      keep no record of what was installed (packages)
-  --force            overwrite files Tine didn't put there
+  --force            overwrite files pengitto didn't put there
 USAGE
 }
 
@@ -42,7 +42,7 @@ while [ $# -gt 0 ]; do
 done
 
 locate
-exec_path=${exec_path:-$BIN/tine}
+exec_path=${exec_path:-$BIN/pengitto}
 for p in "$BIN" "$DATA" "$exec_path"; do
     check_path "$p"
 done
@@ -58,18 +58,39 @@ esac
 
 # The executable.
 if [ -z "$binary" ]; then
-    binary=$root/target/release/tine
+    binary=$root/target/release/pengitto
     if [ "$build" = 1 ]; then
-        command -v cargo >/dev/null 2>&1 || die "cargo isn't there to build Tine (with a built one: --no-build)"
-        (cd "$root" && cargo build --release -p tine)
+        command -v cargo >/dev/null 2>&1 || die "cargo isn't there to build pengitto (with a built one: --no-build)"
+        (cd "$root" && cargo build --release -p pengitto)
     fi
 fi
-[ -f "$binary" ] || die "no executable at $binary (build it first: cargo build --release -p tine)"
+[ -f "$binary" ] || die "no executable at $binary (build it first: cargo build --release -p pengitto)"
 version=$("$binary" --version 2>/dev/null) || version=
 case $version in
-    "tine "*) ;;
+    "pengitto "*) ;;
     *) die "$binary doesn't start here (needs glibc 2.39 or newer)" ;;
 esac
+
+# legacy-names:begin
+# pengitto's installation under its former name, Tine, in the same place:
+# tidied away once pengitto's own is in place (see tidy_former).
+FORMER=$DATA/tine
+FORMER_MANIFEST=$FORMER/install-manifest
+FORMER_PENDING=$FORMER/install-manifest.pending
+FORMER_DOC=$DATA/doc/tine
+# legacy-names:end
+
+# The former name's lock, if its folder is there (once), taken right before
+# its installation is read and tidied: always after pengitto's own (its
+# scripts take only theirs). Its file stays, as pengitto's does.
+former_locked=0
+lock_former() {
+    if [ "$former_locked" = 0 ] && [ -d "$FORMER" ]; then
+        exec 8>>"$FORMER/install.lock"
+        flock 8
+        former_locked=1
+    fi
+}
 
 # (A package's staging area has no other installation to wait for.)
 if [ "$manifest" = 1 ]; then
@@ -78,7 +99,7 @@ fi
 
 # Everything goes to a temporary file next to its place first (those left
 # over are removed whatever happens).
-work=$(mktemp -d "${TMPDIR:-/tmp}/tine-install.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/pengitto-install.XXXXXX")
 : >"$work/staged"
 cleanup() {
     while IFS= read -r t; do
@@ -94,39 +115,39 @@ list=$work/list
 # Stages $1 (a file) for $2 with mode $3.
 stage() {
     mkdir -p "$(dirname "$2")"
-    tmp=$(mktemp "$(dirname "$2")/.tine-install.XXXXXX")
+    tmp=$(mktemp "$(dirname "$2")/.pengitto-install.XXXXXX")
     printf '%s\n' "$tmp" >>"$work/staged"
     cat "$1" >"$tmp"
     chmod "$3" "$tmp"
     printf '%s\t%s\t%s\n' "$tmp" "$2" "$(hash_of "$tmp")" >>"$list"
 }
 
-stage "$binary" "$BIN/tine" 755
+stage "$binary" "$BIN/pengitto" 755
 # The copy to be installed checks itself (git, its helpers) as it will run.
 # (Not in a package's build, which needn't have git.)
 if [ "$manifest" = 1 ] && ! "$tmp" --self-check >"$work/self-check" 2>&1; then
     die "$binary doesn't work here (its self-check failed); nothing was installed:$nl$(cat "$work/self-check")"
 fi
-desktop=$work/tine.desktop
+desktop=$work/pengitto.desktop
 # The path as the Exec key wants it: quoted (\, ", `, $ escaped; % doubled),
 # then as a string value (\ doubled again).
 quoted=$(printf '%s' "$exec_path" | sed -e 's/[\\"`$]/\\&/g' -e 's/%/%%/g')
-TINE_EXEC=$(printf '"%s"' "$quoted" | sed -e 's/\\/\\\\/g') \
-    awk '{ if ($0 == "Exec=@EXEC@ -- %F") print "Exec=" ENVIRON["TINE_EXEC"] " -- %F"; else print }' \
-    "$root/packaging/tine.desktop.in" >"$desktop"
+PENGITTO_EXEC=$(printf '"%s"' "$quoted" | sed -e 's/\\/\\\\/g') \
+    awk '{ if ($0 == "Exec=@EXEC@ -- %F") print "Exec=" ENVIRON["PENGITTO_EXEC"] " -- %F"; else print }' \
+    "$root/packaging/pengitto.desktop.in" >"$desktop"
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$desktop" || die "the menu entry made for $exec_path isn't valid"
 fi
-stage "$desktop" "$DATA/applications/tine.desktop" 644
+stage "$desktop" "$DATA/applications/pengitto.desktop" 644
 for n in 16 24 32 48 64 128 256 512; do
-    stage "$root/packaging/icons/hicolor/${n}x$n/apps/tine.png" "$DATA/icons/hicolor/${n}x$n/apps/tine.png" 644
+    stage "$root/packaging/icons/hicolor/${n}x$n/apps/pengitto.png" "$DATA/icons/hicolor/${n}x$n/apps/pengitto.png" 644
 done
 for f in LICENSE-MIT LICENSE-APACHE; do
-    stage "$root/$f" "$DATA/doc/tine/$f" 644
+    stage "$root/$f" "$DATA/doc/pengitto/$f" 644
 done
-stage "$root/packaging/THIRD_PARTY_LICENSES" "$DATA/doc/tine/THIRD_PARTY_LICENSES" 644
+stage "$root/packaging/THIRD_PARTY_LICENSES" "$DATA/doc/pengitto/THIRD_PARTY_LICENSES" 644
 
-# Nothing is overwritten that Tine didn't put there as it is; and never a
+# Nothing is overwritten that pengitto didn't put there as it is; and never a
 # folder (a file moved onto one would go into it).
 conflicts= folders=
 while IFS="$tab" read -r tmp dest hash; do
@@ -143,7 +164,7 @@ if [ -n "$folders" ]; then
     die "these are folders where files go; nothing was installed (move them away first):$folders"
 fi
 if [ -n "$conflicts" ] && [ "$force" = 0 ]; then
-    die "these are there already and weren't put there by Tine's installation (or were changed since); nothing was installed (--force overwrites them):$conflicts"
+    die "these are there already and weren't put there by pengitto's installation (or were changed since); nothing was installed (--force overwrites them):$conflicts"
 fi
 
 # The record first (a run cut short is taken up by the next), then the
@@ -158,8 +179,8 @@ fi
 placed= n=0
 while IFS="$tab" read -r tmp dest hash; do
     # (For tests: as if stopped after this many.)
-    if [ -n "${TINE_INSTALL_STOP_AFTER:-}" ] && [ "$n" -ge "$TINE_INSTALL_STOP_AFTER" ]; then
-        die "stopped (TINE_INSTALL_STOP_AFTER); in place: ${placed:-nothing}"
+    if [ -n "${PENGITTO_INSTALL_STOP_AFTER:-}" ] && [ "$n" -ge "$PENGITTO_INSTALL_STOP_AFTER" ]; then
+        die "stopped (PENGITTO_INSTALL_STOP_AFTER); in place: ${placed:-nothing}"
     fi
     if ! mv -fT -- "$tmp" "$dest"; then
         die "putting $dest in place failed; in place: ${placed:-nothing} (running the installation again finishes it)"
@@ -182,6 +203,56 @@ if [ "$manifest" = 1 ]; then
     cp "$record" "$MANIFEST.tmp"
     mv -fT -- "$MANIFEST.tmp" "$MANIFEST"
     rm -f "$PENDING"
+fi
+
+# The former installation (read again now that its lock is held): what is
+# as it put it goes; what was changed since stays, kept in its record so
+# that it can be removed later. Only once pengitto's own is in place: a
+# failure before leaves the former one as it was, and a run cut short here
+# is finished by the next (the record is still there).
+tidy_former() {
+    # (Its folder may also have come since this run began.)
+    lock_former
+    [ -f "$FORMER_MANIFEST" ] || [ -f "$FORMER_PENDING" ] || return 0
+    : >"$work/former-kept"
+    former_removed= former_kept= seen=
+    for m in "$FORMER_MANIFEST" "$FORMER_PENDING"; do
+        [ -f "$m" ] || continue
+        while IFS="$tab" read -r hash dest; do
+            case "$nl$seen$nl" in *"$nl$dest$nl"*) continue ;; esac
+            seen="$seen$nl$dest"
+            [ -e "$dest" ] || [ -L "$dest" ] || continue
+            if [ -f "$dest" ] && [ ! -L "$dest" ] &&
+                recorded "$dest" "$(hash_of "$dest")" "$FORMER_MANIFEST" "$FORMER_PENDING" && rm -f "$dest"; then
+                former_removed="$former_removed$nl  $dest"
+            else
+                former_kept="$former_kept$nl  $dest"
+                printf '%s\n' "$dest" >>"$work/former-kept"
+            fi
+        done <"$m"
+    done
+    if [ -n "$former_kept" ]; then
+        for m in "$FORMER_MANIFEST" "$FORMER_PENDING"; do
+            [ -f "$m" ] || continue
+            awk -F "$tab" 'NR == FNR { k[$0] = 1; next } $2 in k' "$work/former-kept" "$m"
+        done | awk '!seen[$0]++' >"$FORMER_MANIFEST.tmp"
+        mv -fT -- "$FORMER_MANIFEST.tmp" "$FORMER_MANIFEST"
+    else
+        rm -f "$FORMER_MANIFEST"
+    fi
+    rm -f "$FORMER_PENDING"
+    rmdir "$FORMER_DOC" 2>/dev/null || true
+    # legacy-names:begin
+    [ -z "$former_removed" ] || say "Removed what Tine (pengitto's former name) had installed:$former_removed"
+    [ -z "$former_kept" ] || say "Kept of Tine's installation (changed since it put them; remove them by hand if they aren't needed):$former_kept"
+    # legacy-names:end
+}
+if [ "$manifest" = 1 ]; then
+    # (For tests: as if stopped right before.)
+    if [ "${PENGITTO_INSTALL_STOP_AT:-}" = legacy ]; then
+        die "stopped (PENGITTO_INSTALL_STOP_AT=legacy)"
+    fi
+    tidy_former
 fi
 
 if [ "$integrate" = 1 ]; then
@@ -216,7 +287,7 @@ if [ -n "$prefix" ]; then
     done
     set +f
     IFS=$saved_ifs
-    [ -n "$found" ] || say "Note: menus don't look in $DATA; Tine's entry won't show there."
-elif [ -f /usr/share/applications/tine.desktop ]; then
-    say "Note: Tine is also installed system-wide (a package); this installation's menu entry takes its place for you."
+    [ -n "$found" ] || say "Note: menus don't look in $DATA; pengitto's entry won't show there."
+elif [ -f /usr/share/applications/pengitto.desktop ]; then
+    say "Note: pengitto is also installed system-wide (a package); this installation's menu entry takes its place for you."
 fi

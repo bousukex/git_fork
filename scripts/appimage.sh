@@ -1,14 +1,14 @@
 #!/bin/sh
-# Makes target/appimage/Tine-<version>-x86_64.AppImage from a built tine.
+# Makes target/appimage/pengitto-<version>-x86_64.AppImage from a built pengitto.
 # No libraries are bundled: the host's glibc (2.39 or newer), display and
 # GPU libraries are used, and nothing like LD_LIBRARY_PATH reaches the
-# programs Tine starts. The AppImage tools are pinned (packaging/appimage/
+# programs pengitto starts. The AppImage tools are pinned (packaging/appimage/
 # tools.lock): APPIMAGETOOL and APPIMAGE_RUNTIME name them.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 . "$root/scripts/lib/common.sh"
 
-binary=$root/target/release/tine
+binary=$root/target/release/pengitto
 out=$root/target/appimage
 appdir_only=0
 while [ $# -gt 0 ]; do
@@ -21,41 +21,41 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ -f "$binary" ] || die "no executable at $binary (build it first: cargo build --release -p tine)"
+[ -f "$binary" ] || die "no executable at $binary (build it first: cargo build --release -p pengitto)"
 version=$("$binary" --version 2>/dev/null) || die "$binary doesn't start"
-version=${version#tine }
+version=${version#pengitto }
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/tine-appimage.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/pengitto-appimage.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-app=$work/Tine.AppDir
-mkdir -p "$app/usr/bin" "$app/usr/share/applications" "$app/usr/share/doc/tine"
-install -m 755 "$binary" "$app/usr/bin/tine"
-sed 's|^Exec=@EXEC@ -- %F$|Exec=tine -- %F|' "$root/packaging/tine.desktop.in" >"$app/usr/share/applications/tine.desktop"
-grep -q '^Exec=tine -- %F$' "$app/usr/share/applications/tine.desktop" || die "the menu entry's template has changed"
+app=$work/pengitto.AppDir
+mkdir -p "$app/usr/bin" "$app/usr/share/applications" "$app/usr/share/doc/pengitto"
+install -m 755 "$binary" "$app/usr/bin/pengitto"
+sed 's|^Exec=@EXEC@ -- %F$|Exec=pengitto -- %F|' "$root/packaging/pengitto.desktop.in" >"$app/usr/share/applications/pengitto.desktop"
+grep -q '^Exec=pengitto -- %F$' "$app/usr/share/applications/pengitto.desktop" || die "the menu entry's template has changed"
 if command -v desktop-file-validate >/dev/null 2>&1; then
-    desktop-file-validate "$app/usr/share/applications/tine.desktop"
+    desktop-file-validate "$app/usr/share/applications/pengitto.desktop"
 fi
 for n in 16 24 32 48 64 128 256 512; do
     mkdir -p "$app/usr/share/icons/hicolor/${n}x$n/apps"
-    install -m 644 "$root/packaging/icons/hicolor/${n}x$n/apps/tine.png" "$app/usr/share/icons/hicolor/${n}x$n/apps/tine.png"
+    install -m 644 "$root/packaging/icons/hicolor/${n}x$n/apps/pengitto.png" "$app/usr/share/icons/hicolor/${n}x$n/apps/pengitto.png"
 done
-install -m 644 "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$root/packaging/THIRD_PARTY_LICENSES" "$root/packaging/APPIMAGE_NOTICES" "$app/usr/share/doc/tine/"
-cp "$app/usr/share/applications/tine.desktop" "$app/tine.desktop"
-cp "$root/packaging/icons/hicolor/256x256/apps/tine.png" "$app/tine.png"
-ln -s tine.png "$app/.DirIcon"
+install -m 644 "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$root/packaging/THIRD_PARTY_LICENSES" "$root/packaging/APPIMAGE_NOTICES" "$app/usr/share/doc/pengitto/"
+cp "$app/usr/share/applications/pengitto.desktop" "$app/pengitto.desktop"
+cp "$root/packaging/icons/hicolor/256x256/apps/pengitto.png" "$app/pengitto.png"
+ln -s pengitto.png "$app/.DirIcon"
 cat >"$app/AppRun" <<'APPRUN'
 #!/bin/sh
-# Runs Tine from the mounted image (it is its own helper for git: it finds
+# Runs pengitto from the mounted image (it is its own helper for git: it finds
 # itself as /proc/<pid>/exe).
 here=$(dirname "$(readlink -f "$0")")
-exec "$here/usr/bin/tine" "$@"
+exec "$here/usr/bin/pengitto" "$@"
 APPRUN
 chmod 755 "$app/AppRun"
 mkdir -p "$out"
 if [ "$appdir_only" = 1 ]; then
-    rm -rf "$out/Tine.AppDir"
-    cp -a "$app" "$out/Tine.AppDir"
-    say "Made $out/Tine.AppDir"
+    rm -rf "$out/pengitto.AppDir"
+    cp -a "$app" "$out/pengitto.AppDir"
+    say "Made $out/pengitto.AppDir"
     exit 0
 fi
 
@@ -76,7 +76,7 @@ fi
 [ "$(hash_of "$tool")" = "$(pinned appimagetool)" ] || die "$tool isn't the pinned appimagetool (see packaging/appimage/tools.lock)"
 [ "$(hash_of "$runtime")" = "$(pinned runtime)" ] || die "$runtime isn't the pinned runtime (see packaging/appimage/tools.lock)"
 command -v file >/dev/null 2>&1 || die "appimagetool needs the file command (apt/dnf: file)"
-image=$out/Tine-$version-x86_64.AppImage
+image=$out/pengitto-$version-x86_64.AppImage
 rm -f "$image"
 # appimagetool is an AppImage itself: run it without needing FUSE (what it
 # extracts is left behind, in TMPDIR: the work folder, removed after).

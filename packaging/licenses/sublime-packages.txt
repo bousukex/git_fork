@@ -1,5 +1,5 @@
 Sublime Text's Packages (https://github.com/sublimehq/Packages), commit fa6b8629c95041bf262d4c1dab95c456a0530122,
-from which syntect 5.3.0 builds its default syntax definitions (built into Tine).
+from which syntect 5.3.0 builds its default syntax definitions (built into pengitto).
 
 --- LICENSE ---
 If not otherwise specified (see below), files in this repository fall under the following license:

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Makes the source and binary RPMs of Tine (target/rpm/): from a snapshot
+# Makes the source and binary RPMs of pengitto (target/rpm/): from a snapshot
 # of the repository (HEAD; with --dirty, also the changes to tracked files
 # not committed yet — untracked files never), with every crate vendored
 # into the source, so the build needs no network.
@@ -29,16 +29,16 @@ case $version in
     *[!A-Za-z0-9._+~^]*) die "an RPM version can't be $version (no '-')" ;;
 esac
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/tine-rpm.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/pengitto-rpm.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-src=$work/tine-$version
+src=$work/pengitto-$version
 mkdir -p "$src"
 git -C "$root" archive --format=tar "$rev" | tar -x -C "$src"
 # The version written into the spec (the source RPM then rebuilds by itself).
-spec=$src/packaging/rpm/tine.spec
-V=$version awk '{ if ($0 == "Version:        @VERSION@") print "Version:        " ENVIRON["V"]; else print }' "$spec" >"$work/tine.spec"
-grep -qx "Version:        $version" "$work/tine.spec" || die "the spec has no Version line to write $version into"
-mv -f "$work/tine.spec" "$spec"
+spec=$src/packaging/rpm/pengitto.spec
+V=$version awk '{ if ($0 == "Version:        @VERSION@") print "Version:        " ENVIRON["V"]; else print }' "$spec" >"$work/pengitto.spec"
+grep -qx "Version:        $version" "$work/pengitto.spec" || die "the spec has no Version line to write $version into"
+mv -f "$work/pengitto.spec" "$spec"
 # The crates of that very snapshot, and cargo told to use them.
 (
     cd "$src"
@@ -47,7 +47,7 @@ mv -f "$work/tine.spec" "$spec"
 )
 # The licenses listed must be those of these crates.
 (cd "$src" && python3 scripts/third-party.py --check)
-tar -czf "$work/tine-$version.tar.gz" -C "$work" "tine-$version"
+tar -czf "$work/pengitto-$version.tar.gz" -C "$work" "pengitto-$version"
 
 nodeps=
 # Built elsewhere than Fedora: its build requirements aren't packages here.

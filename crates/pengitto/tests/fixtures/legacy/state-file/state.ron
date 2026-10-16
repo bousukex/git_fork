@@ -1,0 +1,25 @@
+(
+    recent: [
+        "/home/someone/src/作業",
+        "/home/someone/src/other",
+    ],
+    open: [],
+    active: 0,
+    messages: [
+        "Fix the graph lanes",
+    ],
+    settings: (
+        diff_font_size: 15.0,
+        tab_width: 6,
+        syntax_highlighting: false,
+    ),
+    tools: (
+        terminal: [
+            "konsole",
+            "--workdir",
+            "{dir}",
+        ],
+    ),
+    theme: Some("dark"),
+    zoom: Some(1.25),
+)

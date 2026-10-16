@@ -1,0 +1,4 @@
+{
+    "egui": "(memory: ())",
+    "tine-state": "(\n    recent: [\n        \"/home/someone/src/from-storage\",\n    ],\n    open: [],\n    active: 0,\n    messages: [],\n    settings: (\n        diff_font_size: 13.0,\n        tab_width: 3,\n        syntax_highlighting: true,\n    ),\n    tools: (\n        terminal: [],\n    ),\n    theme: Some(\"light\"),\n    zoom: None,\n)",
+}
