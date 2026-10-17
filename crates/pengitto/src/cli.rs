@@ -7,12 +7,13 @@ use std::{ffi::OsString, path::PathBuf};
 pub const USAGE: &str = "\
 Usage: pengitto [OPTION]... [--] [PATH]...
 Opens the git repositories at PATH (a file: the one it is in), or the ones
-open last time.
+open last time. With pengitto running already, it opens them there.
 
 Options:
-  --self-check  check that git and pengitto's own helpers can run, then exit
-  --version     print the version and exit
-  --help        print this help and exit
+  --new-instance  run a pengitto of its own, even with one running
+  --self-check    check that git and pengitto's own helpers can run, then exit
+  --version       print the version and exit
+  --help          print this help and exit
 ";
 
 /// What the command line asks for.
@@ -21,8 +22,9 @@ pub enum Command {
     Version,
     Help,
     SelfCheck,
-    /// The window, opening `paths` (none: the ones open last time).
-    Run { ime_probe: bool, paths: Vec<PathBuf> },
+    /// The window, opening `paths` (none: the ones open last time);
+    /// `alone`: even with a pengitto running.
+    Run { ime_probe: bool, alone: bool, paths: Vec<PathBuf> },
 }
 
 /// The version line (`pengitto 0.1.0`).
@@ -33,7 +35,7 @@ pub fn version() -> String {
 /// Reads the arguments (without the program name). An unknown option is
 /// an error (the message says which); after `--`, everything is a path.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
-    let mut ime_probe = false;
+    let (mut ime_probe, mut alone) = (false, false);
     let mut paths = Vec::new();
     let mut options = true;
     for arg in args {
@@ -44,6 +46,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 Some("--help" | "-h") => return Ok(Command::Help),
                 Some("--self-check") => return Ok(Command::SelfCheck),
                 Some("--ime-probe") => ime_probe = true,
+                Some("--new-instance") => alone = true,
                 // (The AppImage's AppRun takes these before pengitto runs.)
                 Some(o @ ("--install" | "--uninstall")) => {
                     return Err(format!("{o} is for the AppImage (pengitto-<version>-x86_64.AppImage {o})"));
@@ -54,7 +57,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         }
         paths.push(folder_of(PathBuf::from(arg)));
     }
-    Ok(Command::Run { ime_probe, paths })
+    Ok(Command::Run { ime_probe, alone, paths })
 }
 
 /// A file to open stands for the folder it is in (a file manager may pass
@@ -83,15 +86,16 @@ mod tests {
         assert_eq!(run(&["--version"]), Ok(Command::Version));
         assert_eq!(run(&["-h"]), Ok(Command::Help));
         assert_eq!(run(&["--self-check"]), Ok(Command::SelfCheck));
-        assert_eq!(run(&[]), Ok(Command::Run { ime_probe: false, paths: vec![] }));
-        assert_eq!(run(&["--ime-probe"]), Ok(Command::Run { ime_probe: true, paths: vec![] }));
-        assert_eq!(run(&["a", "b"]), Ok(Command::Run { ime_probe: false, paths: vec!["a".into(), "b".into()] }));
+        assert_eq!(run(&[]), Ok(Command::Run { ime_probe: false, alone: false, paths: vec![] }));
+        assert_eq!(run(&["--ime-probe"]), Ok(Command::Run { ime_probe: true, alone: false, paths: vec![] }));
+        assert_eq!(run(&["--new-instance", "a"]), Ok(Command::Run { ime_probe: false, alone: true, paths: vec!["a".into()] }));
+        assert_eq!(run(&["a", "b"]), Ok(Command::Run { ime_probe: false, alone: false, paths: vec!["a".into(), "b".into()] }));
         assert!(run(&["--frobnicate"]).unwrap_err().contains("--frobnicate"));
         assert!(run(&["-x", "a"]).is_err());
         // After `--`, anything is a path.
         assert_eq!(
             run(&["--", "-x", "--version"]),
-            Ok(Command::Run { ime_probe: false, paths: vec!["-x".into(), "--version".into()] })
+            Ok(Command::Run { ime_probe: false, alone: false, paths: vec!["-x".into(), "--version".into()] })
         );
     }
 

@@ -31,6 +31,12 @@ env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 # The same as eframe's (pengitto's own state file is RON too).
 ron = "0.12"
+# The versions winit uses: activating the window on Wayland with a token
+# (on winit's own connection to the compositor).
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+raw-window-handle = "0.6"
 tempfile = "3"
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
 

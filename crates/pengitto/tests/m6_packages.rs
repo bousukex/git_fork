@@ -226,6 +226,39 @@ fn the_appimage_runs_pengitto_and_its_helpers() {
         lines.read_to_string(&mut rest).unwrap();
         assert!(held.wait().unwrap().success(), "extract {extract}: {rest}");
     }
+    // One at a time (M7b), from the image too (mounted, and extracted): it
+    // hands over to the one running (here a stand-in in this test) — its
+    // mount namespace is this one's. No display it could open.
+    let rt = dir.path().join("runtime");
+    std::fs::create_dir(&rt).unwrap();
+    std::fs::set_permissions(&rt, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let display = format!("pengitto-test-{}", std::process::id());
+    let ns = std::fs::read_link("/proc/self/ns/mnt").unwrap().to_string_lossy().into_owned();
+    let place = pengitto::instance::place(Some(rt.as_os_str()), &ns, Some(&display)).unwrap();
+    let pengitto::instance::Claim::Primary(running) =
+        pengitto::instance::claim(&place, &pengitto::instance::Request::default(), Duration::from_secs(5))
+    else {
+        panic!("not the one running")
+    };
+    running.link.ready(&egui::Context::default());
+    for extract in [false, true] {
+        let mut cmd = Command::new(&image);
+        cmd.arg(dir.path())
+            .env("XDG_RUNTIME_DIR", &rt)
+            .env("WAYLAND_DISPLAY", &display)
+            .env("XDG_ACTIVATION_TOKEN", "from-the-launcher")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_SOCKET");
+        if extract {
+            cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1").env("TMPDIR", dir.path());
+        }
+        let out = ok(cmd.output().unwrap());
+        let got = running.link.take_requests();
+        assert_eq!(got.len(), 1, "extract {extract}: {out}");
+        assert_eq!(got[0].paths, [dir.path().to_path_buf()]);
+        assert_eq!(got[0].token.as_deref(), Some("from-the-launcher"));
+    }
+    drop(running);
     // Registered by install.sh: the menu entry runs the AppImage.
     let home = tempfile::tempdir().unwrap();
     let data = home.path().join("data");

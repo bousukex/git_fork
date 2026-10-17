@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod app;
 pub mod appimage;
 pub mod askpass;
@@ -8,6 +9,7 @@ pub mod fonts;
 /// Fuzzy matching lives in the core (the bench measures it too).
 pub use pengitto_core::fuzzy;
 pub mod input;
+pub mod instance;
 pub mod merge_model;
 pub mod ops_registry;
 pub mod probe;

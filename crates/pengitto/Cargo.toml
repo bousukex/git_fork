@@ -23,6 +23,10 @@ log.workspace = true
 env_logger.workspace = true
 serde.workspace = true
 ron.workspace = true
+wayland-client.workspace = true
+wayland-backend.workspace = true
+wayland-protocols.workspace = true
+raw-window-handle.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

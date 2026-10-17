@@ -93,9 +93,15 @@ fn helper_answers(helper: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// AppImage variables a program started from pengitto would get.
+/// AppImage variables (and the launcher's tokens) a program started from
+/// pengitto would get.
 fn leaked_variables() -> Vec<&'static str> {
     let Ok(out) = Command::new("sh").arg("-c").arg("env").output() else { return Vec::new() };
     let env = String::from_utf8_lossy(&out.stdout);
-    crate::appimage::VARIABLES.into_iter().filter(|v| env.lines().any(|l| l.starts_with(&format!("{v}=")))).collect()
+    // (Also the launcher's activation tokens: kept for pengitto's window.)
+    crate::appimage::VARIABLES
+        .into_iter()
+        .chain(["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"])
+        .filter(|v| env.lines().any(|l| l.starts_with(&format!("{v}="))))
+        .collect()
 }

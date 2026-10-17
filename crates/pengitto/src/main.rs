@@ -4,9 +4,13 @@ use eframe::egui;
 use pengitto::cli::Command;
 
 fn main() -> ExitCode {
-    // From an AppImage: its variables aren't passed on to what pengitto starts.
+    // From an AppImage: its variables aren't passed on to what pengitto starts;
+    // nor the launcher's activation token (kept for this window).
     // SAFETY: first thing, before any other thread.
-    unsafe { pengitto::appimage::take_environment() };
+    unsafe {
+        pengitto::appimage::take_environment();
+        pengitto::instance::take_launch_tokens();
+    }
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     // Started by git as the editor of an interactive rebase (no window).
     if let Some(code) = pengitto_core::interactive::run_editor(&args) {
@@ -17,7 +21,7 @@ fn main() -> ExitCode {
     if let Some(code) = pengitto::askpass::run_client() {
         return exit_code(code);
     }
-    let (ime_probe, repos) = match pengitto::cli::parse(args) {
+    let (ime_probe, alone, repos) = match pengitto::cli::parse(args) {
         Ok(Command::Version) => {
             println!("{}", pengitto::cli::version());
             return ExitCode::SUCCESS;
@@ -27,7 +31,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(Command::SelfCheck) => return exit_code(pengitto::selfcheck::run()),
-        Ok(Command::Run { ime_probe, paths }) => (ime_probe, paths),
+        Ok(Command::Run { ime_probe, alone, paths }) => (ime_probe, alone, paths),
         Err(e) => {
             eprintln!("pengitto: {e}\n\n{}", pengitto::cli::USAGE);
             return ExitCode::from(2);
@@ -35,6 +39,19 @@ fn main() -> ExitCode {
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,pengitto=info,pengitto_core=info"))
         .init();
+
+    // One pengitto at a time: with one running, this one hands it the paths
+    // (and the launcher's token) and is done.
+    let mut notices = Vec::new();
+    let primary = if ime_probe || alone {
+        None
+    } else {
+        match one_at_a_time(&repos, &mut notices) {
+            Ok(p) => p,
+            Err(code) => return code,
+        }
+    };
+    let link = primary.as_ref().map(|p| p.link.clone());
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("pengitto")
@@ -58,16 +75,64 @@ fn main() -> ExitCode {
                 pengitto::setup_context(&cc.egui_ctx);
                 return Ok(Box::new(pengitto::probe::ImeProbe::default()));
             }
-            let options =
-                pengitto::app::AppOptions { state_file, legacy_dir: pengitto::state_file::legacy_dir(), ..Default::default() };
+            let options = pengitto::app::AppOptions {
+                state_file,
+                legacy_dir: pengitto::state_file::legacy_dir(),
+                instance: link,
+                notices,
+                // (Its own window's, one at a time or not.)
+                launch_token: pengitto::instance::launch_tokens().0,
+                ..Default::default()
+            };
             Ok(Box::new(pengitto::app::PengittoApp::with_options(cc, repos, cc.storage, options)))
         }),
     );
+    // (The window gone: no longer served; the socket removed.)
+    drop(primary);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("pengitto: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Takes the place of the one running, or hands `paths` to the one running
+/// (`Err`: this one is done, with that exit code).
+fn one_at_a_time(paths: &[std::path::PathBuf], notices: &mut Vec<String>) -> Result<Option<pengitto::instance::Primary>, ExitCode> {
+    use pengitto::instance::{self, Claim};
+    let place = match instance::place_from_env() {
+        Ok(p) => p,
+        Err(why) => {
+            log::info!("not one at a time: {why}");
+            return Ok(None);
+        }
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    let (token, startup_id) = instance::launch_tokens();
+    let request = instance::Request {
+        paths: paths.iter().map(|p| if p.is_absolute() { p.clone() } else { cwd.join(p) }).collect(),
+        cwd,
+        token,
+        startup_id,
+        activated: false,
+    };
+    match instance::claim(&place, &request, instance::DEADLINE) {
+        Claim::Primary(p) => Ok(Some(p)),
+        Claim::Forwarded => Err(ExitCode::SUCCESS),
+        Claim::Alone(notice) => {
+            log::warn!("{notice}");
+            notices.push(notice);
+            Ok(None)
+        }
+        Claim::Refused(why) => {
+            eprintln!("pengitto: {why}");
+            Err(ExitCode::from(1))
+        }
+        Claim::Off(why) => {
+            log::info!("not one at a time: {why}");
+            Ok(None)
         }
     }
 }

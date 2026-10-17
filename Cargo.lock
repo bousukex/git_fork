@@ -2822,12 +2822,16 @@ dependencies = [
  "memmap2",
  "notify",
  "pengitto-core",
+ "raw-window-handle",
  "rfd",
  "ron",
  "serde",
  "skrifa",
  "tempfile",
  "trash",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

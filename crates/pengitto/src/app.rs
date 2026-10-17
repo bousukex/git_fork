@@ -1,6 +1,9 @@
 //! Top-level window: toolbar, repository tabs and the active repository.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use crossbeam_channel::{Receiver, bounded};
 use egui::{Key, Modifiers, RichText};
@@ -52,11 +55,74 @@ pub struct AppOptions {
     /// How long quitting waits for the operations it stopped before asking
     /// again.
     pub stop_timeout: std::time::Duration,
+    /// Being the one pengitto running: what other ones ask of it
+    /// ([`crate::instance`]); `None`: not one at a time.
+    pub instance: Option<crate::instance::Link>,
+    /// The launcher's own activation token (used once, to bring the window
+    /// to the front, one at a time or not).
+    pub launch_token: Option<String>,
+    /// (Tests.) What makes the window's activator, instead of the one from
+    /// the window's Wayland handles.
+    pub make_activator: Option<MakeActivator>,
+    /// Told when the app starts.
+    pub notices: Vec<String>,
 }
 
 impl Default for AppOptions {
     fn default() -> Self {
-        AppOptions { state_file: None, legacy_dir: None, git: "git".into(), stop_timeout: std::time::Duration::from_secs(10) }
+        AppOptions {
+            state_file: None,
+            legacy_dir: None,
+            git: "git".into(),
+            stop_timeout: std::time::Duration::from_secs(10),
+            instance: None,
+            notices: Vec::new(),
+            launch_token: None,
+            make_activator: None,
+        }
+    }
+}
+
+/// The window's activator, or why there is none.
+pub type Made = Result<Box<dyn crate::instance::Activate>, String>;
+
+/// Makes the window's activator; it gives up when the flag it is given is
+/// set.
+#[derive(Clone)]
+pub struct MakeActivator(pub Arc<dyn Fn(&AtomicBool) -> Made + Send + Sync>);
+
+impl std::fmt::Debug for MakeActivator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MakeActivator")
+    }
+}
+
+/// The window's activation, owned by the app: the thread making its
+/// activator (on Wayland, talking to the compositor with the window's
+/// handles) is stopped and waited for — on_exit, or when the app is dropped
+/// without it (eframe drops the app before its window) — and then the link
+/// is closed (its activator dropped while the window is there).
+struct WindowActivation {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    link: Option<crate::instance::Link>,
+}
+
+impl WindowActivation {
+    fn shutdown(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        if let Some(link) = &self.link {
+            link.close();
+        }
+    }
+}
+
+impl Drop for WindowActivation {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -92,6 +158,13 @@ pub struct PengittoApp {
     /// Quitting once the operations it stopped have ended (since when).
     stopping: Option<std::time::Instant>,
     options: AppOptions,
+    /// Activating the window (from the first frame on).
+    activation: Option<WindowActivation>,
+    /// The window is on Wayland (else X11, or none: tests).
+    on_wayland: bool,
+    /// Other pengittos' requests were done in this frame (it doesn't close
+    /// in it: that would leave them undone).
+    asked_this_frame: bool,
     state_file: Option<crate::state_file::StateFile>,
     /// The version of git (checked at startup; `None` until known).
     git_version: Option<Result<pengitto_core::version::GitVersion, String>>,
@@ -214,6 +287,7 @@ impl PengittoApp {
         let mut state_file = options.state_file.clone().map(crate::state_file::StateFile::new);
         let mut notices = Vec::new();
         let mut state = startup_state(state_file.as_mut(), storage, options.legacy_dir.as_deref(), &mut notices);
+        notices.extend(options.notices.iter().cloned());
         state.settings = state.settings.validated();
         crate::settings::set_current(&cc.egui_ctx, state.settings);
         restore_look(&cc.egui_ctx, &state);
@@ -243,6 +317,9 @@ impl PengittoApp {
             quit_confirmed: false,
             stopping: None,
             options,
+            activation: None,
+            on_wayland: false,
+            asked_this_frame: false,
             state_file,
             git_version: None,
             git_check: Some(git_check),
@@ -516,7 +593,145 @@ impl PengittoApp {
         if !self.unsaved_merges().is_empty() || !running_operations().is_empty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.quit_asked = true;
+        } else if !self.others_let_it_close(ctx) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
+    }
+
+    /// Closing, as far as other pengittos go: from now on what they ask is
+    /// turned away (they take over once this one is gone) — unless something
+    /// was asked already: then this one stays and does it.
+    fn others_let_it_close(&mut self, ctx: &egui::Context) -> bool {
+        let Some(link) = self.options.instance.clone() else { return true };
+        if self.asked_this_frame {
+            return false;
+        }
+        let late = link.begin_closing();
+        if late.is_empty() {
+            return true;
+        }
+        self.handle_requests(ctx, late);
+        false
+    }
+
+    /// Quitting now (what had to be asked was answered), unless other
+    /// pengittos asked for something meanwhile.
+    fn quit_now(&mut self, ctx: &egui::Context) {
+        if self.others_let_it_close(ctx) {
+            self.quit_confirmed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Serves other pengittos: ready from the first frame (the window's
+    /// activation started); what they asked, done. (From `logic`: also
+    /// while the window is hidden, when the UI doesn't run.)
+    fn serve_others(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        self.asked_this_frame = false;
+        if self.activation.is_none() {
+            self.start_activation(ctx, frame);
+        }
+        let Some(link) = self.options.instance.clone() else { return };
+        let requests = link.take_requests();
+        self.handle_requests(ctx, requests);
+    }
+
+    fn handle_requests(&mut self, ctx: &egui::Context, requests: Vec<crate::instance::Request>) {
+        // Started again while quitting: wanted after all (quitting would
+        // leave what was asked undone). What was stopped stays stopped.
+        if !requests.is_empty() && self.quitting_in_progress() {
+            self.quit_asked = false;
+            self.stopping = None;
+            self.notices.push("Quitting was called off: pengitto was started again.".into());
+        }
+        self.asked_this_frame |= !requests.is_empty();
+        for r in requests {
+            for p in &r.paths {
+                self.open(p, ctx);
+            }
+            // Activated by the thread that took it when it could be (a
+            // token, the activator made, the request sent); else asked for
+            // here.
+            if r.activated {
+                continue;
+            }
+            if self.on_wayland {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+    }
+
+    /// The window's activation: its activator made in the background (it
+    /// asks the compositor) when wanted — to take others' tokens, or to use
+    /// the launcher's own (one at a time or not) — and handed to the link;
+    /// then the link is ready.
+    fn start_activation(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let link = self.options.instance.clone();
+        let own = self.options.launch_token.clone();
+        let mut activation = WindowActivation { stop: Arc::new(AtomicBool::new(false)), thread: None, link: link.clone() };
+        let make = match self.options.make_activator.clone() {
+            Some(m) => Some(m),
+            None => self.wayland_activator(frame),
+        };
+        if let Some(make) = make
+            && (link.is_some() || own.is_some())
+        {
+            let (stop, link) = (activation.stop.clone(), link.clone());
+            activation.thread = std::thread::Builder::new()
+                .name("pengitto-activator".into())
+                .spawn(move || match (make.0)(&stop) {
+                    // Made as the app goes: dropped unused (the window still
+                    // there: the app waits for this).
+                    Ok(_) if stop.load(std::sync::atomic::Ordering::SeqCst) => {}
+                    Ok(a) => {
+                        if let Some(t) = &own {
+                            a.activate(t);
+                        }
+                        // (Not taken in: closing. Dropped here, the
+                        // window still there: the app waits for this.)
+                        if let Some(link) = &link {
+                            let _ = link.publish_activator(a);
+                        }
+                    }
+                    Err(e) => log::info!("the window can't be activated: {e}"),
+                })
+                .ok();
+        }
+        if let Some(link) = &link {
+            link.ready(ctx);
+        }
+        self.activation = Some(activation);
+    }
+
+    /// What makes the activator from the window's Wayland handles (none on
+    /// X11, nor without a window).
+    fn wayland_activator(&mut self, frame: &eframe::Frame) -> Option<MakeActivator> {
+        use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _, RawDisplayHandle, RawWindowHandle};
+        let (Ok(w), Ok(d)) = (frame.window_handle(), frame.display_handle()) else { return None };
+        let (RawWindowHandle::Wayland(w), RawDisplayHandle::Wayland(d)) = (w.as_raw(), d.as_raw()) else { return None };
+        self.on_wayland = true;
+        struct Window(*mut std::ffi::c_void, *mut std::ffi::c_void);
+        // SAFETY: only used on the app's activation thread, which is stopped
+        // and waited for before the window goes (WindowActivation).
+        unsafe impl Send for Window {}
+        unsafe impl Sync for Window {}
+        impl Window {
+            fn handles(&self) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
+                (self.0, self.1)
+            }
+        }
+        let window = Window(d.display.as_ptr(), w.surface.as_ptr());
+        Some(MakeActivator(Arc::new(move |stop| {
+            let (display, surface) = window.handles();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            // SAFETY: winit's display and the window's surface, alive while
+            // this runs and the activator exists (see Window).
+            unsafe { crate::activation::WaylandActivator::new(display, surface, deadline, stop) }
+                .map(|a| Box::new(a) as Box<dyn crate::instance::Activate>)
+        })))
     }
 
     /// Asking whether to quit (unsaved changes, running operations).
@@ -549,8 +764,7 @@ impl PengittoApp {
         let (unsaved, running) = (self.unsaved_merges(), running_operations());
         if unsaved.is_empty() && running.is_empty() {
             self.quit_asked = false;
-            self.quit_confirmed = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.quit_now(ctx);
             return;
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -596,8 +810,7 @@ impl PengittoApp {
             }
             Some(true) => {
                 self.quit_asked = false;
-                self.quit_confirmed = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.quit_now(ctx);
             }
             Some(false) => self.quit_asked = false,
             None => {}
@@ -696,8 +909,7 @@ impl PengittoApp {
         let left = running_operations();
         if left.is_empty() {
             self.stopping = None;
-            self.quit_confirmed = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.quit_now(ctx);
             return;
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -730,8 +942,7 @@ impl PengittoApp {
         match answer {
             Some(true) => {
                 self.stopping = None;
-                self.quit_confirmed = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.quit_now(ctx);
             }
             Some(false) => self.stopping = Some(std::time::Instant::now()),
             None => {}
@@ -1359,7 +1570,6 @@ impl eframe::App for PengittoApp {
                 self.state.messages.push(m);
             }
         }
-        self.on_close_request(&ctx);
         if let Some(rx) = &self.git_check
             && let Ok(found) = rx.try_recv()
         {
@@ -1550,7 +1760,18 @@ impl eframe::App for PengittoApp {
         }
     }
 
+    /// Before each frame, and while the window is hidden: what other
+    /// pengittos ask, and closing (neither needs the UI).
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.serve_others(ctx, frame);
+        self.on_close_request(ctx);
+    }
+
     fn on_exit(&mut self) {
+        // The window goes after this: its activation first.
+        if let Some(a) = &mut self.activation {
+            a.shutdown();
+        }
         if let Some(f) = &mut self.state_file {
             f.flush();
         }
