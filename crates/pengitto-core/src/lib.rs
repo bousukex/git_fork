@@ -2,6 +2,7 @@
 
 pub mod autostash;
 pub mod blame;
+pub mod bounded;
 pub mod branches;
 pub mod config;
 pub mod diff;
@@ -25,6 +26,7 @@ pub mod remote;
 pub mod runner;
 pub mod search;
 pub mod sequencer;
+pub mod setup;
 pub mod stash;
 pub mod status;
 pub mod version;

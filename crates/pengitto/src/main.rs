@@ -82,6 +82,7 @@ fn main() -> ExitCode {
                 notices,
                 // (Its own window's, one at a time or not.)
                 launch_token: pengitto::instance::launch_tokens().0,
+                setup: Some(pengitto_core::setup::Env::from_process("git".into())),
                 ..Default::default()
             };
             Ok(Box::new(pengitto::app::PengittoApp::with_options(cc, repos, cc.storage, options)))

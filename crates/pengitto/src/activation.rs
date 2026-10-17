@@ -12,7 +12,7 @@ use std::{
 
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy as _, QueueHandle,
-    backend::{Backend, ObjectId},
+    backend::{Backend, ObjectId, WaylandError},
     protocol::{wl_callback, wl_registry, wl_surface::WlSurface},
 };
 use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::{self, XdgActivationV1};
@@ -49,6 +49,41 @@ impl Dispatch<wl_callback::WlCallback, ()> for State {
 
 impl Dispatch<XdgActivationV1, ()> for State {
     fn event(_: &mut Self, _: &XdgActivationV1, _: xdg_activation_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+/// A read or write that didn't happen just now — another thread (winit's)
+/// read the events first; the socket full; a signal — and is tried again.
+pub fn transient(e: &WaylandError) -> bool {
+    matches!(e, WaylandError::Io(io) if matches!(io.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted))
+}
+
+/// Waits (at most `left`, and 50 ms) for the connection to be ready for
+/// `events`.
+fn wait_for(conn: &Connection, events: libc::c_short, left: Duration) {
+    let fd = conn.backend().poll_fd().as_raw_fd();
+    let mut fds = libc::pollfd { fd, events, revents: 0 };
+    let ms = left.min(Duration::from_millis(50)).as_millis() as i32;
+    // SAFETY: one valid pollfd.
+    unsafe { libc::poll(&mut fds, 1, ms.max(1)) };
+}
+
+/// Sends what is queued, waiting for room (by `deadline`, unless stopped).
+fn flush_by(conn: &Connection, deadline: Instant, stop: &AtomicBool) -> Result<(), String> {
+    loop {
+        match conn.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if transient(&e) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if stop.load(Ordering::SeqCst) {
+            return Err("stopped".into());
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("the compositor didn't take what was sent in time".into());
+        }
+        wait_for(conn, libc::POLLOUT, left);
+    }
 }
 
 /// Activates the window whose surface it borrowed.
@@ -93,14 +128,19 @@ impl WaylandActivator {
             if left.is_zero() {
                 return Err("the compositor didn't answer in time".into());
             }
-            conn.flush().map_err(|e| e.to_string())?;
+            flush_by(&conn, deadline, stop)?;
             // (No guard: events came meanwhile, to be dispatched first.)
             let Some(guard) = queue.prepare_read() else { continue };
             let mut fds = libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 };
             let ms = left.min(Duration::from_millis(50)).as_millis() as i32;
             // SAFETY: one valid pollfd.
             if unsafe { libc::poll(&mut fds, 1, ms.max(1)) } > 0 {
-                guard.read().map_err(|e| e.to_string())?;
+                match guard.read() {
+                    // (Nothing read, as another thread read it first: the
+                    // loop looks again.)
+                    Err(e) if !transient(&e) => return Err(e.to_string()),
+                    _ => {}
+                }
             }
             // (Else the guard, dropped, gives up its read.)
         }
@@ -109,7 +149,7 @@ impl WaylandActivator {
         // SAFETY: the caller's; borrowed (from_ptr doesn't take it over).
         let id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.cast()) }.map_err(|e| format!("the surface: {e}"))?;
         let surface = WlSurface::from_id(&conn, id).map_err(|e| format!("the surface: {e}"))?;
-        conn.flush().map_err(|e| e.to_string())?;
+        flush_by(&conn, deadline, stop)?;
         Ok(WaylandActivator { conn, activation, surface, _queue: queue })
     }
 }
@@ -117,8 +157,11 @@ impl WaylandActivator {
 impl Activate for WaylandActivator {
     fn activate(&self, token: &str) -> bool {
         self.activation.activate(token.to_owned(), &self.surface);
-        match self.conn.flush() {
+        // (Not sent within the time, the socket full: queued all the same,
+        // it goes with winit's next flush.)
+        match flush_by(&self.conn, Instant::now() + Duration::from_millis(500), &AtomicBool::new(false)) {
             Ok(()) => true,
+            Err(e) if e.contains("in time") => true,
             Err(e) => {
                 log::warn!("activating the window: {e}");
                 false

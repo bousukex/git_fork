@@ -6,7 +6,12 @@
 //! in front of egui's bundled fonts, which stay as the last-resort fallback
 //! for emoji and symbols.
 
-use std::{path::PathBuf, process::Command, sync::Arc};
+use std::{
+    path::PathBuf,
+    process::Command,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use egui::{
     FontData, FontDefinitions, FontFamily,
@@ -25,15 +30,70 @@ struct FcFont {
     monospace: bool,
 }
 
-fn fc_match(pattern: &str) -> Option<FcFont> {
-    let out = Command::new("fc-match")
-        .args(["-f", "%{file}\x1f%{index}\x1f%{family[0]}\x1f%{spacing}", pattern])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// Each question to fontconfig, and all of them at startup, within a time
+/// (it may hang on a broken cache or font): past it, egui's own fonts.
+const FC_MATCH_TIME: Duration = Duration::from_secs(2);
+const FC_MATCH_TOTAL: Duration = Duration::from_secs(6);
+
+/// Why the system's fonts weren't (all) used, if they weren't.
+static TROUBLE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn trouble() -> Option<String> {
+    TROUBLE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// (Tests that look at, or change, the reason: one at a time.)
+#[cfg(test)]
+pub(crate) static TROUBLE_TESTS: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn forget_trouble() {
+    *TROUBLE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Notes why (the first reason is kept).
+pub(crate) fn note_trouble(why: String) {
+    log::warn!("fonts: {why}");
+    TROUBLE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(why);
+}
+
+/// Asks fontconfig, with `program` (fc-match), each within `each` and all
+/// within `total` from the first: once one doesn't answer (or the time is
+/// up), no more are asked.
+fn fc_matcher(program: std::ffi::OsString, each: Duration, total: Duration) -> impl Fn(&str) -> Option<FcFont> {
+    let start = Instant::now();
+    let gave_up = Mutex::new(false);
+    move |pattern| {
+        let mut gave_up = gave_up.lock().unwrap_or_else(|e| e.into_inner());
+        if *gave_up {
+            return None;
+        }
+        let left = total.saturating_sub(start.elapsed()).min(each);
+        if left.is_zero() {
+            *gave_up = true;
+            note_trouble(format!("fontconfig took longer than {total:?} in all; egui's own fonts are used for the rest"));
+            return None;
+        }
+        let mut cmd = Command::new(&program);
+        cmd.args(["-f", "%{file}\x1f%{index}\x1f%{family[0]}\x1f%{spacing}", pattern]);
+        let out = match pengitto_core::bounded::run(cmd, left) {
+            Ok(out) => out,
+            Err(e) => {
+                *gave_up = true;
+                note_trouble(format!("{e}; egui's own fonts are used"));
+                return None;
+            }
+        };
+        if !out.status.success() || !out.complete {
+            note_trouble(format!("fc-match {pattern} failed ({})", out.status));
+            return None;
+        }
+        let found = parse_fc_match(&out.stdout_text());
+        if found.is_none() {
+            note_trouble(format!("fc-match {pattern} told no font file there is: {:?}", out.stdout_text()));
+        }
+        found
     }
-    parse_fc_match(&String::from_utf8_lossy(&out.stdout))
 }
 
 fn parse_fc_match(s: &str) -> Option<FcFont> {
@@ -97,7 +157,7 @@ fn with_chars(chars: &str) -> String {
 
 /// Builds font definitions with system fonts in front of egui's defaults.
 pub fn definitions() -> FontDefinitions {
-    definitions_from(&fc_match)
+    definitions_from(&fc_matcher("fc-match".into(), FC_MATCH_TIME, FC_MATCH_TOTAL))
 }
 
 /// The same, with the fonts `lookup` finds for fontconfig patterns.
@@ -191,6 +251,66 @@ mod tests {
         assert!(!f.monospace);
         let m = parse_fc_match(&format!("{path}\x1f0\x1fHack\x1f100")).unwrap();
         assert!(m.monospace);
+    }
+
+    /// A script at `path` (written by a child: no file of this process is
+    /// left open for writing when other tests' threads fork).
+    fn script(path: &std::path::Path, body: &str) {
+        let ok = Command::new("sh")
+            .args(["-c", "printf '#!/bin/sh\\n%s\\n' \"$2\" > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    }
+
+    #[test]
+    fn fontconfig_that_doesnt_answer_is_given_up_on() {
+        let _one = TROUBLE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let font = dir.path().join("a.ttf");
+        std::fs::write(&font, "").unwrap();
+        let answering = dir.path().join("answering");
+        script(&answering, &format!("printf '%s\\037%s\\037%s\\037' '{}' 0 A", font.display()));
+        let lookup = fc_matcher(answering.into(), Duration::from_secs(5), Duration::from_secs(10));
+        assert_eq!(lookup("sans-serif").map(|f| f.family), Some("A".into()));
+        // One hangs: given up on within its time, none asked after it.
+        let hanging = dir.path().join("hanging");
+        script(&hanging, "exec sleep 30");
+        forget_trouble();
+        let lookup = fc_matcher(hanging.into(), Duration::from_millis(300), Duration::from_secs(10));
+        let t = Instant::now();
+        assert!(lookup("sans-serif").is_none() && lookup("monospace").is_none() && lookup("x").is_none());
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(trouble().is_some_and(|t| t.contains("didn't answer")), "{:?}", trouble());
+        // All of them within the total: each slow one gets what is left.
+        let slow = dir.path().join("slow");
+        script(&slow, &format!("sleep 0.3; printf '%s\\037%s\\037%s\\037' '{}' 0 A", font.display()));
+        forget_trouble();
+        let lookup = fc_matcher(slow.into(), Duration::from_secs(5), Duration::from_millis(800));
+        let t = Instant::now();
+        let found = (0..10).filter(|_| lookup("p").is_some()).count();
+        assert!((1..10).contains(&found), "{found}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(trouble().is_some_and(|t| t.contains("in all") || t.contains("didn't answer")), "{:?}", trouble());
+        // No time left for it at all: noted.
+        forget_trouble();
+        let answering = dir.path().join("answering");
+        assert!(fc_matcher(answering.into(), Duration::from_secs(5), Duration::ZERO)("sans-serif").is_none());
+        assert!(trouble().is_some_and(|t| t.contains("in all")), "{:?}", trouble());
+        // Failing, or telling of no file: noted too (the first reason).
+        forget_trouble();
+        let failing = dir.path().join("failing");
+        script(&failing, "echo broken >&2; exit 1");
+        assert!(fc_matcher(failing.into(), Duration::from_secs(5), Duration::from_secs(10))("sans-serif").is_none());
+        assert!(trouble().is_some_and(|t| t.contains("fc-match sans-serif failed")), "{:?}", trouble());
+        forget_trouble();
+        let nowhere = dir.path().join("nowhere");
+        script(&nowhere, "printf '%s\\037%s\\037%s\\037' /nonexistent.ttf 0 A");
+        assert!(fc_matcher(nowhere.into(), Duration::from_secs(5), Duration::from_secs(10))("monospace").is_none());
+        assert!(trouble().is_some_and(|t| t.contains("no font file")), "{:?}", trouble());
+        forget_trouble();
     }
 
     #[test]

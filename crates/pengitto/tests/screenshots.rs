@@ -839,6 +839,62 @@ fn interactive_rebase_edit_stop() {
 
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
+fn setup_check() {
+    let _serial = serial();
+    // A fresh Kinoite: nobody to commit as, no credential helper (libsecret
+    // there to use), no Japanese font.
+    let dir = tempfile::tempdir().unwrap();
+    for d in ["home", "bin", "exec", "root/etc"] {
+        std::fs::create_dir_all(dir.path().join(d)).unwrap();
+    }
+    common::write_executable(&dir.path().join("bin/fc-list"), "#!/bin/sh\n");
+    common::write_executable(&dir.path().join("exec/git-credential-libsecret"), "#!/bin/sh\n");
+    std::fs::write(dir.path().join("root/etc/os-release"), "ID=fedora\nVARIANT_ID=kinoite\nPRETTY_NAME=\"Fedora Linux 44 (KDE Plasma Desktop Edition)\"\n").unwrap();
+    let var = |k: &str, v: std::path::PathBuf| (std::ffi::OsString::from(k), Some(v.into_os_string()));
+    let env = pengitto_core::setup::Env {
+        git: "git".into(),
+        vars: vec![
+            var("GIT_CONFIG_GLOBAL", dir.path().join("gitconfig")),
+            var("GIT_CONFIG_SYSTEM", dir.path().join("system")),
+            var("HOME", dir.path().join("home")),
+            (std::ffi::OsString::from("PATH"), Some(format!("{}:{}", dir.path().join("bin").display(), std::env::var("PATH").unwrap()).into())),
+            var("GIT_EXEC_PATH", dir.path().join("exec")),
+            (std::ffi::OsString::from("SSH_AUTH_SOCK"), None),
+        ],
+        home: dir.path().join("home"),
+        root: dir.path().join("root"),
+        container_var: None,
+        timeout: std::time::Duration::from_secs(5),
+    };
+    let checked = |h: &mut Harness<'_, pengitto::app::PengittoApp>| {
+        let start = std::time::Instant::now();
+        while h.state().setup_report().is_none() || h.state().setup_checking() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(15));
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        h.run_steps(3);
+    };
+    let options = || pengitto::app::AppOptions { setup: Some(env.clone()), ..Default::default() };
+    shoot("setup_welcome", [1100.0, 760.0], |cc| pengitto::app::PengittoApp::with_options(cc, vec![], None, options()), |h| checked(h));
+    shoot(
+        "setup_dialog",
+        [1100.0, 760.0],
+        |cc| pengitto::app::PengittoApp::with_options(cc, vec![], None, options()),
+        |h| {
+            checked(h);
+            h.get_by_label("Check Setup…").hover();
+            h.step();
+            h.get_by_label("Check Setup…").click();
+            h.run_steps(2);
+            checked(h);
+            h.run_steps(4);
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
 fn about_and_quitting() {
     let _serial = serial();
     shoot(

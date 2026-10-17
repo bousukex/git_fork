@@ -147,7 +147,7 @@ fn credentials_through(program: &Path) {
 }
 
 #[test]
-#[ignore = "builds the AppImage; needs the pinned AppImage tools"]
+#[ignore = "builds the AppImage; needs the pinned AppImage tools, and FUSE (fusermount3, /dev/fuse)"]
 fn the_appimage_runs_pengitto_and_its_helpers() {
     let dir = tempfile::tempdir().unwrap();
     let image = appimage(dir.path());
@@ -274,6 +274,62 @@ fn the_appimage_runs_pengitto_and_its_helpers() {
     let installed = home.path().join(".local/bin/pengitto");
     assert_eq!(std::fs::read(&installed).unwrap(), std::fs::read(&image).unwrap());
     assert!(ok(Command::new(&installed).arg("--version").output().unwrap()).starts_with("pengitto "));
+    // It registers itself (M7c): mounted, the menu runs the copy as it is;
+    // without FUSE, extracting itself. Either way that runs with nothing of
+    // the installation's environment.
+    let desktop = data.join("applications/pengitto.desktop");
+    // (Extracting, into this test's folder; mounted, where the runtime
+    // mounts it: it unmounts as the program ends, a little after — a
+    // mount point here then would keep the folder from being removed.)
+    let manage = |args: &[&str], env: &[(&str, &std::ffi::OsStr)]| {
+        let mut c = Command::new(&image);
+        c.args(args).env("HOME", home.path()).env("XDG_DATA_HOME", &data);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        if env.iter().any(|(k, _)| *k == "APPIMAGE_EXTRACT_AND_RUN") {
+            c.env("TMPDIR", dir.path());
+        }
+        ok(c.output().unwrap())
+    };
+    let launched = |extracting: bool| {
+        let words = exec_words(&std::fs::read_to_string(&desktop).unwrap());
+        let upto = words.iter().position(|w| w == "--").unwrap();
+        assert_eq!(words[upto..], ["--", "%F"]);
+        assert_eq!(words[0] == "env", extracting, "{words:?}");
+        let mut c = Command::new(&words[0]);
+        c.args(&words[1..upto]).arg("--version").env_clear().env("HOME", home.path()).env("PATH", "/usr/bin:/bin");
+        if extracting {
+            c.env("TMPDIR", dir.path());
+        }
+        ok(c.output().unwrap())
+    };
+    let out = manage(&["--install", "--force", "--no-integration"], &[]);
+    assert!(!out.contains("FUSE isn't usable"), "{out}");
+    assert_eq!(std::fs::read(&installed).unwrap(), std::fs::read(&image).unwrap());
+    assert!(launched(false).starts_with("pengitto "));
+    let nofuse = dir.path().join("nofuse");
+    std::fs::create_dir(&nofuse).unwrap();
+    for d in std::env::split_paths(&std::env::var_os("PATH").unwrap()) {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let n = e.file_name();
+            if n != "fusermount3" && n != "fusermount" && !nofuse.join(&n).exists() {
+                std::os::unix::fs::symlink(e.path(), nofuse.join(&n)).unwrap();
+            }
+        }
+    }
+    let out = manage(&["--install", "--no-integration"], &[("PATH", nofuse.as_os_str()), ("APPIMAGE_EXTRACT_AND_RUN", "1".as_ref())]);
+    assert!(out.contains("FUSE isn't usable"), "{out}");
+    assert!(launched(true).starts_with("pengitto "));
+    // Taken away by the image too.
+    manage(&["--uninstall"], &[]);
+    assert!(!installed.exists() && !desktop.exists());
+}
+
+/// The words of a desktop file's Exec (plain ones: quotes taken off).
+fn exec_words(desktop: &str) -> Vec<String> {
+    let exec = desktop.lines().find_map(|l| l.strip_prefix("Exec=")).unwrap();
+    exec.split(' ').map(|w| w.trim_matches('"').to_owned()).collect()
 }
 
 /// A repository of what the working tree has (committed or not, without

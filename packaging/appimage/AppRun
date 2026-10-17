@@ -1,0 +1,65 @@
+#!/bin/sh
+# Runs pengitto from the mounted (or extracted) image: it is its own helper
+# for git (it finds itself as /proc/<pid>/exe). As the first argument,
+# --install registers the AppImage with the desktop (a copy in ~/.local/bin,
+# its menu entry and icons), --uninstall takes that away again: with the
+# installation scripts it carries.
+here=$(dirname "$(readlink -f "$0")")
+
+usage() {
+    cat >&2 <<'USAGE'
+Usage: pengitto-<version>-x86_64.AppImage --install [--prefix DIR] [--force] [--no-integration]
+       pengitto-<version>-x86_64.AppImage --uninstall [--prefix DIR] [--force]
+USAGE
+    exit 2
+}
+
+# Whether the image can be mounted to run (else it extracts itself each
+# time it runs). (PENGITTO_FUSE_DEVICE: for tests, the device to try.)
+fuse_usable() {
+    [ "${APPIMAGE_EXTRACT_AND_RUN:-}" != 1 ] &&
+        command -v fusermount3 >/dev/null 2>&1 &&
+        (exec 3<>"${PENGITTO_FUSE_DEVICE:-/dev/fuse}") 2>/dev/null
+}
+
+manage() {
+    what=$1
+    shift
+    if [ -z "${APPIMAGE:-}" ]; then
+        echo "pengitto: $what is for the AppImage file: run it as pengitto-<version>-x86_64.AppImage $what" >&2
+        exit 2
+    fi
+    # Only these (whatever else is passed on to the scripts).
+    want=
+    for a; do
+        if [ -n "$want" ]; then
+            want=
+            continue
+        fi
+        case $a in
+            --prefix) want=1 ;;
+            --prefix=?* | --force) ;;
+            --no-integration) [ "$what" = --install ] || { echo "pengitto: $what doesn't take $a" >&2; usage; } ;;
+            *) echo "pengitto: $what doesn't take $a" >&2; usage ;;
+        esac
+    done
+    [ -z "$want" ] || { echo "pengitto: --prefix needs a folder" >&2; usage; }
+    scripts=$here/usr/share/pengitto/setup/scripts
+    if [ "$what" = --uninstall ]; then
+        exec sh "$scripts/uninstall.sh" "$@"
+    elif fuse_usable; then
+        exec sh "$scripts/install.sh" --binary "$APPIMAGE" --no-build "$@"
+    else
+        exec sh "$scripts/install.sh" --binary "$APPIMAGE" --no-build --extract-and-run "$@"
+    fi
+}
+
+case ${1:-} in
+    --install | --uninstall)
+        # (Never for git's helpers: pengitto run with these set.)
+        if [ -z "${PENGITTO_ASKPASS_SOCKET:-}${PENGITTO_REBASE_DIR:-}" ]; then
+            manage "$@"
+        fi
+        ;;
+esac
+exec "$here/usr/bin/pengitto" "$@"

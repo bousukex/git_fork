@@ -37,7 +37,10 @@ APPIMAGETOOL=/path/to/appimagetool APPIMAGE_RUNTIME=/path/to/runtime-x86_64 scri
 
 - appimagetool と runtime は版を固定しています（`packaging/appimage/tools.lock` の sha256 と一致するものだけを使います）。
 - ライブラリは同梱しません。動かすには、glibc 2.39 以上、Wayland か X11 と GPU（Vulkan か EGL）のライブラリ、git 2.43 以上、fontconfig が必要です。FUSE がない場合は `--appimage-extract-and-run` を付けて起動します（このとき展開した中身（約 35MB）が `/tmp` に残ります。版ごとに 1 つで、再起動すると消えます）。
-- AppImage をそのまま起動しただけでは、Wayland のタスクバーのアイコンは汎用のものになります。メニューとアイコンを付けるには `scripts/install.sh --binary pengitto-….AppImage` で登録します。
+- AppImage は自分自身を登録できます。`pengitto-….AppImage --install` で、`~/.local/bin/pengitto` に写し、メニュー・アイコン・ライセンスの一覧を置きます（中身は `scripts/install.sh` と同じです。`--prefix DIR`、`--force`、`--no-integration` も使えます）。外すには、AppImage でも、写した `~/.local/bin/pengitto` でも、`--uninstall` です。
+  - `--install` と `--uninstall` は最初の引数のときだけ効きます（`pengitto-….AppImage -- --install` は `--install` という名前のフォルダーを開きます）。
+  - FUSE が使えない環境（`fusermount3` がない、`/dev/fuse` を開けない、または `APPIMAGE_EXTRACT_AND_RUN=1` で動かした場合）で `--install` すると、メニューからは `APPIMAGE_EXTRACT_AND_RUN=1` を付けて起動するように登録し、そう表示します（展開した中身が `/tmp` に残るのは上と同じです）。
+- AppImage をそのまま起動しただけでは、Wayland のタスクバーのアイコンは汎用のものになります（`--install` で登録すると付きます）。
 - AppImage には runtime（type2-runtime、静的にリンクした libfuse（LGPL-2.1）など）が入っています。その通知は `packaging/APPIMAGE_NOTICES` にあります。他の人に配布する場合は、LGPL に従い runtime の対応するソースを示す必要があります。
 
 **RPM**（Fedora 向け。`target/rpm/`）
@@ -50,6 +53,41 @@ scripts/rpm.sh --dirty    # コミットしていない変更（追跡してい�
 - 依存するクレートを vendor してソースに入れるので、ビルドの間はネットワークを使いません。ソース RPM（`.src.rpm`）だけからも作り直せます（版は spec に書き込んであります）。
 - `sudo dnf install ./target/rpm/pengitto-*.x86_64.rpm` で入れます。
 
+## クリーンインストールの後に
+
+**通常の Fedora**（Workstation、KDE Plasma など）: RPM を入れます。git（`git-core`）などの依存は dnf が入れます。
+
+```bash
+sudo dnf install ./pengitto-*.x86_64.rpm
+```
+
+**atomic な Fedora**（Kinoite、Silverblue など。`/usr` は書き換えられません）: 次のどちらかです。
+- **ホストで AppImage を使う**（主な方法）: パッケージを重ねずに動きます（FUSE 3 で動くので、FUSE 2 は要りません）。git はホストに必要です。ない場合や、HTTPS の認証情報をキーリングに保存したい場合は、重ねてから再起動します。
+
+  ```bash
+  rpm-ostree install git-core git-credential-libsecret   # 必要なものだけ。その後に再起動
+  ./pengitto-*-x86_64.AppImage --install
+  ```
+
+- **distrobox の中で RPM を使う**: コンテナの中に git も入るので、ホストには何も重ねません。メニューへは `distrobox-export` で出します。
+
+  ```bash
+  distrobox create --name pengitto --image registry.fedoraproject.org/fedora-toolbox:44
+  distrobox enter pengitto
+  sudo dnf install ./pengitto-*.x86_64.rpm          # （コンテナの中で）
+  distrobox-export --app pengitto                   # （コンテナの中で）ホストのメニューに出す
+  ```
+
+  コンテナの中の pengitto とホストの pengitto は、別々に数えます（二重起動の防止は、それぞれの中だけで働きます）。
+
+**入れた後**: ☰ → **Check Setup…** で、足りないものを確かめられます。リポジトリを開いていないときの画面にも、足りないものだけを表示します。
+- git の有無と版、コミットする人（`user.name`・`user.email`。Settings → Git で設定できます）、HTTPS の認証情報の保存（credential helper）、SSH（ssh-agent と `~/.ssh` の鍵。情報だけ）、日本語のフォント、どこで動いているか（コンテナの中か、atomic か）。
+- 調べるのは、リポジトリの外での git の設定（system と global。include を含む）です。リポジトリごとの設定（`.git/config` や `includeIf`）があれば、そのリポジトリでは変わることがあります。
+- 足りないものには、入れ方を表示します（Fedora なら `dnf` か `rpm-ostree` のパッケージ名）。
+- credential helper がない場合は、「Use libsecret」で `credential.helper libsecret` を global の設定に加えられます（`git-credential-libsecret` がある場合だけ。押した時点で設定が変わっていれば、書かずに今の設定を表示します）。確かめるのは設定だけで、認証情報を git に問い合わせることはしません。
+
+**設定の引き継ぎ**: 最近使ったリポジトリや設定は `~/.local/share/pengitto/state.ron` にあります（ウィンドウの位置などは同じ場所の `app.ron`）。新しい環境の同じ場所に写せば引き継げます。
+
 **二つ起動した場合**: 動いている pengitto が、渡したリポジトリを開きます（同じデスクトップの中で 1 つ）。
 - 2 つ目は、動いている pengitto が依頼を受け取った時点で終わります。開くのは、動いている側の画面が動いたときです（最小化中でも開きます。画面が固まっている間に渡したものは、戻ってから開きます）。
 - メニューや Dolphin から起動すると、その起動のトークンで、動いているウィンドウを前に出すよう頼みます（Wayland の xdg-activation）。実際に前に出すかどうかは、デスクトップ（compositor）が決めます。端末から起動した場合（トークンがない場合）や X11 では、タスクバーで知らせるか、前に出すよう頼むだけです。
@@ -57,7 +95,9 @@ scripts/rpm.sh --dirty    # コミットしていない変更（追跡してい�
 - 別のウィンドウで動かしたいときは `--new-instance` を付けます。
 - 動いている pengitto が応答しない場合は、新しいウィンドウを開き、そのことを知らせます（設定は、後から保存した方の内容になります。ファイルは壊れません）。
 - 終了の確認中や、操作の停止を待っている間に起動すると、終了を取り止めて開きます。
+- 渡されたリポジトリを開き終えるまでは、閉じる操作をしても閉じません（開くのに時間がかかる場合でも、10 秒を過ぎれば閉じられます）。
 - 更新した後は、一度閉じてから起動し直してください（動いている古い版が開くため）。
+- ホストとコンテナ（distrobox など）の pengitto は、別々に数えます（コンテナの中のパスはホストで開けないことがあるため）。
 
 <!-- legacy-names:begin -->
 **以前の名前（Tine）からの移行**（0.2.0 で pengitto に名前を変えました）

@@ -15,6 +15,7 @@ pub mod ops_registry;
 pub mod probe;
 pub mod repo;
 pub mod selfcheck;
+pub mod setup;
 pub mod settings;
 pub mod shortcuts;
 pub mod state_file;

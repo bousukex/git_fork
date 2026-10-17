@@ -1,10 +1,6 @@
 //! Which git is there, and whether it is new enough for pengitto.
 
-use std::{
-    ffi::OsStr,
-    process::{Command, Stdio},
-    time::{Duration, Instant},
-};
+use std::{ffi::OsStr, process::Command, time::Duration};
 
 /// The oldest git pengitto works with (it relies on options of 2.43).
 pub const MIN_GIT: GitVersion = GitVersion(2, 43, 0);
@@ -37,59 +33,17 @@ pub fn parse(out: &str) -> Option<GitVersion> {
     Some(GitVersion(major, minor, patch))
 }
 
-/// Asks `program` (git) for its version, giving up after `timeout` — for
-/// the whole of it: its exit and its output (a wrapper may leave a process
-/// behind that holds the output open; what was written by then counts).
+/// Asks `program` (git) for its version, giving up after `timeout` (see
+/// [`crate::bounded`]).
 pub fn git_version(program: &OsStr, timeout: Duration) -> Result<GitVersion, String> {
-    use std::{io::Read as _, os::unix::process::CommandExt as _};
     let name = program.to_string_lossy();
-    let mut child = Command::new(program)
-        .arg("--version")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // Its own group: whatever it leaves behind is stopped with it.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("can't run {name}: {e}"))?;
-    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let mut stdout = child.stdout.take().expect("piped");
-    let sink = out.clone();
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 256];
-        while let Ok(n) = stdout.read(&mut chunk) {
-            if n == 0 {
-                break;
-            }
-            sink.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]);
-        }
-        let _ = done_tx.send(());
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break None,
-            Err(e) => return Err(e.to_string()),
-        }
-    };
-    // The output's end, within what is left of the time.
-    let finished = status.is_some() && done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok();
-    if !finished {
-        // SAFETY: a signal to the process group just made for it.
-        unsafe {
-            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-        }
-        let _ = child.wait();
+    let mut cmd = Command::new(program);
+    cmd.arg("--version").env("LC_ALL", "C");
+    let ran = crate::bounded::run(cmd, timeout).map_err(|e| e.to_string().replace(" didn't answer", " --version didn't answer"))?;
+    if !ran.status.success() {
+        return Err(format!("{name} --version failed ({})", ran.status));
     }
-    let Some(status) = status else { return Err(format!("{name} --version didn't answer in {timeout:?}")) };
-    if !status.success() {
-        return Err(format!("{name} --version failed ({status})"));
-    }
-    let out = String::from_utf8_lossy(&out.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    let out = ran.stdout_text();
     parse(&out).ok_or_else(|| format!("can't read the version in {:?}", out.trim()))
 }
 
@@ -104,6 +58,8 @@ pub fn git_problem(found: &Result<GitVersion, String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[test]

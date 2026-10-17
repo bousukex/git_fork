@@ -19,10 +19,13 @@ Usage: scripts/install.sh [OPTION]...
   --no-integration   don't refresh desktop caches
   --no-manifest      keep no record of what was installed (packages)
   --force            overwrite files pengitto didn't put there
+  --extract-and-run  (an AppImage, where FUSE isn't usable) run it by
+                     extracting itself each time: the menu entry sets
+                     APPIMAGE_EXTRACT_AND_RUN=1, and so do the checks here
 USAGE
 }
 
-prefix= binary= build=1 exec_path= integrate=1 manifest=1 force=0
+prefix= binary= build=1 exec_path= integrate=1 manifest=1 force=0 extract=0
 while [ $# -gt 0 ]; do
     case $1 in
         --prefix) prefix=${2:?--prefix needs a folder}; shift ;;
@@ -35,6 +38,7 @@ while [ $# -gt 0 ]; do
         --no-integration) integrate=0 ;;
         --no-manifest) manifest=0 ;;
         --force) force=1 ;;
+        --extract-and-run) extract=1 ;;
         -h | --help) usage; exit 0 ;;
         *) usage >&2; die "unknown option: $1" ;;
     esac
@@ -56,6 +60,29 @@ case $exec_path in
     *=* | *%*) die "a menu entry can't run a program whose path has '=' or '%' in it: $exec_path" ;;
 esac
 
+# Everything goes to a temporary file next to its place first (those left
+# over are removed whatever happens).
+work=$(mktemp -d "${TMPDIR:-/tmp}/pengitto-install.XXXXXX")
+: >"$work/staged"
+cleanup() {
+    while IFS= read -r t; do
+        rm -f "$t"
+    done <"$work/staged"
+    rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
+
+# Runs the executable as the menu entry will: an AppImage that extracts
+# itself does so into the work folder (removed after).
+run_it() {
+    if [ "$extract" = 1 ]; then
+        APPIMAGE_EXTRACT_AND_RUN=1 TMPDIR=$work "$@"
+    else
+        "$@"
+    fi
+}
+
 # The executable.
 if [ -z "$binary" ]; then
     binary=$root/target/release/pengitto
@@ -65,7 +92,7 @@ if [ -z "$binary" ]; then
     fi
 fi
 [ -f "$binary" ] || die "no executable at $binary (build it first: cargo build --release -p pengitto)"
-version=$("$binary" --version 2>/dev/null) || version=
+version=$(run_it "$binary" --version 2>/dev/null) || version=
 case $version in
     "pengitto "*) ;;
     *) die "$binary doesn't start here (needs glibc 2.39 or newer)" ;;
@@ -97,18 +124,6 @@ if [ "$manifest" = 1 ]; then
     lock
 fi
 
-# Everything goes to a temporary file next to its place first (those left
-# over are removed whatever happens).
-work=$(mktemp -d "${TMPDIR:-/tmp}/pengitto-install.XXXXXX")
-: >"$work/staged"
-cleanup() {
-    while IFS= read -r t; do
-        rm -f "$t"
-    done <"$work/staged"
-    rm -rf "$work"
-}
-trap cleanup EXIT
-trap 'exit 1' INT TERM HUP
 list=$work/list
 : >"$list"
 
@@ -125,14 +140,19 @@ stage() {
 stage "$binary" "$BIN/pengitto" 755
 # The copy to be installed checks itself (git, its helpers) as it will run.
 # (Not in a package's build, which needn't have git.)
-if [ "$manifest" = 1 ] && ! "$tmp" --self-check >"$work/self-check" 2>&1; then
+if [ "$manifest" = 1 ] && ! run_it "$tmp" --self-check >"$work/self-check" 2>&1; then
     die "$binary doesn't work here (its self-check failed); nothing was installed:$nl$(cat "$work/self-check")"
 fi
 desktop=$work/pengitto.desktop
 # The path as the Exec key wants it: quoted (\, ", `, $ escaped; % doubled),
-# then as a string value (\ doubled again).
+# then as a string value (\ doubled again). (Extracting itself: run through
+# env, which sets the variable.)
 quoted=$(printf '%s' "$exec_path" | sed -e 's/[\\"`$]/\\&/g' -e 's/%/%%/g')
-PENGITTO_EXEC=$(printf '"%s"' "$quoted" | sed -e 's/\\/\\\\/g') \
+launcher=
+if [ "$extract" = 1 ]; then
+    launcher="env APPIMAGE_EXTRACT_AND_RUN=1 "
+fi
+PENGITTO_EXEC=$launcher$(printf '"%s"' "$quoted" | sed -e 's/\\/\\\\/g') \
     awk '{ if ($0 == "Exec=@EXEC@ -- %F") print "Exec=" ENVIRON["PENGITTO_EXEC"] " -- %F"; else print }' \
     "$root/packaging/pengitto.desktop.in" >"$desktop"
 if command -v desktop-file-validate >/dev/null 2>&1; then
@@ -260,6 +280,9 @@ if [ "$integrate" = 1 ]; then
 fi
 
 say "Installed $version:$placed"
+if [ "$extract" = 1 ]; then
+    say "Note: FUSE isn't usable here, so it runs by extracting itself each time (what it extracts stays in ${TMPDIR:-/tmp}, about 35 MB for each version)."
+fi
 case ":$PATH:" in
     *":$BIN:"*) ;;
     *) say "Note: $BIN isn't on your PATH (the menu entry works anyway)." ;;

@@ -43,14 +43,18 @@ install -m 644 "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$root/packaging/THIRD
 cp "$app/usr/share/applications/pengitto.desktop" "$app/pengitto.desktop"
 cp "$root/packaging/icons/hicolor/256x256/apps/pengitto.png" "$app/pengitto.png"
 ln -s pengitto.png "$app/.DirIcon"
-cat >"$app/AppRun" <<'APPRUN'
-#!/bin/sh
-# Runs pengitto from the mounted image (it is its own helper for git: it finds
-# itself as /proc/<pid>/exe).
-here=$(dirname "$(readlink -f "$0")")
-exec "$here/usr/bin/pengitto" "$@"
-APPRUN
-chmod 755 "$app/AppRun"
+install -m 755 "$root/packaging/appimage/AppRun" "$app/AppRun"
+# What --install and --uninstall run (laid out as in the repository; the
+# icons and licenses are the image's own).
+setup=$app/usr/share/pengitto/setup
+mkdir -p "$setup/scripts/lib" "$setup/packaging"
+install -m 644 "$root/scripts/install.sh" "$root/scripts/uninstall.sh" "$setup/scripts/"
+install -m 644 "$root/scripts/lib/common.sh" "$setup/scripts/lib/"
+install -m 644 "$root/packaging/pengitto.desktop.in" "$setup/packaging/"
+ln -s ../../../icons "$setup/packaging/icons"
+ln -s ../../../doc/pengitto/THIRD_PARTY_LICENSES "$setup/packaging/THIRD_PARTY_LICENSES"
+ln -s ../../doc/pengitto/LICENSE-MIT "$setup/LICENSE-MIT"
+ln -s ../../doc/pengitto/LICENSE-APACHE "$setup/LICENSE-APACHE"
 mkdir -p "$out"
 if [ "$appdir_only" = 1 ]; then
     rm -rf "$out/pengitto.AppDir"

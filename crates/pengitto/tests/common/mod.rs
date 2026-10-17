@@ -152,3 +152,19 @@ pub fn former_rebase_names() -> (String, String) {
     let mark = names(&from.join("rebase-merge")).pop().unwrap();
     (folder, mark)
 }
+
+/// Writes an executable script without this process ever holding it open
+/// for writing (a child process writes it): a process another test thread
+/// forks meanwhile would keep it open until it execs, and running the
+/// script then fails with "Text file busy".
+pub fn write_executable(path: &std::path::Path, body: &str) {
+    use std::io::Write as _;
+    let mut child = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success());
+}

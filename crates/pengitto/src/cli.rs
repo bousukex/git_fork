@@ -49,7 +49,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 Some("--new-instance") => alone = true,
                 // (The AppImage's AppRun takes these before pengitto runs.)
                 Some(o @ ("--install" | "--uninstall")) => {
-                    return Err(format!("{o} is for the AppImage (pengitto-<version>-x86_64.AppImage {o})"));
+                    return Err(format!("{o} is for the AppImage, as its first argument (pengitto-<version>-x86_64.AppImage {o})"));
                 }
                 _ => return Err(format!("unknown option: {}", arg.to_string_lossy())),
             }

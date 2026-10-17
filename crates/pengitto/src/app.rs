@@ -66,6 +66,9 @@ pub struct AppOptions {
     pub make_activator: Option<MakeActivator>,
     /// Told when the app starts.
     pub notices: Vec<String>,
+    /// Where the Setup check looks, checking at startup (its problems on
+    /// the welcome screen); `None`: the process's own, only when asked.
+    pub setup: Option<pengitto_core::setup::Env>,
 }
 
 impl Default for AppOptions {
@@ -79,6 +82,7 @@ impl Default for AppOptions {
             notices: Vec::new(),
             launch_token: None,
             make_activator: None,
+            setup: None,
         }
     }
 }
@@ -170,6 +174,7 @@ pub struct PengittoApp {
     git_version: Option<Result<pengitto_core::version::GitVersion, String>>,
     git_check: Option<Receiver<Result<pengitto_core::version::GitVersion, String>>>,
     about: Option<About>,
+    setup: crate::setup::Setup,
     /// The settings dialog is open.
     settings_open: bool,
     settings_ui: ui::settings::SettingsUi,
@@ -216,7 +221,15 @@ fn still_there(paths: &pengitto_core::RepoPaths) -> Result<(), String> {
 struct Opening {
     path: PathBuf,
     rx: Receiver<anyhow::Result<pengitto_core::CliReader>>,
+    /// Asked for by another pengitto (it keeps the window from closing
+    /// meanwhile, for a while), since when.
+    requested: Option<std::time::Instant>,
 }
+
+/// How long a repository another pengitto asked for keeps the window from
+/// closing while it is found (a file system that doesn't answer mustn't
+/// keep it open for good).
+const REQUESTED_OPENING_HOLDS: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// F12 overlay with frame timing and memory, for checking performance.
 #[derive(Default)]
@@ -300,6 +313,12 @@ impl PengittoApp {
             });
             rx
         };
+        let mut setup = crate::setup::Setup::new(
+            options.setup.clone().unwrap_or_else(|| pengitto_core::setup::Env::from_process(options.git.clone().into())),
+        );
+        if options.setup.is_some() {
+            setup.check(&cc.egui_ctx);
+        }
         let mut app =
             PengittoApp {
             tabs: Vec::new(),
@@ -324,6 +343,7 @@ impl PengittoApp {
             git_version: None,
             git_check: Some(git_check),
             about: None,
+            setup,
             settings_open: false,
             settings_ui: Default::default(),
             opening: Vec::new(),
@@ -398,7 +418,21 @@ impl PengittoApp {
             let _ = tx.send(pengitto_core::CliReader::open(&p));
             c.request_repaint();
         });
-        self.opening.push(Opening { path: path.to_path_buf(), rx });
+        self.opening.push(Opening { path: path.to_path_buf(), rx, requested: None });
+    }
+
+    /// Opens what another pengitto asked for: until it is found, the
+    /// window doesn't close.
+    fn open_requested(&mut self, path: &Path, ctx: &egui::Context) {
+        self.open(path, ctx);
+        if let Some(o) = self.opening.iter_mut().find(|o| o.path == path) {
+            o.requested.get_or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// Repositories other pengittos asked for, still being found.
+    fn requested_openings(&self) -> bool {
+        self.opening.iter().any(|o| o.requested.is_some_and(|t| t.elapsed() < REQUESTED_OPENING_HOLDS))
     }
 
     /// Adds repositories whose discovery finished, in the order requested.
@@ -603,7 +637,8 @@ impl PengittoApp {
     /// was asked already: then this one stays and does it.
     fn others_let_it_close(&mut self, ctx: &egui::Context) -> bool {
         let Some(link) = self.options.instance.clone() else { return true };
-        if self.asked_this_frame {
+        // (What was asked is done once its repository is open.)
+        if self.asked_this_frame || self.requested_openings() {
             return false;
         }
         let late = link.begin_closing();
@@ -628,6 +663,8 @@ impl PengittoApp {
     /// while the window is hidden, when the UI doesn't run.)
     fn serve_others(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         self.asked_this_frame = false;
+        // Repositories found meanwhile become tabs (their UI not running).
+        self.poll_opening(ctx);
         if self.activation.is_none() {
             self.start_activation(ctx, frame);
         }
@@ -647,7 +684,7 @@ impl PengittoApp {
         self.asked_this_frame |= !requests.is_empty();
         for r in requests {
             for p in &r.paths {
-                self.open(p, ctx);
+                self.open_requested(p, ctx);
             }
             // Activated by the thread that took it when it could be (a
             // token, the activator made, the request sent); else asked for
@@ -1051,8 +1088,9 @@ impl PengittoApp {
         if tab_modal.is_some() || quitting {
             self.settings_open = false;
             self.about = None;
+            self.setup.open = false;
         }
-        if tab_modal.is_some() || self.settings_open || quitting || self.about.is_some() {
+        if tab_modal.is_some() || self.settings_open || quitting || self.about.is_some() || self.setup.open {
             self.quick = None;
         }
         // Quitting comes first: what it asks hides everything else.
@@ -1062,6 +1100,8 @@ impl PengittoApp {
             (input::Layer::Prompt, p.id)
         } else if self.about.is_some() {
             (input::Layer::Dialog, ABOUT_TOKEN)
+        } else if self.setup.open {
+            (input::Layer::Dialog, SETUP_TOKEN)
         } else if let Some(token) = tab_modal {
             (input::Layer::Dialog, token)
         } else if self.settings_open {
@@ -1133,6 +1173,39 @@ impl PengittoApp {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// The Setup dialog, checked again as it opens.
+    pub fn open_setup(&mut self) {
+        self.quick = None;
+        self.about = None;
+        self.setup.open = true;
+        self.setup.check(&self.ctx);
+    }
+
+    pub fn setup_open(&self) -> bool {
+        self.setup.open
+    }
+
+    /// A Setup check is under way.
+    pub fn setup_checking(&self) -> bool {
+        self.setup.checking()
+    }
+
+    pub fn settings_page(&self) -> ui::settings::Page {
+        self.settings_ui.page
+    }
+
+    /// The Setup check's findings (`None` until the first is done).
+    pub fn setup_report(&self) -> Option<&pengitto_core::setup::Report> {
+        self.setup.report()
+    }
+
+    fn setup_dialog(&mut self, ctx: &egui::Context) {
+        if self.setup.show(ctx) == Some(pengitto_core::setup::Action::GitSettings) {
+            self.settings_ui.page = ui::settings::Page::Git;
+            self.open_settings();
         }
     }
 
@@ -1296,6 +1369,10 @@ impl PengittoApp {
                         self.open_settings();
                         ui.close();
                     }
+                    if ui.button("Check Setup…").clicked() {
+                        self.open_setup();
+                        ui.close();
+                    }
                     if ui.button("About pengitto").clicked() {
                         self.about = Some(About::default());
                         ui.close();
@@ -1389,6 +1466,24 @@ impl PengittoApp {
                 ui.add_space(8.0);
                 ui.label(RichText::new(e).color(p.status_deleted));
             }
+            // What this system lacks (checked at startup).
+            let problems = self.setup.problems();
+            if !problems.is_empty() {
+                ui.add_space(16.0);
+                let mut check = false;
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(520.0);
+                    ui.label(RichText::new("Setup: something to look at").strong());
+                    for r in &problems {
+                        let mark = if r.status == pengitto_core::setup::Status::Problem { "!" } else { "?" };
+                        ui.add(egui::Label::new(format!("{mark} {}: {}", r.what, r.text)).wrap());
+                    }
+                    check = ui.button("Check Setup…").clicked();
+                });
+                if check {
+                    self.open_setup();
+                }
+            }
             if !self.state.recent.is_empty() {
                 ui.add_space(20.0);
                 ui.label(RichText::new("Recent").small().strong().color(p.text_weak));
@@ -1449,6 +1544,8 @@ fn error_banner(ui: &mut egui::Ui, tab: &mut RepoTab) {
 const QUIT_TOKEN: u64 = u64::MAX;
 /// The input owner token of the About dialog.
 const ABOUT_TOKEN: u64 = u64::MAX - 1;
+/// The Setup dialog's.
+const SETUP_TOKEN: u64 = u64::MAX - 2;
 
 /// One line per operation queued or running, anywhere.
 fn running_operations() -> Vec<String> {
@@ -1546,7 +1643,6 @@ impl eframe::App for PengittoApp {
         let ctx = ui.ctx().clone();
         let p = Palette::of(&ctx);
         input::begin_frame(&ctx);
-        self.poll_opening(&ctx);
         self.debug.record(frame.info().cpu_usage);
         self.debug.show(&ctx, self.tabs.get(self.active));
         if let Some(rx) = &self.picker
@@ -1570,6 +1666,7 @@ impl eframe::App for PengittoApp {
                 self.state.messages.push(m);
             }
         }
+        self.setup.poll(&ctx);
         if let Some(rx) = &self.git_check
             && let Ok(found) = rx.try_recv()
         {
@@ -1655,6 +1752,7 @@ impl eframe::App for PengittoApp {
                 ui::settings::show(&ctx, &mut self.state.settings, &mut self.state.tools, &mut self.settings_ui, &mut self.settings_open);
                 self.quick_launch_frame(&ctx);
                 self.about_dialog(&ctx);
+                self.setup_dialog(&ctx);
             }
             // (Operations of closed tabs may still run when quitting.)
             self.quit_dialog(&ctx);
@@ -1733,6 +1831,7 @@ impl eframe::App for PengittoApp {
             }
             self.quick_launch_frame(&ctx);
             self.about_dialog(&ctx);
+            self.setup_dialog(&ctx);
         }
         // A tab whose unsaved changes were given up so it could close.
         if let Some(i) = self.tabs.iter().position(|t| t.close_requested) {

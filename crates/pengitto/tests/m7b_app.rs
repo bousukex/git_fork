@@ -238,13 +238,56 @@ fn what_is_asked_is_done_while_the_window_is_hidden() {
     let sent = hidden_logic(&mut h, true);
     assert!(sent.contains(&egui::ViewportCommand::CancelClose), "{sent:?}");
     assert_eq!(r.primary.link.state(), State::Ready);
+    // Both opened, the UI never running.
+    hidden_until(&mut h, "both open", |h| h.state().tab_count() == 2);
     // Closed again with nothing asked: closing.
     let sent = hidden_logic(&mut h, true);
     assert!(!sent.contains(&egui::ViewportCommand::CancelClose), "{sent:?}");
     assert_eq!(r.primary.link.state(), State::Closing);
     assert_eq!(ask(&r, &[&a]), Reply::Closing);
-    // Both opened once the UI runs.
-    until(&mut h, "both open", |h| h.state().tab_count() == 2);
+}
+
+/// Runs the hidden logic until `done` (never the UI).
+fn hidden_until(h: &mut Harness<'static, PengittoApp>, what: &str, mut done: impl FnMut(&mut Harness<'static, PengittoApp>) -> bool) {
+    let start = Instant::now();
+    while !done(h) {
+        assert!(start.elapsed() < Duration::from_secs(15), "never: {what}");
+        hidden_logic(h, false);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_repository_asked_for_keeps_the_window_open_until_it_is_found() {
+    let _t = turn();
+    let r = running();
+    let (_a, a) = repo("alpha");
+    // Its discovery waits: git reads its configuration, which includes a
+    // FIFO (opening it waits for a writer).
+    let gate = a.parent().unwrap().join("gate");
+    let made = std::process::Command::new("mkfifo").arg(&gate).status().unwrap();
+    assert!(made.success());
+    let config = a.join(".git/config");
+    let before = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{before}[include]\n\tpath = {}\n", gate.display())).unwrap();
+    let mut h = harness(&r);
+    assert_eq!(ask(&r, &[&a]), Reply::Accepted);
+    hidden_logic(&mut h, false);
+    // Closed while it is found: it stays (whatever the frames meanwhile).
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(100));
+        let sent = hidden_logic(&mut h, true);
+        assert!(sent.contains(&egui::ViewportCommand::CancelClose), "{sent:?}");
+    }
+    assert_eq!((h.state().tab_count(), r.primary.link.state()), (0, State::Ready));
+    // Found (the gate let go, the include gone for what git runs next): a
+    // tab, the UI never running; then it may close.
+    std::fs::write(&config, before).unwrap();
+    drop(std::fs::OpenOptions::new().write(true).open(&gate).unwrap());
+    hidden_until(&mut h, "opened", |h| h.state().tab_count() == 1);
+    let sent = hidden_logic(&mut h, true);
+    assert!(!sent.contains(&egui::ViewportCommand::CancelClose), "{sent:?}");
+    assert_eq!(r.primary.link.state(), State::Closing);
 }
 
 /// An activator that records what it was asked, and whether it was dropped.

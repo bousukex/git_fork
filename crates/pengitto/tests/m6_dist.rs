@@ -21,9 +21,14 @@ fn text(o: &[u8]) -> String {
     String::from_utf8_lossy(o).into_owned()
 }
 
+/// Writes an executable script — through a child process, so that no file
+/// of this one is open for writing when another test's thread forks (it
+/// would stay open in the child until it execs: "Text file busy").
 fn executable(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    use std::io::Write as _;
+    let mut child = Command::new("sh").args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"]).arg(path).stdin(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success());
 }
 
 // --- The command line and the self-check -----------------------------------
@@ -43,7 +48,7 @@ fn options_without_a_window() {
     for opt in ["--install", "--uninstall"] {
         let o = run(&[opt]);
         assert_eq!(o.status.code(), Some(2));
-        assert!(text(&o.stderr).contains(&format!("{opt} is for the AppImage")), "{}", text(&o.stderr));
+        assert!(text(&o.stderr).contains(&format!("{opt} is for the AppImage, as its first argument")), "{}", text(&o.stderr));
     }
     // Asked for credentials by git: a prompt that looks like an option is
     // still a prompt (here the app isn't there to answer it).
@@ -299,6 +304,17 @@ fn the_appimage_folder_and_its_pinned_tools() {
         assert!(app.join(format!("usr/share/icons/hicolor/{n}x{n}/apps/pengitto.png")).is_file());
     }
     assert!(!app.join("usr/lib").exists(), "no libraries bundled");
+    // What --install and --uninstall run: the scripts, the icons and
+    // licenses the image has (M7c).
+    let setup = app.join("usr/share/pengitto/setup");
+    for f in ["scripts/install.sh", "scripts/uninstall.sh", "scripts/lib/common.sh", "packaging/pengitto.desktop.in", "LICENSE-MIT", "LICENSE-APACHE", "packaging/THIRD_PARTY_LICENSES"] {
+        assert!(setup.join(f).is_file(), "{f}");
+    }
+    for n in ICON_SIZES {
+        let icon = setup.join(format!("packaging/icons/hicolor/{n}x{n}/apps/pengitto.png"));
+        assert_eq!(std::fs::read(&icon).unwrap(), std::fs::read(app.join(format!("usr/share/icons/hicolor/{n}x{n}/apps/pengitto.png"))).unwrap());
+    }
+    assert_eq!(std::fs::read(app.join("AppRun")).unwrap(), std::fs::read(root().join("packaging/appimage/AppRun")).unwrap());
     let desktop = std::fs::read_to_string(app.join("pengitto.desktop")).unwrap();
     assert_eq!(exec_argv(&desktop), ["pengitto", "--", "%F"]);
     // Tools that aren't the pinned ones: refused, saying where to get them.
@@ -340,11 +356,16 @@ impl Home {
     }
 
     fn command(&self, script: &str, args: &[&str], env: &[(&str, &Path)]) -> Command {
-        let path = format!("{}:{}", self.path("fakebin").display(), std::env::var("PATH").unwrap());
         let mut c = Command::new("sh");
-        c.arg(root().join("scripts").join(script))
-            .args(args)
-            .env("HOME", self.path("home"))
+        c.arg(root().join("scripts").join(script)).args(args);
+        self.with_env(&mut c, env);
+        c
+    }
+
+    /// This home's environment (and `env`) for `c`.
+    fn with_env(&self, c: &mut Command, env: &[(&str, &Path)]) {
+        let path = format!("{}:{}", self.path("fakebin").display(), std::env::var("PATH").unwrap());
+        c.env("HOME", self.path("home"))
             .env("XDG_DATA_HOME", self.data())
             .env("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
             .env("PATH", path)
@@ -352,7 +373,6 @@ impl Home {
         for (k, v) in env {
             c.env(k, v);
         }
-        c
     }
 
     fn run_with(&self, script: &str, args: &[&str], env: &[(&str, &Path)]) -> Output {
@@ -996,4 +1016,203 @@ fn a_former_installation_that_comes_later_is_waited_for_too() {
     holder.wait().unwrap();
     ok_out(finished(i));
     assert!(former.files.iter().all(|f| !f.exists()));
+}
+
+// --- The AppImage installing itself (M7c) ------------------------------------
+
+/// An AppImage's folder around a stand-in pengitto that notes how it was run
+/// (`args`), and a stand-in for the AppImage file itself (what is
+/// installed): it notes how its checks were run (`checks`). Whether FUSE is
+/// usable is the test's (whatever the machine has): a stand-in fusermount3
+/// on PATH (`fusebin`, else none: `nofuse` is PATH without one) and a
+/// device to try (`device`).
+struct Image {
+    home: Home,
+}
+
+/// A stand-in AppImage file of `version`, at `path`.
+fn fake_image(path: &Path, version: &str, checks: &Path) {
+    executable(
+        path,
+        &format!(
+            "#!/bin/sh\ncase $1 in\n--version) echo 'pengitto {version}' ;;\n--self-check) echo \"${{APPIMAGE_EXTRACT_AND_RUN:-}} $TMPDIR\" >> '{}'; echo fine ;;\nesac\n",
+            checks.display()
+        ),
+    );
+}
+
+impl Image {
+    fn new() -> Image {
+        let home = Home::new();
+        let inside = home.path("inside-pengitto");
+        fake_pengitto(&inside, "9.9.9", &format!("printf '%s\\n' \"$@\" > '{}'", home.path("args").display()));
+        let o = Command::new("sh")
+            .arg(root().join("scripts/appimage.sh"))
+            .args(["--appdir-only", "--binary"])
+            .arg(&inside)
+            .arg("--out")
+            .arg(home.dir.path())
+            .env("TMPDIR", home.dir.path())
+            .output()
+            .unwrap();
+        ok(&o);
+        fake_image(&home.path("pengitto.AppImage"), "9.9.9", &home.path("checks"));
+        std::fs::create_dir_all(home.path("fusebin")).unwrap();
+        executable(&home.path("fusebin/fusermount3"), "#!/bin/sh\nexit 0\n");
+        std::fs::write(home.path("device"), "").unwrap();
+        path_without_fuse(&home.path("nofuse"));
+        Image { home }
+    }
+
+    /// PATH with a stand-in fusermount3, or without any.
+    fn path(&self, fuse: bool) -> String {
+        let h = &self.home;
+        let fusebin = if fuse { format!("{}:", h.path("fusebin").display()) } else { String::new() };
+        format!("{}:{fusebin}{}", h.path("fakebin").display(), h.path("nofuse").display())
+    }
+
+    /// The AppDir's AppRun, as the runtime runs it (`APPIMAGE` set): FUSE
+    /// usable (unless `env` says otherwise).
+    fn run(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
+        self.run_image(&self.home.path("pengitto.AppImage"), args, env)
+    }
+
+    fn run_image(&self, image: &Path, args: &[&str], env: &[(&str, &Path)]) -> Output {
+        let mut c = Command::new(self.home.path("pengitto.AppDir/AppRun"));
+        c.args(args).env("APPIMAGE", image);
+        let (path, device) = (self.path(true), self.home.path("device"));
+        let mut all: Vec<(&str, &Path)> = vec![("PATH", Path::new(&path)), ("PENGITTO_FUSE_DEVICE", &device)];
+        all.extend(env);
+        self.home.with_env(&mut c, &all);
+        c.output().unwrap()
+    }
+
+    fn args(&self) -> Vec<String> {
+        std::fs::read_to_string(self.home.path("args")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    fn desktop(&self) -> String {
+        std::fs::read_to_string(self.home.data().join("applications/pengitto.desktop")).unwrap()
+    }
+}
+
+/// A PATH like the real one, without FUSE's helpers.
+fn path_without_fuse(dir: &Path) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    for d in std::env::split_paths(&std::env::var_os("PATH").unwrap()) {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            if name == "fusermount3" || name == "fusermount" || dir.join(&name).exists() {
+                continue;
+            }
+            let _ = std::os::unix::fs::symlink(e.path(), dir.join(&name));
+        }
+    }
+    dir.display().to_string()
+}
+
+/// Runs what a menu entry's Exec runs up to `--`, with `--version`, in an
+/// environment with nothing of the installation's.
+fn launched_version(desktop: &str, home: &Path) -> Output {
+    let argv = exec_argv(desktop);
+    let upto = argv.iter().position(|a| a == "--").unwrap();
+    assert_eq!(argv[upto + 1..], ["%F"]);
+    Command::new(&argv[0]).args(&argv[1..upto]).arg("--version").env_clear().env("HOME", home).env("PATH", "/usr/bin:/bin").output().unwrap()
+}
+
+#[test]
+fn the_appimage_installs_itself_with_fuse_or_without() {
+    let i = Image::new();
+    let h = &i.home;
+    let bin = h.path("home/.local/bin");
+    // FUSE usable: the menu runs the installed copy itself.
+    let out = ok(&i.run(&["--install"], &[]));
+    assert!(out.contains("Installed pengitto 9.9.9"), "{out}");
+    assert!(!out.contains("FUSE isn't usable"), "{out}");
+    assert_eq!(std::fs::read(bin.join("pengitto")).unwrap(), std::fs::read(h.path("pengitto.AppImage")).unwrap());
+    for f in installed_files(&bin, &h.data()) {
+        assert!(f.is_file(), "{}", f.display());
+    }
+    assert_eq!(exec_argv(&i.desktop()), [bin.join("pengitto").display().to_string(), "--".into(), "%F".into()]);
+    let o = launched_version(&i.desktop(), &h.path("home"));
+    assert_eq!(ok(&o).trim(), "pengitto 9.9.9");
+    let checks = std::fs::read_to_string(h.path("checks")).unwrap();
+    assert!(checks.lines().all(|l| !l.starts_with('1')), "checked as it runs: mounted ({checks})");
+    // Without FUSE (its helper not there): the menu entry has it extract
+    // itself, and the checks ran so (in the installation's work folder).
+    std::fs::remove_file(h.path("checks")).unwrap();
+    let path = i.path(false);
+    let out = ok(&i.run(&["--install"], &[("PATH", Path::new(&path))]));
+    assert!(out.contains("FUSE isn't usable"), "{out}");
+    let argv = exec_argv(&i.desktop());
+    assert_eq!(argv, ["env", "APPIMAGE_EXTRACT_AND_RUN=1", &bin.join("pengitto").display().to_string(), "--", "%F"]);
+    assert_eq!(ok(&launched_version(&i.desktop(), &h.path("home"))).trim(), "pengitto 9.9.9");
+    let checks = std::fs::read_to_string(h.path("checks")).unwrap();
+    let (mode, tmp) = checks.trim().split_once(' ').unwrap();
+    assert_eq!(mode, "1");
+    assert!(Path::new(tmp).starts_with(h.dir.path()) && tmp.contains("pengitto-install.") && !Path::new(tmp).exists(), "{tmp}");
+    // Its helper there but the device not to be opened: the same.
+    ok(&i.run(&["--uninstall"], &[]));
+    ok(&i.run(&["--install"], &[("PENGITTO_FUSE_DEVICE", Path::new("/nonexistent/fuse"))]));
+    assert_eq!(exec_argv(&i.desktop())[..2], ["env", "APPIMAGE_EXTRACT_AND_RUN=1"]);
+    // Running extracting itself (FUSE there or not): the same.
+    ok(&i.run(&["--uninstall"], &[]));
+    ok(&i.run(&["--install"], &[("APPIMAGE_EXTRACT_AND_RUN", Path::new("1"))]));
+    assert_eq!(exec_argv(&i.desktop())[..2], ["env", "APPIMAGE_EXTRACT_AND_RUN=1"]);
+    // Usable again: as it was.
+    ok(&i.run(&["--install"], &[]));
+    assert_eq!(exec_argv(&i.desktop())[0], bin.join("pengitto").display().to_string());
+    // A newer AppImage installs itself in its place.
+    let newer = h.path("pengitto-newer.AppImage");
+    fake_image(&newer, "9.9.10", &h.path("checks"));
+    let out = ok(&i.run_image(&newer, &["--install"], &[]));
+    assert!(out.contains("Installed pengitto 9.9.10"), "{out}");
+    assert_eq!(std::fs::read(bin.join("pengitto")).unwrap(), std::fs::read(&newer).unwrap());
+    assert_eq!(ok(&launched_version(&i.desktop(), &h.path("home"))).trim(), "pengitto 9.9.10");
+    // Taken away again.
+    let out = ok(&i.run(&["--uninstall"], &[]));
+    assert!(!bin.join("pengitto").exists() && !h.data().join("applications/pengitto.desktop").exists(), "{out}");
+    // Its options passed on.
+    let prefix = h.path("opt");
+    ok(&i.run(&["--install", "--prefix", prefix.to_str().unwrap(), "--no-integration", "--force"], &[]));
+    assert!(prefix.join("bin/pengitto").is_file());
+    ok(&i.run(&["--uninstall", &format!("--prefix={}", prefix.display())], &[]));
+    assert!(!prefix.join("bin/pengitto").exists());
+}
+
+#[test]
+fn only_its_first_argument_installs_and_only_what_it_takes() {
+    let i = Image::new();
+    let h = &i.home;
+    let nothing_installed = || !h.path("home/.local/bin/pengitto").exists() && !h.data().join("applications").exists();
+    // After `--` (or not first): a path, for pengitto.
+    ok(&i.run(&["--", "--install"], &[]));
+    assert_eq!(i.args(), ["--", "--install"]);
+    ok(&i.run(&["x", "--install"], &[]));
+    assert_eq!(i.args(), ["x", "--install"]);
+    assert!(nothing_installed());
+    // git's helpers are pengitto with these set: never installing.
+    ok(&i.run(&["--install"], &[("PENGITTO_ASKPASS_SOCKET", Path::new("/x"))]));
+    assert_eq!(i.args(), ["--install"]);
+    ok(&i.run(&["--uninstall"], &[("PENGITTO_REBASE_DIR", Path::new("/x"))]));
+    assert_eq!(i.args(), ["--uninstall"]);
+    // What it doesn't take: told, nothing done.
+    for args in [
+        &["--install", "--binary", "/bin/true"][..],
+        &["--install", "--exec", "/x"],
+        &["--install", "--prefix"],
+        &["--install", "--help"],
+        &["--uninstall", "--no-integration"],
+        &["--uninstall", "--binary", "/bin/true"],
+    ] {
+        let o = i.run(args, &[]);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", failed(&o));
+        assert!(text(&o.stderr).contains("Usage: pengitto-<version>-x86_64.AppImage --install"), "{args:?}");
+    }
+    assert!(nothing_installed());
+    // The folder run as it is (not from its AppImage): told to run the file.
+    let o = Command::new(h.path("pengitto.AppDir/AppRun")).arg("--install").env_remove("APPIMAGE").output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(text(&o.stderr).contains("is for the AppImage file"), "{}", text(&o.stderr));
+    assert!(nothing_installed());
 }

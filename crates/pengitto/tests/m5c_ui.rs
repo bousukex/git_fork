@@ -67,8 +67,14 @@ fn until(h: &mut Harness<'static, PengittoApp>, what: &str, mut done: impl FnMut
 }
 
 fn remove_from_sidebar(h: &mut Harness<'static, PengittoApp>, name: &str) {
-    h.get_by_label(&format!("worktree {name}")).click_secondary();
-    h.run_steps(2);
+    // (Clicked where it is now: what is under way done first — a refresh
+    // or a banner moves it — and the pointer over it a frame before.)
+    settle(h);
+    let item = format!("worktree {name}");
+    h.get_by_label(&item).hover();
+    h.step();
+    h.get_by_label(&item).click_secondary();
+    until(h, "its menu", |h| h.query_by_label("Remove…").is_some());
     h.get_by_label("Remove…").click();
     settle(h);
     h.get_by_label("Remove it anyway, losing these").click();
